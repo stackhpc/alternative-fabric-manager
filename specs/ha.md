@@ -144,9 +144,29 @@ differs, it applies again.
 
 OpenSM skips lines of a partitions file it can't parse and still finishes
 the sweep, and it logs, rather than fails on, a port whose pkey table it
-couldn't set. The leader treats both as a failed apply: a partitions file
-parse error, and pkey manager errors setting a port's pkey table, whose
-exact messages need checking on OpenSM 5.17.
+couldn't set. The leader treats both as a failed apply when they appear
+between the signal and the end of the sweep:
+
+- a partitions file parse error, `PARSE ERROR` from `parse_part_conf`;
+- the pkey manager's and virtualisation manager's errors setting pkey
+  tables, by their codes in OpenSM 5.17, from its binary's messages:
+
+| Code | Meaning | Treated as |
+| --- | --- | --- |
+| `ERR 0502` | No memory for a pending pkey entry | A failed apply of that port |
+| `ERR 0505`, `ERR 0508` | A pkey couldn't be set in a block and index of a port's table | A failed apply of that port |
+| `ERR 0506`, `ERR 0509` | A port's pkey table block couldn't be updated | A failed apply of that port |
+| `ERR 0512` | A pkey couldn't be set because the port's table is full | A failed apply of that port |
+| `ERR 0507`, `ERR 0513` | A switch port has too few pkey entries, so OpenSM **clears its enforcement bit**: the switch stops enforcing partitions on that port | A failed apply of every job, since isolation is lost at that switch port, and an alarm |
+| `ERR 0F12` | A PKeyTable request couldn't be started | A failed apply of that port |
+| `ERR 1503`, `ERR 5703` | A virtual port's pkey table couldn't be read or set | A failed apply of that port |
+| `ERR 6B06` | A virtual port's partition item couldn't be allocated | A failed apply of that port |
+
+Codes outside this list, such as the SA's `ERR 45xx` for requests between
+ports that share no pkey, are about clients, not about applying the file,
+and aren't treated as failures. The list is matched by code, `ERR 0507:`
+for example, since the message texts may change between OpenSM versions;
+a newer OpenSM's codes need checking before it is supported.
 
 A parse error is a property of the generation, not of the node: the same
 file fails on every OpenSM. So the leader records the generation as
@@ -200,9 +220,9 @@ step 2, 3 or 4 confirms:
 2. **Kill the container.** Over SSH, with a key restricted to one forced
    command, kill the old node's OpenSM container and confirm, through the
    container runtime, that it has exited. This covers a paused or hung
-   manager, and a paused OpenSM container if cgroup v2 lets SIGKILL kill
-   frozen processes, which needs checking. It needs the node to be
-   reachable and running.
+   manager, and a paused OpenSM container: under cgroup v2, `docker kill`
+   stops a paused container at once, as checked on this host. It needs the
+   node to be reachable and running.
 3. **Disable its switch ports.** With the M_Key, send SubnSet(PortInfo) to
    the switch ports the old node's adapters are cabled to, setting them to
    Disabled, and confirm by querying them that they are disabled and their
@@ -473,9 +493,9 @@ becoming ACTIVE before the leader's OpenSM has swept its partition.
 - [ ] Verify on a fabric with two OpenSMs: SMInfo DISABLE; switch-port
       disabling and its confirmation with the M_Key; how a lower-priority
       stale master behaves; `sminfo` with the M_Key and SM_Key.
-- [ ] Verify on this host: whether `docker kill` kills a paused container's
-      processes under cgroup v2; OpenSM 5.17's messages for pkey-table
-      errors.
+- [x] Verify on this host: `docker kill` kills a paused container's
+      processes under cgroup v2; OpenSM 5.17's codes for pkey-table errors
+      (see OpenSM errors).
 - [x] Single node: a DELETE of an unknown object creates a job rather than
       answering 404; the checks of rendered files; the managed driver; and
       reconciling the file with the database.
@@ -508,8 +528,6 @@ becoming ACTIVE before the leader's OpenSM has swept its partition.
 - Does OpenSM 5.17 honour SMInfo DISABLE, and how quickly?
 - Can the switches' ports be disabled reliably with the M_Key, and does a
   disabled port stay disabled whatever its neighbour does?
-- Does `docker kill` stop a paused container's processes, so that step 2
-  covers a paused OpenSM container?
 - What is the deployment's MariaDB failover time, and are 30 s for `T` and
   300 s for the job timeout right?
 - Do the OpenSM nodes have BMCs the manager may use?
