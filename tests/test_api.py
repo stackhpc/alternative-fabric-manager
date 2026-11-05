@@ -386,3 +386,27 @@ def test_network_without_a_partition_is_rejected(client, network_type):
         client, "Network", conftest.network(**{"provider:network_type": network_type})
     )
     assert response.status_code == 400
+
+
+def test_opensm_conf_is_written_with_shared_keys(manager, config, tmp_path):
+    import os
+
+    config.driver = "managed"
+    config.opensm_conf = {"sm_priority": "15"}
+    manager._write_current()
+    with open(config.opensm_conf_file) as f:
+        lines = f.read().splitlines()
+    assert "sm_priority 15" in lines
+    assert "m_key_protection_level 2" in lines
+    m_key = next(line for line in lines if line.startswith("m_key "))
+    assert os.stat(config.opensm_conf_file).st_mode & 0o777 == 0o600
+    # The same keys after a restart, and for every OpenSM of the fabric
+    assert manager.keys() == manager.keys()
+    manager._write_current()
+    with open(config.opensm_conf_file) as f:
+        assert m_key in f.read().splitlines()
+
+
+def test_opensm_conf_only_for_the_managed_driver(manager, config):
+    manager._write_current()
+    assert not pathlib.Path(config.opensm_conf_file).exists()

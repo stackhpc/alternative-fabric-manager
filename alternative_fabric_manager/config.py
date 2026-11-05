@@ -16,7 +16,10 @@ import configparser
 import dataclasses
 import os
 
-DEFAULT_PARTITION = "Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=full, SELF=full ;"
+# Every port is only a limited member of the default partition, so that ports
+# can't reach each other there; flat networks' ports are added as full
+# members. See docs/opensm-hardening.md.
+DEFAULT_PARTITION = "Default=0x7fff, ipoib : ALL=limited, SELF=full ;"
 DEFAULT_VOLUMES = (
     "/lib/modules:/lib/modules:ro,"
     "/etc/localtime:/etc/localtime:ro,"
@@ -90,6 +93,10 @@ class Config:
     ipoib_mtu: int = 4
     ipoib_sl: int = 0
 
+    # Write the hardened OpenSM options of docs/opensm-hardening.md into
+    # opensm.conf (managed). [opensm_conf] overrides any of them.
+    hardening: bool = True
+
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)
 
@@ -121,7 +128,10 @@ class Config:
                 kind = type(getattr(config, name))
                 value = parser.get(section, name)
                 try:
-                    setattr(config, name, kind(value))
+                    if kind is bool:
+                        setattr(config, name, parser.getboolean(section, name))
+                    else:
+                        setattr(config, name, kind(value))
                 except ValueError:
                     raise ConfigError(
                         f"[{section}] {name} must be a {kind.__name__}, not {value!r}"
@@ -166,6 +176,7 @@ OPTIONS = (
             "config_dir",
             "host_config_dir",
             "partitions_template",
+            "hardening",
             "start_timeout",
             "sweep_timeout",
             "check_interval",

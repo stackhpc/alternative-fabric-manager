@@ -44,24 +44,31 @@ host_config_dir = /etc/opensm
 # ipoib (rate, mtu, sl) and generation, and what it renders is checked: every
 # network's pkey must have exactly its ports as full members.
 partitions_template =
+# Write the hardened OpenSM options of docs/opensm-hardening.md into
+# opensm.conf: M_Key protection, secret SM and SA keys kept in the database,
+# the SA enhanced trust model, and more. Override any of them in
+# [opensm_conf].
+hardening = true
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5
 apply_attempts = 3
-# Written as is. ALL=full keeps ports on flat networks, which share the
-# default partition, able to reach each other. For isolation, give ports
-# limited membership: Default=0x7fff, ipoib : ALL=limited, SELF=full ;
-# Match the rate and MTU of the existing broadcast group (saquery -g), or
-# OpenSM recreates it, which disrupts IPoIB on the default partition.
-default_partition = Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=full, SELF=full ;
+# Written as is. By default every port is only a limited member, so ports
+# can't reach each other in the default partition; flat networks' ports are
+# added as full members. See docs/opensm-hardening.md. On a fabric that
+# already runs, match the rate and MTU of the existing broadcast group
+# (saquery -g), or OpenSM recreates it, which disrupts IPoIB on the default
+# partition, for example:
+#   Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=limited, SELF=full ;
+default_partition = Default=0x7fff, ipoib : ALL=limited, SELF=full ;
 # IPoIB broadcast group of networks' partitions, as IBTA values.
 ipoib_rate = 3
 ipoib_mtu = 4
 ipoib_sl = 0
 
 [opensm_conf]
-# opensm.conf options for the managed driver, as "key = value". OpenSM uses
-# its defaults for the others. partition_config_file and daemon are set by
-# the manager.
+# opensm.conf options for the managed driver, as "key = value". These win
+# over the hardened options. OpenSM uses its defaults for the others.
+# partition_config_file and daemon are set by the manager.
 #sm_priority = 15
 #log_flags = 0x07

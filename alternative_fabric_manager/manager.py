@@ -21,12 +21,13 @@ reported as in its partition before OpenSM has put it there.
 
 import datetime
 import logging
+import os
 import threading
 import time
 
 import sqlalchemy as sa
 
-from alternative_fabric_manager import db, partitions
+from alternative_fabric_manager import db, opensm_conf, partitions
 from alternative_fabric_manager.drivers import ReloadError
 
 LOG = logging.getLogger(__name__)
@@ -205,8 +206,34 @@ class Manager:
         )
         return content
 
+    def keys(self):
+        """Return the fabric's shared OpenSM keys, generating any missing"""
+        with self._lock, self.sessionmaker() as session:
+            keys = {}
+            for name in opensm_conf.KEYS:
+                secret = session.get(db.Secret, name)
+                if secret is None:
+                    secret = db.Secret(name=name, value=opensm_conf.new_key())
+                    session.add(secret)
+                keys[name] = secret.value
+            session.commit()
+            return keys
+
+    def _write_opensm_conf(self):
+        if self.config.driver != "managed":
+            return
+        content = opensm_conf.render(
+            self.config.opensm_conf,
+            hardening=self.config.hardening,
+            keys=self.keys() if self.config.hardening else None,
+        )
+        partitions.write_atomically(self.config.opensm_conf_file, content)
+        # The keys are secrets.
+        os.chmod(self.config.opensm_conf_file, 0o600)
+
     def _write_current(self):
-        """Write the current state's partitions file, before OpenSM starts"""
+        """Write the current state's files, before OpenSM starts"""
+        self._write_opensm_conf()
         with self._lock, self.sessionmaker() as session:
             content = self._render(session)
             session.commit()

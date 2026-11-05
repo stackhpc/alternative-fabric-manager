@@ -29,6 +29,12 @@ def main(argv=None):
     )
     parser.add_argument("--config-file", default=DEFAULT_CONFIG)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--show-keys",
+        action="store_true",
+        help="Print the fabric's OpenSM keys, for diagnostic tools such as "
+        "smpquery -y <m_key>, and exit",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -39,6 +45,14 @@ def main(argv=None):
         config = config_mod.Config.load(args.config_file)
     except config_mod.ConfigError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+
+    if args.show_keys:
+        manager = manager_mod.Manager(
+            config, db.make_sessionmaker(config.database), drivers.NoOpenSM()
+        )
+        for name, value in manager.keys().items():
+            print(f"{name} {value}")
+        return
 
     manager = manager_mod.Manager(
         config,

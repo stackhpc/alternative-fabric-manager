@@ -87,6 +87,15 @@ class Job(Base):
     )
 
 
+class Secret(Base):
+    """Keys that every OpenSM of the fabric must share, kept across restarts"""
+
+    __tablename__ = "secrets"
+
+    name: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    value: orm.Mapped[str] = orm.mapped_column(sa.String(255))
+
+
 class State(Base):
     """Counters kept across restarts"""
 

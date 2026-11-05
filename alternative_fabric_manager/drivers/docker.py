@@ -26,7 +26,7 @@ import time
 import docker
 import docker.errors
 
-from alternative_fabric_manager import opensm_conf, partitions
+from alternative_fabric_manager import opensm_conf
 from alternative_fabric_manager.drivers import ReloadError
 
 LOG = logging.getLogger(__name__)
@@ -163,10 +163,7 @@ class ManagedDocker(DockerReloader):
             self.client.containers.get(self.container_name).remove(force=True)
 
     def start(self):
-        """Start OpenSM, with the partitions file already written"""
-        partitions.write_atomically(
-            self.config.opensm_conf_file, opensm_conf.render(self.config.opensm_conf)
-        )
+        """Start OpenSM, with its files already written"""
         try:
             # A container left by an earlier manager has stopped, since it
             # was in that manager's PID namespace, but its name is taken.

@@ -88,6 +88,15 @@ partitions from `config_dir`, bind mounted into its container: mount the
 directory rather than the file, so that the atomic rename reaches it. The
 manager then only sends it SIGHUP.
 
+### Hardening
+
+The manager configures OpenSM for a fabric shared by tenants who don't trust
+each other: M_Key protection, secret SM and SA keys that it keeps in its
+database, the SA enhanced trust model, and a default partition in which every
+port is only a limited member. [docs/opensm-hardening.md](docs/opensm-hardening.md)
+explains each option, why, and what it costs, such as diagnostic tools
+needing the M_Key (`alternative-fabric-manager --show-keys`).
+
 ### The partitions template
 
 `partitions.conf` is rendered from a Jinja template, in a sandbox. Set

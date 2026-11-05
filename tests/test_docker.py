@@ -143,8 +143,6 @@ def test_managed_start(managed_config):
     assert kwargs["network_mode"] == "host"
     assert kwargs["command"][:2] == ["-F", "/etc/opensm/opensm.conf"]
     assert kwargs["volumes"][0] == "/etc/opensm:/etc/opensm:ro"
-    with open(managed_config.opensm_conf_file) as f:
-        assert "sm_priority 15" in f.read().splitlines()
     assert driver.running()
 
 
