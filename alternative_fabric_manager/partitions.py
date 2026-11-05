@@ -110,13 +110,17 @@ def guid_from_port(port):
 #   ipoib              rate, mtu and sl, from [opensm] ipoib_*
 #   generation         the state's generation
 # Whatever it renders is checked by validate() before it is written.
+#
+# indx0 puts a network's pkey at index 0 of its ports' pkey tables. A guest's
+# IPoIB interface uses the pkey at index 0, so without it the interface is in
+# the default partition, not the network's.
 DEFAULT_TEMPLATE = """\
 {{ default_partition }}
 {% if flat_guids -%}
 Default=0x7fff : {{ flat_guids | join("=full, ") }}=full ;
 {% endif -%}
 {% for network in networks -%}
-{{ network.name }}={{ network.pkey_hex }}, ipoib, rate={{ ipoib.rate }}, \
+{{ network.name }}={{ network.pkey_hex }}, indx0, ipoib, rate={{ ipoib.rate }}, \
 mtu={{ ipoib.mtu }}, sl={{ ipoib.sl }} : \
 {% for guid in network.guids %}{{ guid }}=full{{ ", " if not loop.last else "" }}\
 {% endfor %} ;

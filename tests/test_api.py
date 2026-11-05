@@ -54,7 +54,9 @@ def test_network_job_completes_once_applied(client, manager, config, reloader):
 
     assert _job(client, response)["Status"] == "Completed"
     assert reloader.calls == 1
-    assert f"net-{NETWORK_ID}=0x0064, ipoib, rate=3, mtu=4, sl=0 :  ;" in _file(config)
+    assert f"net-{NETWORK_ID}=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 :  ;" in _file(
+        config
+    )
 
 
 def test_port_is_a_full_member(client, manager, config):

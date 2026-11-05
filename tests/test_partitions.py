@@ -24,7 +24,7 @@ def test_default_template(config):
     assert content.splitlines()[1:] == [
         "# Generation 7",
         config.default_partition,
-        f"net-net1=0x0064, ipoib, rate=3, mtu=4, sl=0 : 0x{GUID:016x}=full ;",
+        f"net-net1=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 : 0x{GUID:016x}=full ;",
     ]
     partitions.validate(content, {0x64: {GUID}})
 
