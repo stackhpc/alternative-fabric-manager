@@ -27,6 +27,12 @@ applies the recorded state:
 3. it waits for OpenSM to log the end of the sweep, and only then completes
    the jobs that the file covers.
 
+The database is the source of truth. Every `[opensm] check_interval`
+seconds, the manager also makes sure that OpenSM is running, and that the
+partitions file is what it last applied, and what the recorded state renders
+to. If not, for example after someone edited the file or an apply failed, it
+writes the file again from the recorded state and has OpenSM apply it.
+
 networking-mlnx holds a port `DOWN` until its job has completed, so a port
 is never reported as in its partition before OpenSM has put it there. A
 request that can never be applied is answered with 400, which sets the port

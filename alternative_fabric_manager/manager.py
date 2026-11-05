@@ -57,6 +57,9 @@ class Manager:
         self._wakeup = threading.Event()
         self._stop = threading.Event()
         self._thread = None
+        # The partitions file last written and applied, and its generation
+        self._written = None
+        self._written_generation = None
 
     # Requests
 
@@ -177,6 +180,7 @@ class Manager:
         )
         self._write_current()
         self.driver.start()
+        self._started()
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
         self._thread.start()
         # Apply what was pending when the service last stopped.
@@ -198,6 +202,7 @@ class Manager:
             try:
                 self._check_opensm()
                 self.apply_pending()
+                self.reconcile()
             except Exception:
                 LOG.exception("Failed to apply the partitions")
                 time.sleep(RETRY_DELAY)
@@ -211,16 +216,20 @@ class Manager:
         try:
             self._write_current()
             self.driver.start()
+            self._started()
         except (OSError, ReloadError, partitions.InvalidPartitions) as e:
             LOG.error("Failed to start OpenSM: %s", e)
 
-    def _render(self, session):
-        """Return the partitions file for the current state, checked"""
-        state = session.get(db.State, GENERATION)
-        if state is None:
-            state = db.State(name=GENERATION, value=0)
-            session.add(state)
-        state.value += 1
+    def _render(self, session, generation=None):
+        """Return the partitions file for the current state, checked, and its
+        generation: a new one, unless generation is given"""
+        if generation is None:
+            state = session.get(db.State, GENERATION)
+            if state is None:
+                state = db.State(name=GENERATION, value=0)
+                session.add(state)
+            state.value += 1
+            generation = state.value
         members = {}
         for port in session.scalars(sa.select(db.Port)):
             members.setdefault(port.network_id, []).append(int(port.guid, 16))
@@ -228,7 +237,7 @@ class Manager:
             (network, members.get(network.id, []))
             for network in session.scalars(sa.select(db.Network))
         ]
-        content = partitions.render(self.config, networks, state.value, self.template)
+        content = partitions.render(self.config, networks, generation, self.template)
         partitions.validate(
             content,
             {n.pkey: set(guids) for n, guids in networks if n.pkey is not None},
@@ -236,7 +245,7 @@ class Manager:
             flat_pkey=self.config.flat_pkey,
             shared_default=self.config.shared_default_partition,
         )
-        return content
+        return content, generation
 
     def keys(self):
         """Return the fabric's shared OpenSM keys, generating any missing"""
@@ -273,7 +282,7 @@ class Manager:
         self._write_opensm_conf()
         try:
             with self._lock, self.sessionmaker() as session:
-                content = self._render(session)
+                content, generation = self._render(session)
                 session.commit()
         except partitions.InvalidPartitions as e:
             if not os.path.exists(self.config.partitions_file):
@@ -285,6 +294,8 @@ class Manager:
             )
             return
         partitions.write_atomically(self.config.partitions_file, content)
+        # OpenSM reads it when it starts.
+        self._pending_start = (content, generation)
 
     def _snapshot(self):
         """Return the pending jobs, and the file that covers them or why
@@ -298,11 +309,11 @@ class Manager:
                 )
             )
             if not job_ids:
-                return [], None, None
+                return [], (None, None), None
             try:
                 content, error = self._render(session), None
             except partitions.InvalidPartitions as e:
-                content, error = None, str(e)
+                content, error = (None, None), str(e)
             session.execute(
                 sa.update(db.Job)
                 .where(db.Job.id.in_(job_ids))
@@ -324,9 +335,69 @@ class Manager:
             )
             session.commit()
 
+    def _started(self):
+        """Record the file that OpenSM started with"""
+        pending, self._pending_start = getattr(self, "_pending_start", None), None
+        if pending is not None:
+            self._written, self._written_generation = pending
+
+    def _apply(self, content, generation, attempt=1):
+        """Write a partitions file and have OpenSM apply it"""
+        if attempt > 1:
+            # So that OpenSM sees a changed file, and runs a pkey sweep
+            content += f"# Attempt {attempt}\n"
+        partitions.write_atomically(self.config.partitions_file, content)
+        # Until OpenSM confirms it, the file isn't what was applied, so a
+        # failed apply is retried by reconcile().
+        self._written = None
+        self.driver.reload()
+        self._written, self._written_generation = content, generation
+
+    def reconcile(self):
+        """Make the partitions file, and OpenSM, match the recorded state
+
+        The recorded state is the source of truth. The file is rewritten
+        and applied again if it isn't what the manager last applied, for
+        example after someone edited it, or after an apply failed, or if
+        the recorded state no longer renders to it, for example after it
+        changed in the database without a job.
+        """
+        if not self.driver.running():
+            return
+        try:
+            with open(self.config.partitions_file) as f:
+                on_disk = f.read()
+        except OSError:
+            on_disk = None
+        if self._written is not None and on_disk == self._written:
+            with self._lock, self.sessionmaker() as session:
+                try:
+                    desired, _generation = self._render(
+                        session, generation=self._written_generation
+                    )
+                except partitions.InvalidPartitions:
+                    desired = None
+            # The attempt line, if any, isn't part of the state.
+            written = self._written.split("# Attempt ")[0]
+            if desired == written:
+                return
+            reason = "the recorded state has changed"
+        elif self._written is None:
+            reason = "the last apply wasn't confirmed"
+        else:
+            reason = "the partitions file was changed outside the manager"
+        LOG.warning("Applying the partitions again: %s", reason)
+        try:
+            with self._lock, self.sessionmaker() as session:
+                content, generation = self._render(session)
+                session.commit()
+            self._apply(content, generation)
+        except (OSError, ReloadError, partitions.InvalidPartitions) as e:
+            LOG.error("Failed to apply the partitions again: %s", e)
+
     def apply_pending(self):
         """Apply the desired state, if any job is waiting for it"""
-        job_ids, content, error = self._snapshot()
+        job_ids, (content, generation), error = self._snapshot()
         if not job_ids:
             return
         if error:
@@ -338,8 +409,7 @@ class Manager:
         LOG.info("Applying partitions for %d jobs", len(job_ids))
         for attempt in range(1, self.config.apply_attempts + 1):
             try:
-                partitions.write_atomically(self.config.partitions_file, content)
-                self.driver.reload()
+                self._apply(content, generation, attempt)
             except (OSError, ReloadError) as e:
                 error = str(e)
                 LOG.warning(

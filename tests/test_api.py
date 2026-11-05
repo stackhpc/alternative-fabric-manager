@@ -507,3 +507,88 @@ def test_database_and_opensm_conf_are_private(tmp_path, config, reloader):
     manager._write_current()
     assert os.stat(database).st_mode & 0o777 == 0o600
     assert os.stat(config.opensm_conf_file).st_mode & 0o777 == 0o600
+
+
+def _applied(client, manager):
+    _post(client, "Network", conftest.network())
+    _post(client, "Port", conftest.port())
+    manager.apply_pending()
+
+
+def test_reconcile_does_nothing_when_all_matches(client, manager, reloader):
+    _applied(client, manager)
+    calls = reloader.calls
+    manager.reconcile()
+    assert reloader.calls == calls
+
+
+def test_reconcile_restores_an_edited_file(client, manager, config, reloader):
+    _applied(client, manager)
+    path = pathlib.Path(config.partitions_file)
+    path.write_text(path.read_text().replace("=full", "=limited"))
+    calls = reloader.calls
+    manager.reconcile()
+    assert reloader.calls == calls + 1
+    assert _members(config)[0x64] == {GUID: "full"}
+
+
+def test_reconcile_restores_a_missing_file(client, manager, config, reloader):
+    _applied(client, manager)
+    pathlib.Path(config.partitions_file).unlink()
+    manager.reconcile()
+    assert _members(config)[0x64] == {GUID: "full"}
+
+
+def test_reconcile_retries_a_failed_apply(client, manager, config, reloader):
+    from alternative_fabric_manager.drivers import ReloadError
+
+    config.apply_attempts = 1
+    reloader.error = ReloadError("OpenSM is down")
+    _applied(client, manager)
+    reloader.error = None
+    calls = reloader.calls
+    manager.reconcile()
+    assert reloader.calls == calls + 1
+    calls = reloader.calls
+    manager.reconcile()
+    assert reloader.calls == calls
+
+
+def test_reconcile_applies_a_state_changed_without_a_job(client, manager, config):
+    from alternative_fabric_manager import db
+
+    _applied(client, manager)
+    # As another instance sharing the database would
+    with manager.sessionmaker() as session:
+        session.query(db.Port).delete()
+        session.commit()
+    manager.reconcile()
+    assert _members(config)[0x64] == {}
+
+
+def test_reconcile_skips_a_stopped_opensm(client, manager, config, reloader):
+    _applied(client, manager)
+    pathlib.Path(config.partitions_file).unlink()
+    reloader.is_running = False
+    manager.reconcile()
+    assert not pathlib.Path(config.partitions_file).exists()
+
+
+def test_retries_change_the_file(client, manager, config, reloader):
+    # So that OpenSM runs a pkey sweep, not a heavy one, on each attempt
+    from alternative_fabric_manager.drivers import ReloadError
+
+    seen = []
+    errors = [ReloadError("once"), None]
+
+    def reload():
+        seen.append(_file(config))
+        error = errors.pop(0)
+        if error:
+            raise error
+
+    reloader.reload = reload
+    config.apply_attempts = 2
+    _applied(client, manager)
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert "# Attempt 2" in seen[1]
