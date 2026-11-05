@@ -1,0 +1,39 @@
+# alternative-fabric-manager configuration. networking-mlnx's ml2_conf.ini
+# then has:
+#
+#   [sdn]
+#   url = http://<host>:<port><url_prefix>, e.g. http://127.0.0.1:8090/ufmRestV3
+#   domain = <domain>
+#   token = <token>
+
+[api]
+host = 127.0.0.1
+port = 8090
+url_prefix = /ufmRestV3
+domain = cloudx
+# Requests must carry "Authorization: Basic <token>". Required.
+token =
+
+[database]
+database = /var/lib/alternative-fabric-manager/afm.sqlite
+
+[opensm]
+# The file OpenSM reads as its partition_config_file, in a directory that
+# is bind mounted into the OpenSM container.
+partitions_file = /etc/opensm/partitions.conf
+# docker: send SIGHUP to the container and wait for OpenSM's pkey sweep.
+# none: only write the file.
+reload = docker
+container = opensm
+sweep_timeout = 30
+apply_attempts = 3
+# Written as is. ALL=full keeps ports on flat networks, which share the
+# default partition, able to reach each other. For isolation, give ports
+# limited membership: Default=0x7fff, ipoib : ALL=limited, SELF=full ;
+# Match the rate and MTU of the existing broadcast group (saquery -g), or
+# OpenSM recreates it, which disrupts IPoIB on the default partition.
+default_partition = Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=full, SELF=full ;
+# IPoIB broadcast group of networks' partitions, as IBTA values.
+ipoib_rate = 3
+ipoib_mtu = 4
+ipoib_sl = 0

@@ -1,0 +1,103 @@
+# Alternative fabric manager
+
+An InfiniBand fabric manager for
+[networking-mlnx](https://opendev.org/x/networking-mlnx). It implements the
+part of NVIDIA UFM's REST API that networking-mlnx's `mlnx_sdn_assist`
+mechanism driver uses. It puts each Neutron VLAN network in its own
+partition of an [OpenSM](https://github.com/linux-rdma/opensm) subnet
+manager, and each port's GUID in its network's partition.
+
+## How it works
+
+networking-mlnx sends each network and port as it changes:
+
+| Request | Effect |
+| --- | --- |
+| `POST <url>/<domain>/Network`, `PUT` / `DELETE …/Network/<id>` | Create or remove the network's partition. Its partition key is the network's VLAN ID (`provider:segmentation_id`) |
+| `POST <url>/<domain>/Port`, `PUT` / `DELETE …/Port/<id>` | Add or remove the port's GUID, the last 8 octets of its DHCP client ID, as a full member of its network's partition |
+
+Each change is recorded in an SQLite database and answered with a job,
+which networking-mlnx polls with `GET <url>/app/jobs/<id>`. One thread
+applies the recorded state:
+
+1. it writes the whole partitions file, atomically;
+2. it sends OpenSM `SIGHUP`. When only the partitions file has changed,
+   OpenSM then runs a pkey sweep, which updates the ports' pkey tables,
+   without a restart;
+3. it waits for OpenSM to log the end of the sweep, and only then completes
+   the jobs that the file covers.
+
+networking-mlnx holds a port `DOWN` until its job has completed, so a port
+is never reported as in its partition before OpenSM has put it there. A
+request that can never be applied is answered with 400, which sets the port
+to `ERROR`: a port without a usable client ID, a port on a network without a
+partition, or a network whose VLAN ID another network's partition already
+uses.
+
+Ports on flat networks stay in the default partition. networking-mlnx sends
+them, but not their networks, so they are rejected too.
+
+## Running it
+
+The image runs next to the OpenSM container, on the same host:
+
+```sh
+docker build -t alternative-fabric-manager .
+docker run -d --name alternative-fabric-manager --restart unless-stopped \
+  --network host \
+  -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
+  -v /etc/opensm:/etc/opensm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v afm_data:/var/lib/alternative-fabric-manager \
+  alternative-fabric-manager
+```
+
+OpenSM must read its partitions from the same directory, mounted into its
+container (`-v /etc/opensm:/etc/opensm:ro`). Mount the directory rather than
+the file, so that the atomic rename reaches the container. The Docker
+socket lets the manager signal OpenSM and read its log, so treat the manager
+as root on its host.
+
+Copy [etc/afm.conf.sample](etc/afm.conf.sample) to
+`/etc/alternative-fabric-manager/afm.conf` and set a token. Then configure
+networking-mlnx in `ml2_conf.ini`:
+
+```ini
+[ml2]
+mechanism_drivers = ...,mlnx_infiniband,mlnx_sdn_assist
+
+[sdn]
+sync_enabled = True
+url = http://127.0.0.1:8090/ufmRestV3
+domain = cloudx
+token = <token>
+physical_networks = <InfiniBand physical networks>
+```
+
+### The default partition
+
+`[opensm] default_partition` is written to the file as is. If OpenSM ran
+without a partitions file, every port was a full member of the default
+partition. Keep that, `ALL=full`, while ports on flat networks must reach
+each other. Otherwise give ports limited membership, so that they can only
+reach the subnet manager there.
+
+Give the default partition's IPoIB broadcast group the rate and MTU it has
+now, as `saquery -g` shows them. Otherwise OpenSM recreates it, which
+disrupts IPoIB on the default partition across the fabric.
+
+## Development
+
+```sh
+uv sync
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest
+```
+
+## Limitations
+
+- One OpenSM, on the same host. Subnet manager failover needs every OpenSM
+  to have the same partitions.
+- A job that fails leaves its change in the recorded state, so the next
+  change that applies also applies it.
