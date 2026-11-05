@@ -11,19 +11,23 @@ consensus, and there is no Raft.
 Running one OpenSM, rather than OpenSM's own master and standbys on every
 node, means no standby can take over with partitions that nobody applied,
 and a job's evidence is one OpenSM's sweep. The cost is that a takeover
-starts an OpenSM, rather than promoting a running one.
+starts an OpenSM rather than promoting a running one: until it has swept,
+there is no subnet administrator (SA), so new connections, IPoIB joins and
+ports coming up wait, and its multicast groups are rebuilt.
 
 Three principles carry the safety argument:
 
 - **A job completes only on evidence that the fabric has its effect:** the
-  current leader's OpenSM swept a file in which the job's effect holds,
-  in the leader's current term.
-- **A new leader starts OpenSM only once the old leader's OpenSM is known
-  unable to act:** it released cleanly, or a fence that doesn't depend on
-  its cooperation confirmed it is stopped or cut off from the fabric.
+  current leader's OpenSM swept a body in which the job's effect holds, in
+  the leader's current term, while the leader saw the whole fabric and no
+  other subnet manager on it.
+- **A new leader starts OpenSM only once every OpenSM that may have run
+  since the last confirmed stop is known unable to act:** it was released
+  cleanly, or a fence that doesn't depend on its cooperation confirmed it is
+  stopped or cut off from the fabric.
 - **When in doubt, wait:** a takeover that can't confirm a fence doesn't
-  happen, and a fenced node's fabric port stays disabled until its OpenSM
-  is known stopped.
+  start OpenSM, and a fenced node's fabric ports stay disabled until its
+  OpenSM is known stopped.
 
 ## Architecture
 
@@ -51,87 +55,121 @@ HAProxy sends each request to any of the three instances, which are all
 active backends, round robin with no session stickiness. Each instance
 records requests in Galera and answers polls from it. Only the leader
 renders the partitions file and runs OpenSM. No other subnet manager may run
-on the fabric, such as one embedded in a switch: the leader checks that the
-fabric's master SM is its own OpenSM (see Job completion).
+on the fabric, such as one embedded in a switch, and the leader checks after
+every sweep that none does (see Job completion).
+
+The cluster's own control traffic, Galera, the management network and the
+fence agents' SSH, must not run over the InfiniBand ports of the nodes that
+can be fenced, since fencing disables those ports. The deployment role
+checks this.
 
 ## Shared state
 
 | Table | Holds |
 | --- | --- |
-| `networks` | Network ID, pkey (unique, NULL for flat networks), name |
+| `networks` | Network ID, type, pkey (unique, NULL for flat networks), name |
 | `ports` | Port ID, network (foreign key), GUID (unique), host |
-| `state` | The `generation` counter; the schema version; the configuration epoch and the configuration hashes it allows |
-| `jobs` | Operation, object, generation, effect, status, error, timestamps (UTC) |
-| `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, and the takeover in progress, if any |
-| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the GUIDs of its fabric ports and the switch ports they are cabled to, its fencing state, and its fence agents' settings |
-| `applied` | The leader's last swept generation and body, with its term |
-| `generations` | Generations OpenSM rejected, and why |
+| `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
+| `jobs` | Operation, object, generation, effect, deadline, status, error, timestamps (UTC) |
+| `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, and the **target set** (see The lease) |
+| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, its adapters' node GUIDs and the switch ports they are cabled to (the static map), its fencing state and fence record, and its fence agents' settings |
+| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, and the leader's term |
+| `quarantine` | Objects left out of rendering, and why |
+| `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
 
 A request's transaction starts by bumping the generation, with
 `UPDATE state SET generation = generation + 1`, which locks the row. Only
-then does it read and validate, so that its checks see every change
-committed before it, under InnoDB's repeatable read. It then records the
-change and creates its job with that generation and its effect. Every write
-goes to one Galera node (see Galera specifics), so requests are serialised
-on the generation row, and a job's generation is exactly the first state
-that includes it.
+then does it read and validate, with locking reads, so that its checks see
+every change committed before it. It validates against the configuration
+stored in Galera, such as the pkeys that the template's static partitions
+reserve and `flat_pkey`, not the instance's own, so that every instance
+accepts the same requests. It then records the change and creates its job
+with that generation, its effect, and its deadline, its creation time plus
+the job timeout, so that every instance agrees on when it times out. Every
+write goes to one Galera node (see Galera specifics), so requests are
+serialised on the generation row, and a job's generation is exactly the
+first state that includes it.
 
-A job's **effect** is a set of assertions about the partitions file, in
-terms of GUIDs and pkeys, taken from the request:
+A DELETE of a network or port that isn't recorded still bumps the
+generation and creates a job, with its identity taken from the request's
+body, which networking-mlnx sends on DELETE as on create.
 
-| Request | Effect |
+### Effects
+
+A job's **effect** is stated relative to its own object, as the leader's
+render attributes each partition and each explicit membership to the
+network or port it comes from. Keyword members, such as `ALL=limited`, are
+never counted.
+
+| Request | Effect, in the swept body |
 | --- | --- |
-| Create or update a VLAN network | Its pkey's partition exists |
-| Delete a network | Its pkey's partition doesn't exist; none of its ports' GUIDs is in a network's partition |
-| Create or update a port | Its GUID is a full member of its network's partition (or the flat partition), and of no other network's partition |
-| Delete a port | Its GUID is in no network's partition, nor the flat partition |
+| Create or update a VLAN network | A partition attributed to the network, with its current pkey |
+| Create or update a flat network | Nothing beyond the swept generation: flat networks share the flat partition |
+| Delete a network, VLAN or flat | No partition, and no membership, attributed to the network or its ports |
+| Create or update a port | A full membership of its GUID attributed to the port, in its network's partition or the flat partition, and no other membership attributed to it |
+| Delete a port | No membership attributed to the port |
 
-A DELETE of a network or port that isn't recorded takes its pkey or GUID
-from the request's body, which networking-mlnx sends on DELETE as on create,
-and still bumps the generation and creates a job.
+Every effect also needs the swept generation to be at least the job's. So a
+delete completes once a sweep of a state at or after it has nothing from its
+object, whatever else holds the same pkey or GUID by then. A port created at
+G and deleted at G+1 never has a membership attributed to it in a swept
+body, so its create times out and fails, while its delete completes.
 
 ## The lease
 
 The lease row names the leader and its **term**, a counter that only goes
-up. Every action of a leader on OpenSM, and every record of what it swept,
-carries the term, and is a compare-and-set on it, so a deposed leader's late
-writes are refused.
+up. Every action of a leader on OpenSM or the fabric, and every record of
+what it swept or fenced, is a compare-and-set on its term, so a deposed
+leader's late writes are refused.
 
 - **Renewal:** the leader increments the lease's renewal counter every few
-  seconds, matching its instance UUID and term. A renewal that matches no
-  row means it lost the lease: it stops OpenSM at once (see Stepping down).
+  seconds, matching its instance UUID and term, on a thread of its own that
+  runs through applies and fencing alike. A renewal that matches no row
+  means it lost the lease: it stops OpenSM at once (see Stepping down).
 - **Expiry:** every other instance watches the renewal counter on its own
-  monotonic clock. Once it hasn't changed for `T`, the lease has expired,
-  and the instance may try to take over. Nothing compares the database's
-  clock with any other.
-- **Taking the lease:** a candidate takes the lease with a compare-and-set
-  that includes the counter it saw unchanged, setting itself as leader with
-  the term incremented, and the old leader as the takeover's target. Only
-  the winner proceeds. It then fences the old leader (see Fencing), and
-  only on a confirmed fence starts OpenSM.
+  monotonic clock. Once it hasn't changed for `T`, or the lease was
+  released, an instance may try to take over. Nothing compares the
+  database's clock with any other.
+- **The target set** holds every node that may have run OpenSM since the
+  last stop that was released or confirmed. A takeover never removes a node
+  from it, except with a term compare-and-set that records the node's
+  confirmed fence or verified stop. So a takeover whose winner dies
+  mid-fence leaves its targets, and itself, for the next.
+- **Taking the lease:** a candidate first checks that its own fabric port is
+  Active, not disabled. It then takes the lease with a compare-and-set that
+  includes the counter it saw unchanged, setting itself as leader with the
+  term incremented, and adding itself to the target set. Only the winner
+  proceeds. It fences every other node in the target set (see Fencing), and
+  only once none is left but itself starts OpenSM.
 - **Releasing the lease:** a leader that stops cleanly, for example for an
-  upgrade, stops OpenSM, verifies that it has stopped, and clears the
-  lease's target. A successor then needs no fence.
+  upgrade, stops OpenSM, verifies that it has stopped (see Fencing, step 2),
+  removes itself from the target set and marks the lease released. A
+  successor can take it at once, and needs no fence.
 
-A candidate must have a configuration whose hash the current configuration
-epoch allows, and must not itself be fenced.
+A takeover whose own commit outcome is unknown counts as taken: the
+instance adds itself to the target set before it can know, so a successor
+fences it.
+
+A candidate's configuration hash must be one the current configuration
+epoch allows, and the candidate must not itself be fenced.
 
 ## Requests and applying
 
-1. HAProxy sends networking-mlnx's request to any instance. With no leader,
-   for example during a takeover, it answers 503, which networking-mlnx
-   retries, rather than accepting a job that can't complete in time.
-2. The instance records the change and its job, as above, and answers with
-   the job's path.
-3. The leader polls the generation, every second or so, and is woken at once
+1. HAProxy sends networking-mlnx's request to any instance. The instance
+   records it whenever Galera is up, leader or not, and answers with the
+   job's path. A job's status is always answered, never with 503, since
+   networking-mlnx answers anything but a timeout on a job poll by sending
+   its request again.
+2. The leader polls the generation, every second or so, and is woken at once
    when it took the request itself.
-4. When it is behind, it reads the generation and the whole state in one
-   consistent-read transaction, renders the partitions file, checks it (see
-   Configuration), writes it atomically and fsyncs it, sends OpenSM SIGHUP,
-   and waits for the sweep that starts after the signal to end, with no
-   errors (see OpenSM errors).
-5. It records the generation and the body it swept in `applied`, with a
-   compare-and-set on its term.
+3. When it is behind, it reads the generation and the whole state in one
+   consistent-read transaction, renders the partitions file without the
+   quarantined objects, checks it (see Configuration), writes it atomically
+   and fsyncs it, sends OpenSM SIGHUP, and waits for the sweep that starts
+   after the signal to end (see OpenSM errors).
+4. After the sweep, it checks the fabric (see Job completion), then records
+   the generation, the body, its attribution and the GUIDs with pkey errors
+   in `applied`, with a compare-and-set on its term.
 
 Applying is level-triggered: the leader always renders the newest state,
 never replays changes. The file's header carries the generation and an
@@ -140,40 +178,54 @@ pkey sweep. Every `check_interval`, the leader also reconciles: if its file
 isn't what it last applied, or the state rendered at that generation
 differs, it applies again.
 
+### Quarantine
+
+State is cumulative, so an object that makes a render fail would otherwise
+fail every later change, deletes included. So a failure is attributed to an
+object, and only that object is left out:
+
+- a check of the rendered file names the network or port whose partition or
+  membership broke it;
+- an OpenSM parse error names a line, which the render's attribution maps to
+  an object.
+
+The leader quarantines the object, fails its jobs, and applies the rest
+again. An object is released from quarantine by its next change or its
+deletion. If a failure can't be attributed, for example a template error,
+the leader keeps the last body it swept, fails the jobs of that generation,
+and raises an alarm; validating requests against the stored configuration
+makes that a template problem, not a request one.
+
 ### OpenSM errors
 
 OpenSM skips lines of a partitions file it can't parse and still finishes
 the sweep, and it logs, rather than fails on, a port whose pkey table it
-couldn't set. The leader treats both as a failed apply when they appear
-between the signal and the end of the sweep:
+couldn't set. The leader treats these as failures when they appear between
+the signal and the end of the sweep:
 
-- a partitions file parse error, `PARSE ERROR` from `parse_part_conf`;
+- a partitions file parse error, `PARSE ERROR` from `parse_part_conf`,
+  quarantines the line's object;
 - the pkey manager's and virtualisation manager's errors setting pkey
   tables, by their codes in OpenSM 5.17, from its binary's messages:
 
 | Code | Meaning | Treated as |
 | --- | --- | --- |
-| `ERR 0502` | No memory for a pending pkey entry | A failed apply of that port |
-| `ERR 0505`, `ERR 0508` | A pkey couldn't be set in a block and index of a port's table | A failed apply of that port |
-| `ERR 0506`, `ERR 0509` | A port's pkey table block couldn't be updated | A failed apply of that port |
-| `ERR 0512` | A pkey couldn't be set because the port's table is full | A failed apply of that port |
-| `ERR 0507`, `ERR 0513` | A switch port has too few pkey entries, so OpenSM **clears its enforcement bit**: the switch stops enforcing partitions on that port | A failed apply of every job, since isolation is lost at that switch port, and an alarm |
-| `ERR 0F12` | A PKeyTable request couldn't be started | A failed apply of that port |
-| `ERR 1503`, `ERR 5703` | A virtual port's pkey table couldn't be read or set | A failed apply of that port |
-| `ERR 6B06` | A virtual port's partition item couldn't be allocated | A failed apply of that port |
+| `ERR 0502` | No memory for a pending pkey entry | A pkey error on that port |
+| `ERR 0505`, `ERR 0508` | A pkey couldn't be set in a block and index of a port's table | A pkey error on that port |
+| `ERR 0506`, `ERR 0509` | A port's pkey table block couldn't be updated | A pkey error on that port |
+| `ERR 0512` | A pkey couldn't be set because the port's table is full | A pkey error on that port |
+| `ERR 0507`, `ERR 0513` | A switch port has too few pkey entries, so OpenSM **clears its enforcement bit**: the switch stops enforcing partitions on that port | A pkey error on every port behind that switch port, and an alarm |
+| `ERR 0F12` | A PKeyTable request couldn't be started | A pkey error on that port |
+| `ERR 1503`, `ERR 5703` | A virtual port's pkey table couldn't be read or set | A pkey error on that port |
+| `ERR 6B06` | A virtual port's partition item couldn't be allocated | A pkey error on that port |
 
-Codes outside this list, such as the SA's `ERR 45xx` for requests between
-ports that share no pkey, are about clients, not about applying the file,
-and aren't treated as failures. The list is matched by code, `ERR 0507:`
-for example, since the message texts may change between OpenSM versions;
-a newer OpenSM's codes need checking before it is supported.
-
-A parse error is a property of the generation, not of the node: the same
-file fails on every OpenSM. So the leader records the generation as
-rejected, fails its jobs, writes and applies the last body it swept again,
-and doesn't render again until the state changes. A pkey-table error on a
-port fails the jobs whose effects involve that port's GUID, and the leader
-retries at the next reconcile.
+A pkey error on a port's GUID is recorded in `applied`, so jobs whose
+effects involve that GUID don't complete, and the leader retries at the next
+reconcile. It doesn't count towards stepping down: one bad adapter mustn't
+move the leadership. Codes outside this list, such as the SA's `ERR 45xx`
+for requests between ports that share no pkey, are about clients, not about
+applying the file. The list is matched by code, `ERR 0507:` for example; a
+newer OpenSM's codes need checking before it is supported.
 
 ## Job completion
 
@@ -182,94 +234,103 @@ generation G is **Completed** when, in `applied`:
 
 1. the leader's term is the current term;
 2. the swept generation is at least G;
-3. the job's effect holds in the swept body, parsed as the checks parse it;
-4. the leader has checked, since its OpenSM started in this term, that the
-   fabric's master SM is its own OpenSM, by its port's GUID.
+3. the job's effect holds in the swept body, and no GUID it involves had a
+   pkey error in that sweep;
+4. the leader's fabric checks passed after that sweep.
 
-Because the effect is checked against what was actually swept, a later
-generation can't complete an earlier job whose effect it undid: a port
-created at G and deleted at G+1 never has its create's effect in a swept
-body, so the create times out and fails.
+The **fabric checks**, after every sweep:
 
-A job is **Failed** once its generation was rejected, or once the
-database's UTC time is past its creation time plus the job timeout, and it
-isn't Completed. Otherwise it is **Pending**. Status is computed when a job
-is read, in that order, and written to its row the first time it is
-terminal, with `UPDATE ... WHERE status IN ('Pending', 'Running')`; a
-reader whose update matches no row returns the stored status.
+- **Complete topology:** OpenSM discovered every switch in
+  `expected_switches`. That list is configured at deployment, or learnt
+  from sweeps and confirmed by an operator, so that a leader on a fragment
+  of a split fabric, or one whose own link is down, doesn't count its
+  fragment as the fabric.
+- **No other subnet manager:** the leader's own SA knows of no SM but its
+  own OpenSM, by its SMInfo records, and OpenSM logged no other SM, such as
+  entering STANDBY or finding a remote master, since the last check.
 
-A job whose effect can't hold in the current state, for example a port's
-create after the port was deleted, may be failed at once rather than at its
-timeout. That is an optimisation, not what makes completion safe.
+A failed check raises an alarm, and no job completes until a check passes
+again. A second SM found while leading is fenced if it is a managed node,
+and otherwise left for an operator.
+
+A job is **Failed** once its object is quarantined, or once the database's
+UTC time is past its stored deadline, and it isn't Completed. Otherwise it
+is **Pending**. Status is computed when a job is read, in that order, and
+written to its row the first time it is terminal, with
+`UPDATE ... WHERE status IN ('Pending', 'Running')`; a reader whose update
+matches no row returns the stored status.
 
 A request whose commit outcome is unknown, and which networking-mlnx sends
 again, creates a second job with the same effect. That is harmless.
 
 ## Fencing
 
-Before a new leader starts OpenSM, the old leader's OpenSM must be unable to
-act on the fabric. That can't depend on the old leader's cooperation: it may
-be paused, hung, or cut off from the management network while its OpenSM
-still runs. The new leader climbs a ladder, and the takeover proceeds once
-step 2, 3 or 4 confirms:
+Before a new leader starts OpenSM, every other node in the target set must
+be unable to act on the fabric. That can't depend on those nodes'
+cooperation: one may be paused, hung, or cut off from the management network
+while its OpenSM still runs. For each target, the new leader records its
+fence intent, the node, the step and the switch ports, with a term
+compare-and-set before it acts, so that a successor can finish or undo it.
+It then climbs a ladder, and the target leaves the set once step 2, 3 or 4
+confirms:
 
-1. **Ask.** Send the old SM a SubnSet(SMInfo) with the DISABLE modifier and
-   the SM_Key, which a live OpenSM honours by going to NOT-ACTIVE. It can't
-   be confirmed, since a frozen SM neither honours nor answers it, so it
-   never counts on its own; it only makes the next steps gentler.
-2. **Kill the container.** Over SSH, with a key restricted to one forced
-   command, kill the old node's OpenSM container and confirm, through the
-   container runtime, that it has exited. This covers a paused or hung
-   manager, and a paused OpenSM container: under cgroup v2, `docker kill`
-   stops a paused container at once, as checked on this host. It needs the
-   node to be reachable and running.
+1. **Ask.** Send the target's SM a SubnSet(SMInfo) with the DISABLE modifier
+   and the SM_Key, which a live OpenSM honours by going to NOT-ACTIVE. It
+   can't be confirmed, since a frozen SM neither honours nor answers it, so
+   it never counts on its own.
+2. **Stop it on the host.** Over SSH, with a key restricted to a forced
+   command, a small script with two subcommands, `kill` and `status`: kill
+   the target's OpenSM container, and confirm through the host's process
+   table that no OpenSM process runs on the host, in any container or
+   outside one, such as a distribution's `opensm` service. Under cgroup v2,
+   `docker kill` stops a paused container at once, as checked on the test
+   host. This needs the target to be reachable and running.
 3. **Disable its switch ports.** With the M_Key, send SubnSet(PortInfo) to
-   the switch ports the old node's adapters are cabled to, setting them to
-   Disabled, and confirm by querying them that they are disabled and their
-   links down. The switch acts on it in its own firmware, whatever the old
-   node is doing, and the old node can't undo it: it has no path to the
-   switch. This covers a paused or hung node, and one cut off from the
-   management network. Before disabling a port, the leader checks that the
-   port's neighbour is the GUID the node registered, so that a wrong
-   mapping can't cut off another node. It needs M_Key protection, so that
-   only the managers can do it.
-4. **Power it off.** Optionally, through the node's BMC, with IPMI or
-   Redfish, as Pacemaker's `fence_ipmilan` and `fence_redfish` do, where the
-   deployment has BMC credentials.
+   every switch port cabled to one of the target's adapters, setting it to
+   Disabled, and confirm by querying that it is disabled and its link down.
+   The switch acts on it in its own firmware, whatever the target is doing,
+   and the target can't undo it, having no path to the switch. This covers
+   a paused or hung node, and one cut off from the management network.
+   - **Which ports:** those whose neighbours, in a fabric scan, have one of
+     the target's adapters' node GUIDs, cross-checked with the static map.
+     A port whose link is already down, so that its neighbour can't be read,
+     is disabled if the static map names it.
+   - **Never the wrong one:** a port is never disabled if its neighbour is
+     one of the fencer's own adapters, or another live node's, so that a
+     fencer can't cut itself or a healthy peer off, even if adapters moved
+     between hosts.
+   - **Lasting:** while the target is fenced, the leader asserts and checks
+     that its ports are still disabled every `check_interval`, since a
+     switch reboot or its management can enable them again.
+4. **Power it off.** Optionally, through the target's BMC, with IPMI or
+   Redfish, as Pacemaker's `fence_ipmilan` and `fence_redfish` do. It must
+   power the node off, not reboot it, since a booting node could start an
+   OpenSM of its own.
 
-Fencing is recorded in the node's row: the fencer, the step that confirmed,
-and a deadline. Only the instance that took the lease runs the fence. If it
-dies, the lease expires again, and the next candidate takes it and repeats
-the fence, so every step must be idempotent. Disabling a fenced node's ports
-is a lasting state until it is unfenced: its fabric traffic, its storage or
-workloads on InfiniBand included, stops.
+Steps 3 and 4 are never used against the fencer's own node: a new leader
+that is also in the target set, for example because its manager restarted,
+counts its own old OpenSM as stopped only on step 2's check, run locally.
+
+Fencing a node stops its InfiniBand traffic, its own storage or workloads on
+the fabric included, until it is unfenced. Every step must be idempotent,
+since a successor repeats it.
 
 If no step confirms within `[ha] fence_timeout`, the takeover doesn't start
-OpenSM. The new leader keeps the lease, answers 503, retries the ladder, and
-raises an alarm; an operator can confirm a fence with the CLI, which asks
-them to check that the old node's OpenSM can't act. The fabric then runs on
-the old OpenSM, if it still runs, or without a subnet manager, until then.
+OpenSM. The new leader keeps the lease, retries the ladder and raises an
+alarm; an operator can confirm a fence with the CLI, which asks them to
+check that the target's OpenSM can't act. The fabric runs on the target's
+OpenSM, if it still runs, or without a subnet manager, until then.
 
-HA mode refuses to start unless every node has the container-runtime agent
-and switch-port fencing configured, or `[ha] fencing = manual` is set,
-which makes every takeover wait for an operator.
+HA mode refuses to start unless:
 
-### The priority boost
+- M_Key protection is on, at protection level 1 or more, so that only the
+  managers can disable switch ports;
+- every node has the container-runtime agent and its static map
+  configured, or `[ha] fencing = manual` is set, which makes every takeover
+  wait for an operator.
 
-As an opt-in, `[ha] unfenced_takeover = priority`, a new leader whose fence
-can't be confirmed may start OpenSM anyway at a boosted priority: OpenSM's
-masters are elected by priority, so a stale master that resumes should see a
-higher-priority master and step down. Leaders normally run at a base
-priority, and drop back to it, which needs an OpenSM restart, once the old
-leader is confirmed fenced or unfenced. At most one possibly-alive node may
-run boosted, recorded in the lease row; a takeover that finds one waits for
-a fence.
-
-It isn't a fence: a resumed stale master sweeps until it notices the other
-master, and may set ports' pkey tables first. It stays off until testing on
-a fabric with two SMs shows that a lower-priority stale master steps down
-before it touches pkeys. Jobs still need the new leader's own sweep, so
-nothing completes on a stale SM's word.
+The keys are then in Galera and its backups, as well as in OpenSM's files
+and log, so the backups need the same protection.
 
 ## Unfencing
 
@@ -277,18 +338,18 @@ A fenced node's switch ports stay disabled until its OpenSM is known stopped
 and unable to start by itself:
 
 1. Its manager comes back and registers, with a new instance UUID, and sees
-   that it doesn't hold the lease.
+   that it doesn't hold the lease. A manager that finds it lost the lease
+   without restarting does the same, with a new UUID.
 2. It tells its watchdog to stop OpenSM, if it still runs, for example after
    a network partition rather than a crash, and records that OpenSM is
-   stopped. The watchdog only starts OpenSM on a start request for a term
-   the node holds, so OpenSM can't come back by itself.
+   stopped. The watchdog only starts OpenSM on a single-use start request
+   for a term the node holds, so OpenSM can't come back by itself.
 3. It asks to be unfenced, in its node row.
-4. The leader checks independently, through the container-runtime agent,
-   that the node's OpenSM container isn't running, and that its
-   configuration's hash is allowed.
-5. The leader re-enables the node's switch ports, confirms that they are up,
+4. The leader checks independently, with step 2's `status`, that no OpenSM
+   runs on the node's host, and that its configuration's hash is allowed.
+5. The leader enables the node's switch ports, confirms that they are up,
    and its OpenSM brings the node's ports to Active and sets their pkey
-   tables.
+   tables. The node's fence record is cleared with a term compare-and-set.
 6. The node becomes a candidate again.
 
 If the leader can't verify, the ports stay disabled until an operator
@@ -296,60 +357,77 @@ unfences the node with the CLI.
 
 ## The watchdog
 
-OpenSM's container runs a small watchdog as its PID 1, with no restart
-policy. It starts OpenSM only on a start request from the manager, and kills
-it with SIGKILL, then exits, so that the container stops, when its lease
-expires, when the manager asks it to stop, or when OpenSM exits.
+OpenSM's container keeps joining the manager's PID namespace, so that OpenSM
+dies with the manager whenever the manager exits. Its entrypoint is a small
+watchdog, which starts OpenSM only on a start request, and kills it with
+SIGKILL when its lease expires, when the manager asks it to stop, or when
+OpenSM exits; then the watchdog exits too, so the container stops. The
+container has no restart policy. The watchdog runs in its own container's
+cgroup, so pausing the manager's container doesn't pause it.
 
-- **The lease** is renewed by the manager's own liveness: its heartbeat
-  thread renews it only while the apply loop makes progress, and every
-  runtime call has a timeout. A paused, hung or crashed manager stops
-  renewing it, and OpenSM stops within `T_watchdog`. Losing the database
-  doesn't stop renewal: a leader cut off from Galera keeps its OpenSM
-  running, so a MariaDB outage doesn't leave the fabric without a subnet
-  manager, and it is fenced if another instance takes over.
+- **The lease** is renewed by a liveness thread of the manager, which
+  renews it only while the manager's apply loop and lease renewal make
+  progress. "Progress" allows for the longest blocking call, such as a
+  sweep's wait, and every runtime and database call has a timeout shorter
+  than that. So `T_watchdog` must exceed `sweep_timeout` and the call
+  timeouts. A paused, hung or crashed manager stops renewing, and OpenSM
+  stops within `T_watchdog`. Losing the database doesn't stop renewal: a
+  leader cut off from Galera keeps its OpenSM running, so a MariaDB outage
+  doesn't leave the fabric without a subnet manager, and it is fenced if
+  another instance takes over.
 - **The lease and the start request** are on a tmpfs the two containers
   share, so they don't survive a reboot, tagged with the host's boot ID, the
   instance UUID and the term. The deadline is in the host's monotonic clock,
-  which every container on the host shares. The watchdog refuses a request
-  for another boot, instance or term.
-- **Before starting OpenSM,** the watchdog checks that the partitions file
-  exists and has the generation the start request names: with no file,
-  OpenSM would make every port a full member of the default partition.
+  which every container on the host shares. A start request is consumed
+  when used, and step 2's `kill` removes both files, so a later
+  `docker start` of the container can't start OpenSM.
+- **Before starting OpenSM,** the watchdog checks the hashes of
+  `partitions.conf` and `opensm.conf` against those the start request
+  names: with no partitions file, OpenSM would make every port a full member
+  of the default partition, and an old `opensm.conf` could have other keys.
 
 The watchdog can't cover a pause of its own container, or of the node: a
 frozen OpenSM can resume before the watchdog does. Fencing covers that,
-since a takeover fences before it starts another OpenSM.
+since a takeover fences every target before it starts another OpenSM.
 
 The single-node manager starts OpenSM again whenever it stops. In HA mode it
-doesn't: an OpenSM that stops makes its leader step down, and a new leader's
-takeover, possibly the same node's, starts it.
+doesn't: an OpenSM that stops makes its leader step down, and a new
+takeover, possibly by the same node, starts it.
 
 ### Stepping down
 
-A leader steps down, by stopping OpenSM through the watchdog, verifying that
-the container exited, and releasing the lease, when its renewal matches no
-row, when OpenSM exits, when it can't apply for reasons other than a
-rejected generation past a threshold, or when its configuration is no longer
-allowed. If it can't verify that OpenSM stopped, it stops renewing the
-watchdog's lease, which kills OpenSM within `T_watchdog`, and doesn't
-release the lease, so that a successor fences it.
+A leader steps down, by stopping OpenSM through the watchdog, verifying with
+step 2's `status` locally that no OpenSM runs, and releasing the lease, when
+its renewal matches no row, when OpenSM exits, when its configuration is no
+longer allowed, or when it can't apply past a threshold for reasons other
+than quarantine and pkey errors. If it can't verify that OpenSM stopped, it
+stops renewing the watchdog's lease, which kills OpenSM within
+`T_watchdog`, and doesn't release the lease, so that a successor fences it.
 
 ## Timeouts
 
-A takeover takes up to `T` for the lease to expire, plus the fence, plus
-starting OpenSM and its first sweep. Jobs in flight during a takeover must
-not time out, or networking-mlnx sets their ports to ERROR, and a failed
-DELETE blocks every later create of its GUID until the journal is repaired.
-So:
+A takeover takes up to `T` for the lease to expire, plus fencing, plus
+starting OpenSM and its first sweep. A job in flight during a takeover must
+not time out, or networking-mlnx sets its port to ERROR. So, with every
+value a cluster setting in Galera, so that all instances agree:
 
-`job timeout > T + fence_timeout + OpenSM start + first sweep`
+- job timeout > `T` + `fence_timeout` + OpenSM's start and first sweep;
+- Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
+  sync interval + its retry backoff + the job timeout.
 
-and Nova's and Ironic's waits for ports must be longer still. With the
-example values, `T` 30 s, `fence_timeout` 60 s, OpenSM start and sweep
-30 s, the job timeout must exceed two minutes; 300 s is a safer default.
-`T_watchdog`, the watchdog's lease, can be short, 15 s, since it depends
-only on the manager's own liveness.
+With `T` 20 s, `fence_timeout` 60 s, and 60 s for OpenSM's start and first
+sweep, the job timeout must exceed 140 s; the default is 180 s. Nova's
+default `vif_plugging_timeout` is 300 s, which leaves 120 s for the journal's
+sync interval of 10 s and its backoff, so it holds, but only just: a
+deployment that raises the job timeout must raise Nova's and Ironic's waits
+too. `T_watchdog` must exceed `sweep_timeout`, 30 s, and the call timeouts;
+the default is 45 s.
+
+A failed DELETE is retried by networking-mlnx, `retry_count` times, forever
+by default, so with the relative delete effects it completes once a leader
+sweeps again. With a finite `retry_count`, a DELETE that runs out of
+retries blocks every later create of its GUID until the journal is
+repaired.
 
 ## Configuration
 
@@ -362,8 +440,8 @@ The leader writes both of OpenSM's files:
   environment with undefined variables as errors.
 
 Before writing a rendered file, the manager parses it and refuses to apply
-it, failing the jobs, unless all of these hold, as the single-node manager
-already checks:
+it, quarantining the object that breaks it, unless all of these hold, as the
+single-node manager already checks:
 
 - the default partition is defined;
 - every network's partition, and the flat networks' partition, has exactly
@@ -382,22 +460,27 @@ networks.
 
 ### Configuration epochs
 
-The configuration's hash is stored with an epoch, which allows one hash, or
-two during a rolling change. Only an instance whose configuration is
-allowed may become leader; a leader whose configuration is no longer
-allowed steps down. Only one OpenSM runs, so a change is applied by the
-leader restarting it:
+The configuration's hash covers everything that decides the partitions and
+how OpenSM protects the fabric: the template, `default_partition`,
+`flat_pkey`, `shared_default_partition`, the IPoIB settings, the hardening
+groups, the keys, and the `opensm.conf` overrides, except node-specific ones,
+such as the port GUID OpenSM binds to, and paths. The cluster settings, the
+lease and job timeouts among them, are stored in Galera, not in each
+instance's configuration. The hash is stored with an epoch, which allows one
+hash, or two during a rolling change. Only an instance whose hash is
+allowed may become leader; a leader whose hash is no longer allowed steps
+down. Only one OpenSM runs, so a change is applied by the leader restarting
+it:
 
-- **Rolling changes** are an allowlist in code: `sweep_interval`, routing,
-  logging and the manager's own timeouts. The operator records the new
-  hash, updates the candidates, then the leader, which restarts OpenSM.
-- **Everything else** is fabric-affecting, the keys included: the operator
-  records the new epoch with only the new hash, so that only updated
-  candidates can lead, and the leader steps down. Changing a key needs a
-  key rotation procedure, which is future work: until then the manager
-  refuses to start with keys other than the stored ones.
-
-During a change, requests get 503 while there is no leader.
+- **Rolling changes** are an allowlist in code: `sweep_interval`, routing
+  and logging. The operator records a new epoch that allows both hashes,
+  updates the candidates, then the leader, which restarts OpenSM, then
+  records an epoch with only the new hash.
+- **Everything else** is fabric-affecting, the keys included. The operator
+  updates the candidates, then records an epoch with only the new hash, so
+  that the leader steps down and an updated candidate takes over. Changing a
+  key needs a key rotation procedure, which is future work: until then the
+  manager refuses to start with keys other than the stored ones.
 
 ## Galera specifics
 
@@ -416,13 +499,12 @@ the OpenStack services do. SQLAlchemy makes the backend a
 - **Read your own writes.** Every manager session sets
   `wsrep_sync_wait = 1`, so a read waits for writes already committed on
   other Galera nodes; Kolla's VIP fails over between Galera nodes.
-- **UTC.** Timestamps are `DATETIME(6)` values set with
-  `UTC_TIMESTAMP(6)`, and the timeout compares them with it, so that no
-  session's timezone or daylight saving change can age a job. SQLite uses
-  its own UTC functions. Galera's nodes need synchronised clocks, within
-  much less than the job timeout, since a job's timeout is judged by
-  whichever node serves the read. Lease expiry doesn't use the database's
-  clock.
+- **UTC.** Timestamps and deadlines are `DATETIME(6)` values set and
+  compared with `UTC_TIMESTAMP(6)`, so that no session's timezone or
+  daylight saving change can age a job. SQLite uses its own UTC functions.
+  Galera's nodes need synchronised clocks, within much less than the job
+  timeout, since a deadline is judged by whichever node serves the read.
+  Lease expiry doesn't use the database's clock.
 - **Schema migrations.** Alembic, run by one instance at deploy time, rather
   than `create_all` at startup.
 - **One instance per name.** An instance registers a UUID on its node row
@@ -439,97 +521,116 @@ instance can't reach the database.
   release the lease, which a candidate takes without a fence, and upgrade
   it. Schema changes must be compatible with the version before, so that
   old and new instances can share the database during the upgrade; a
-  version that can't, says so, and needs every instance stopped.
+  version that can't, says so, and needs every instance stopped. Each
+  release of the lease restarts OpenSM on another node, so its SA state is
+  rebuilt.
 - **From single node:** with the manager stopped, which stops OpenSM too,
   so the fabric has no subnet manager meanwhile:
   1. copy the networks, ports and keys into Galera, and continue the
      generation above the single-node one, which the partitions file's
      header carries;
-  2. copy the jobs, keeping their IDs, since journal rows that are
+  2. record the single-node host as verified stopped, so that the first
+     leader's target set is empty;
+  3. copy the jobs, keeping their IDs, since journal rows that are
      monitoring a job would otherwise get 404 and send their requests
      again;
-  3. keep terminal jobs as they are, and give every unfinished job,
-     `Pending` or `Running`, the migration's generation, status `Pending`,
-     and its effect, from its operation and object.
+  4. keep terminal jobs as they are, and give every unfinished job,
+     `Pending` or `Running`, the migration's generation, a deadline, status
+     `Pending`, and its effect, which for a delete needs only its object's
+     identity, by the relative rule.
 
   The unfinished jobs then complete, or fail, once the first leader has
-  swept a state in which their effects hold.
-- **Job history.** Purge finished jobs after a retention period, from any
-  instance, since the purge is idempotent.
+  swept.
+- **Job history.** Keep finished jobs for longer than networking-mlnx can
+  poll one, a day, say, then purge them from any instance, since the purge
+  is idempotent; a poll of a purged job gets 404, and networking-mlnx would
+  send its request again.
 
 ## Failure scenarios
 
-Every case fails closed: a port waits, or its request gets 503, rather than
-becoming ACTIVE before the leader's OpenSM has swept its partition.
+Every case fails closed: a port waits rather than becoming ACTIVE before the
+leader's OpenSM has swept its membership with the whole fabric in view.
 
 | Failure | What happens | Outcome |
 | --- | --- | --- |
-| The leader's manager crashes | Its watchdog kills OpenSM within `T_watchdog`. After `T` a candidate takes the lease, fences the old node (its container is already stopped), and starts OpenSM | Jobs wait through the takeover |
-| The leader's manager paused or hung | As above: the watchdog lease isn't renewed | As above |
-| The leader's node, or OpenSM's container, paused | Nothing on the node runs. A candidate takes the lease and fences it: the container kill if the runtime answers, otherwise its switch ports are disabled | Jobs wait through the takeover. A resumed OpenSM has no link |
-| The leader cut off from the management network, OpenSM still running | It keeps renewing its watchdog lease. A candidate takes the lease, can't reach it over SSH, and disables its switch ports | As above |
+| The leader's manager crashes | Its OpenSM dies with it, through the PID namespace. After `T` a candidate takes the lease, fences the old node (step 2 confirms), and starts OpenSM | Jobs wait through the takeover |
+| The leader's manager paused or hung | Its watchdog's lease expires, and OpenSM stops within `T_watchdog`. A candidate takes over as above | As above |
+| The leader's node, or OpenSM's container, paused | Nothing on the node runs. A candidate takes the lease and fences it: step 2 if its host answers, otherwise step 3 | Jobs wait through the takeover. A resumed OpenSM has no link |
+| The leader cut off from the management network, OpenSM still running | It keeps renewing its watchdog's lease. A candidate takes the lease, can't reach it over SSH, and disables its switch ports | As above |
 | The leader cut off from Galera only | Its OpenSM keeps running. A candidate takes the lease and fences it | As above |
-| No fence step can confirm | The new leader doesn't start OpenSM, answers 503 and raises an alarm | The fabric runs on the old OpenSM, or without one, until an operator confirms a fence |
+| A takeover's winner dies mid-fence | Its targets, and itself, stay in the target set. The next candidate fences them all | Jobs wait longer |
+| No fence step can confirm | The new leader doesn't start OpenSM and raises an alarm | The fabric runs on the old OpenSM, or without one, until an operator confirms a fence |
+| A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing | No job completes; alarm |
+| Another SM appears | The fabric checks find it | No job completes until it is fenced or removed; alarm |
 | Galera unavailable | Requests and `/healthz` fail; no takeover is possible | The leader's OpenSM keeps running. networking-mlnx retries its requests |
-| OpenSM exits | The leader steps down, verifying the container exited, and a candidate takes over without fencing | Jobs wait through the takeover |
-| OpenSM rejects a generation | It is recorded as rejected, its jobs fail, and the leader applies the last body it swept again | Later changes carry on. No node is fenced |
-| A port's pkey table can't be set | The jobs involving its GUID fail, and the leader retries at the next reconcile | Other jobs carry on |
+| OpenSM exits | The leader steps down, verifying that no OpenSM runs, and a candidate takes over without fencing it | Jobs wait through the takeover |
+| An object breaks the render or OpenSM's parse | It is quarantined and its jobs fail | Every other change carries on |
+| A port's pkey table can't be set | Jobs involving its GUID wait, and the leader retries | Other jobs carry on; the leadership stays |
 | A deposed leader writes late | Its compare-and-set on the term fails | Nothing happens |
-| A port is created then deleted before a sweep | The create's effect never holds in a swept body | The create times out and fails; the delete completes |
+| A port is created then deleted before a sweep | No swept body has a membership attributed to it | The create times out and fails; the delete completes |
 
 ## Alternatives considered
 
 | Option | Why not |
 | --- | --- |
-| OpenSM's own master and standbys on every node | A standby takes over by itself, with whatever file it has, which nobody may have applied, and jobs need evidence from every node. One OpenSM at a time makes a job's evidence one sweep |
+| OpenSM's own master and standbys on every node | A standby takes over by itself, with whatever file it has, which nobody may have applied, and jobs need evidence from every node. One OpenSM at a time makes a job's evidence one sweep. Its election would keep the SA up through a failure, and work without Galera, which this design gives up |
 | Raft among the manager instances | Galera already gives replicated state with quorum. Raft would add a second consensus that can disagree with it, and a Raft leader is still a lease that a paused process can outlive, so fencing is needed anyway |
 | tooz's MySQL backend for the lease | It uses `GET_LOCK`, which Galera doesn't replicate. tooz with etcd would do, where a deployment runs etcd |
 | Renewing the watchdog's lease only on database success | A MariaDB outage would then stop every OpenSM; fencing at takeover covers a leader cut off from the database |
-| The priority boost as the only way to take over | It isn't a fence: a resumed stale master may set pkeys before it steps down. It is an opt-in, after testing |
+| Taking over unfenced, at a boosted priority, so a stale master steps down | A resumed stale master sweeps until it notices the other master, and can undo a completed job, such as put back a deleted port, before it steps down |
 | Fencing by M_Key rotation | OpenSM has no supported online key rotation; revisit with key rotation |
+| Answering 503 without a leader | networking-mlnx backs off on it, and resends a job poll answered with it; recording requests whenever Galera is up is simpler and loses nothing |
 
 ## Implementation plan
 
 - [ ] Verify on a fabric with two OpenSMs: SMInfo DISABLE; switch-port
-      disabling and its confirmation with the M_Key; how a lower-priority
-      stale master behaves; `sminfo` with the M_Key and SM_Key.
-- [x] Verify on this host: `docker kill` kills a paused container's
-      processes under cgroup v2; OpenSM 5.17's codes for pkey-table errors
-      (see OpenSM errors).
+      disabling and its confirmation with the M_Key; the SA's SMInfo
+      records of another SM; OpenSM's log when it finds one.
+- [x] Verify on the test host: `docker kill` stops a paused container under
+      cgroup v2; OpenSM 5.17's codes for pkey-table errors.
 - [x] Single node: a DELETE of an unknown object creates a job rather than
       answering 404; the checks of rendered files; the managed driver; and
       reconciling the file with the database.
-- [ ] Single node: treat pkey manager errors as failed applies, and record
-      rejected generations rather than retrying them.
-- [ ] Single node: jobs record their effect, and complete only when it holds
-      in the swept body.
+- [ ] Single node: the pkey error codes, recorded per GUID; quarantine of
+      the objects that break a render or OpenSM's parse; the render's
+      attribution of partitions and memberships to objects.
+- [ ] Single node: jobs record their effect and deadline, and complete only
+      when the effect holds in the swept body.
+- [ ] Single node: the fabric checks, against expected switches and other
+      SMs.
 - [ ] Database: a `[database] connection` URL, Alembic migrations, schema
-      version, configuration epochs, `wsrep_sync_wait`, UTC timestamps,
-      deadlock retry, the generation bump first in every request, constraint
-      errors as 400.
+      version, configuration epochs and cluster settings,
+      `wsrep_sync_wait`, UTC timestamps, deadlock retry, the generation bump
+      first in every request, constraint errors as 400.
 - [ ] The lease: taking, renewing, releasing, expiry on the monotonic clock,
-      terms in every compare-and-set, 503 without a leader.
+      terms in every compare-and-set, and the target set.
 - [ ] The watchdog: an entrypoint for OpenSM's container, with the lease and
-      start requests on tmpfs.
-- [ ] Fencing: SMInfo DISABLE, the restricted SSH agent, switch-port
-      disabling with the neighbour check, optional BMC agents, recording,
-      retry by the next leader, and unfencing.
-- [ ] A CLI to confirm fences, unfence nodes, and record configuration
-      epochs.
+      single-use start requests on tmpfs, and the file hashes.
+- [ ] Fencing: the recorded intent, SMInfo DISABLE, the restricted SSH
+      script, switch-port disabling with the fabric scan, the static map and
+      the neighbour checks, its re-assertion, optional BMC agents, retry by
+      the next leader, and unfencing.
+- [ ] A CLI to confirm fences, unfence nodes, record configuration epochs
+      and confirm expected switches.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
       in containers, with faults injected: the leader killed, paused, cut
-      off from the database or the network; a fence failing; OpenSM
-      rejecting a generation; a deposed leader writing late.
+      off from the database or the network; a winner dying mid-fence; a
+      fence failing; a quarantined object; a deposed leader writing late; a
+      fabric missing a switch.
 - [ ] Deployment: a Kayobe or Kolla-Ansible role with the HAProxy backend,
-      healthcheck, database credentials, SSH keys and the switch-port map.
+      healthcheck, database credentials, SSH keys, the static map, expected
+      switches, and the check that control traffic doesn't run over fenced
+      ports.
 
 ## Open questions
 
 - Does OpenSM 5.17 honour SMInfo DISABLE, and how quickly?
 - Can the switches' ports be disabled reliably with the M_Key, and does a
   disabled port stay disabled whatever its neighbour does?
-- What is the deployment's MariaDB failover time, and are 30 s for `T` and
-  300 s for the job timeout right?
+- How does OpenSM 5.17 log another SM, and do its SA's SMInfo records show
+  every SM on the fabric?
+- What is the deployment's MariaDB failover time, and are 20 s for `T` and
+  180 s for the job timeout right?
 - Do the OpenSM nodes have BMCs the manager may use?
 - Do the OpenSM nodes run the control plane, so they reach the database
   VIP, or are they separate hosts that need database access opened to them?
