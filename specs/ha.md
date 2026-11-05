@@ -1,6 +1,6 @@
 # High availability
 
-Status: proposed, 2026-11-05.
+Status: accepted for implementation, 2026-11-05.
 
 Run a fabric manager instance on every OpenSM node, behind HAProxy, with the
 shared state in the deployment's Galera cluster. Exactly one instance, the
@@ -20,7 +20,7 @@ Three principles carry the safety argument:
 - **A job completes only on evidence that the fabric has its effect:** the
   current leader's OpenSM swept a body in which the job's effect holds, in
   the leader's current term, while the leader saw the whole fabric and no
-  other subnet manager on it.
+  other subnet manager that could master or set ports.
 - **A new leader starts OpenSM only once every OpenSM that may have run
   since the last confirmed stop is known unable to act:** it was released
   cleanly, or a fence that doesn't depend on its cooperation confirmed it is
@@ -54,9 +54,10 @@ Three principles carry the safety argument:
 HAProxy sends each request to any of the three instances, which are all
 active backends, round robin with no session stickiness. Each instance
 records requests in Galera and answers polls from it. Only the leader
-renders the partitions file and runs OpenSM. No other subnet manager may run
-on the fabric, such as one embedded in a switch, and the leader checks after
-every sweep that none does (see Job completion).
+renders the partitions file and runs OpenSM. No other managed subnet
+manager may run on the fabric, nor one embedded in a switch, and the leader
+checks after every sweep that no other SM could master or set ports (see Job
+completion).
 
 The cluster's own control traffic, Galera, the management network and the
 fence agents' SSH, must not run over the InfiniBand ports of the nodes that
@@ -140,9 +141,9 @@ leader's late writes are refused.
   confirmed fence or verified stop. So a takeover whose winner dies
   mid-fence leaves its targets, and itself, for the next.
 - **Taking the lease:** a candidate first checks that its own fabric port's
-  physical link is up, its logical state Init or above, not Active, since
-  only a subnet manager makes a port Active, which would deadlock a cold
-  start, and its neighbouring switch port not disabled. It counts the
+  physical link is up, its logical state Init or above (Active is not
+  required, since only a subnet manager makes a port Active, which would
+  deadlock a cold start), and its neighbouring switch port not disabled. It counts the
   expected switches it can reach with directed-route SMPs, and publishes
   the count in its node row every few seconds. Only a candidate that reaches
   every expected switch may take the lease, or, once no candidate has for
@@ -264,9 +265,12 @@ The **fabric checks** run after every sweep and every `check_interval`:
   fragment as the fabric.
 - **No other subnet manager that matters:** the leader looks at the SMs
   its own SA knows, by their SMInfo records, and OpenSM's log since the last
-  check, and sorts them by port GUID:
-  - another managed node's SM fails the check, and is fenced, since it may
-    have the fabric's keys;
+  check, and sorts them by port GUID and by where they sit:
+  - another managed node's SM, one whose port GUID is a managed node's and
+    whose switch port is the one the static map names for it, fails the
+    check, and is fenced, since it may have the fabric's keys;
+  - an SM with a managed node's port GUID but on another switch port, as a
+    tenant spoofing a GUID would be, is treated as unknown, with an alarm;
   - an unknown SM, such as one a bare metal tenant runs, fails the check
     only if it is master or the leader's OpenSM went to STANDBY. Without the
     SM_Key and M_Key it can't win a handover or set ports, so otherwise it
@@ -361,8 +365,9 @@ and log, so the backups need the same protection.
 ## Unfencing
 
 A node fenced by step 2 alone has no disabled ports: it needs only steps 1
-to 3 and 6 below, so that its OpenSM is known stopped before it becomes a
-candidate again. A node whose ports step 3 disabled needs every step.
+to 4 and 6 below, and the leader clears its fence record, with a term
+compare-and-set, once step 4 has verified it, so that its OpenSM is known
+stopped before it becomes a candidate again. A node whose ports step 3 disabled needs every step.
 
 A fenced node's switch ports stay disabled until its OpenSM is known stopped
 and unable to start by itself:
@@ -447,7 +452,11 @@ when:
 
 Failures that every node would have the same way never make a leader step
 down: quarantine, pkey errors, template errors that can't be attributed, a
-dead expected switch. And leadership doesn't move again within
+dead expected switch. OpenSM runs with `stay_on_fatal`, so that a fatal
+fabric condition, such as a tenant's duplicated GUID, doesn't make it exit;
+and if OpenSM exits on two successive leaders within the cooldown, that is
+treated as a shared failure too: the leadership stays put, and the leader
+raises an alarm and retries starting OpenSM. And leadership doesn't move again within
 `[ha] step_down_cooldown`, five minutes say, of its last move, recorded in
 the lease row, unless the leader lost its lease or its OpenSM, so that a
 fault can't bounce it between nodes, restarting OpenSM and the SA each time.
@@ -463,12 +472,15 @@ starting OpenSM and its first sweep. A job in flight during a takeover must
 not time out, or networking-mlnx sets its port to ERROR. So, with every
 value a cluster setting in Galera, so that all instances agree:
 
-- job timeout > `T` + `fence_timeout` + OpenSM's start and first sweep;
+- job timeout > `T` + `T_reach` + `fence_timeout` + OpenSM's start and first
+  sweep;
 - Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
   sync interval + its retry backoff + the job timeout.
 
-With `T` 20 s, `fence_timeout` 60 s, and 60 s for OpenSM's start and first
-sweep, the job timeout must exceed 140 s; the default is 180 s. Nova's
+With `T` 20 s, `T_reach` 30 s, `fence_timeout` 60 s, and 60 s for OpenSM's
+start and first sweep, the job timeout must exceed 170 s; the default is
+180 s, which leaves only 10 s, so a deployment whose OpenSM takes longer to
+sweep must raise it. Nova's
 default `vif_plugging_timeout` is 300 s, which leaves 120 s for the journal's
 sync interval of 10 s and its backoff, so it holds, but only just: a
 deployment that raises the job timeout must raise Nova's and Ironic's waits
@@ -615,7 +627,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | No fence step can confirm | The new leader doesn't start OpenSM and raises an alarm | The fabric runs on the old OpenSM, or without one, until an operator confirms a fence |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
-| A cold start, every port in Init | Candidates need a link up and Init or above, not Active | A candidate that reaches every switch takes the lease and starts OpenSM |
+| A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
 | A MariaDB failover | Failed reads reset the candidates' timers | No takeover; the leader's OpenSM keeps running |
 | A managed node's SM appears | The fabric checks find it, and it is fenced | No job completes until then; alarm |
 | A tenant runs an SM | It has no keys, so it can't master or set ports | An alarm; jobs carry on unless it is master |
