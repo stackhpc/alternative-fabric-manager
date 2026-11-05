@@ -43,7 +43,7 @@ def main(argv=None):
     manager = manager_mod.Manager(
         config,
         db.make_sessionmaker(config.database),
-        drivers.make_reloader(config),
+        drivers.make_driver(config),
     )
     app = api.create_app(config, manager)
     manager.start()

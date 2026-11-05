@@ -18,14 +18,35 @@ token =
 database = /var/lib/alternative-fabric-manager/afm.sqlite
 
 [opensm]
-# The file OpenSM reads as its partition_config_file, in a directory that
-# is bind mounted into the OpenSM container.
-partitions_file = /etc/opensm/partitions.conf
-# docker: send SIGHUP to the container and wait for OpenSM's pkey sweep.
-# none: only write the file.
-reload = docker
+# managed: the manager runs OpenSM in its own container, in the manager's
+#   PID namespace, so that OpenSM never outlives the manager. The manager
+#   writes opensm.conf and partitions.conf, and starts OpenSM again if it
+#   stops.
+# docker: OpenSM runs in a container that something else starts, reading
+#   partitions.conf from config_dir; the manager only sends it SIGHUP.
+# none: only write the files.
+driver = managed
 container = opensm
+image = ghcr.io/stackhpc/docker-opensm:latest
+# Extra OpenSM arguments; prefer [opensm_conf].
+opensm_args =
+# Mounts of the OpenSM container, besides config_dir, as
+# source:destination[:mode], separated by commas.
+volumes = /lib/modules:/lib/modules:ro,/etc/localtime:/etc/localtime:ro,opensm_logs:/var/log,opensm_cache:/var/cache/opensm
+# The manager's own container, whose PID namespace OpenSM joins.
+manager_container = alternative-fabric-manager
+# OpenSM's files, as the manager sees them, and as the host does (for
+# OpenSM's bind mount). OpenSM sees them at /etc/opensm.
+config_dir = /etc/opensm
+host_config_dir = /etc/opensm
+# A Jinja template for partitions.conf, instead of the default. It gets
+# default_partition, networks (each with id, name, pkey, pkey_hex and guids),
+# ipoib (rate, mtu, sl) and generation, and what it renders is checked: every
+# network's pkey must have exactly its ports as full members.
+partitions_template =
+start_timeout = 120
 sweep_timeout = 30
+check_interval = 5
 apply_attempts = 3
 # Written as is. ALL=full keeps ports on flat networks, which share the
 # default partition, able to reach each other. For isolation, give ports
@@ -37,3 +58,10 @@ default_partition = Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=full, SELF=
 ipoib_rate = 3
 ipoib_mtu = 4
 ipoib_sl = 0
+
+[opensm_conf]
+# opensm.conf options for the managed driver, as "key = value". OpenSM uses
+# its defaults for the others. partition_config_file and daemon are set by
+# the manager.
+#sm_priority = 15
+#log_flags = 0x07

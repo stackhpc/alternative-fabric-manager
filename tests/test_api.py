@@ -292,3 +292,50 @@ def test_running_jobs_are_applied_after_a_restart(tmp_path, config, reloader):
 
 def test_unknown_job_is_not_found(client):
     assert client.get("/ufmRestV3/app/jobs/42", headers=AUTH).status_code == 404
+
+
+def test_start_writes_the_state_before_opensm(manager, config, reloader):
+    seen = []
+    reloader.start = lambda: seen.append(_file(config))
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager._write_current()
+    manager.driver.start()
+    assert f"net-{NETWORK_ID}=0x0064" in seen[0]
+
+
+def test_stopped_opensm_is_started_again(manager, config, reloader):
+    reloader.is_running = False
+    manager._check_opensm()
+    assert reloader.starts == 1
+    reloader.starts = 0
+    manager._check_opensm()
+    assert reloader.starts == 0
+
+
+def test_invalid_template_fails_jobs_without_writing(
+    client, manager, config, reloader, tmp_path
+):
+    from alternative_fabric_manager import partitions
+
+    path = tmp_path / "bad.j2"
+    path.write_text("{{ default_partition }}\nstorage=0x0064 : ALL=full ;\n")
+    manager.template = partitions.load_template(str(path))
+    response = _post(client, "Network", conftest.network())
+    manager.apply_pending()
+
+    job = _job(client, response)
+    assert job["Status"] == "Failed"
+    assert "0x0064" in job["Error"]
+    assert reloader.calls == 0
+    assert not pathlib.Path(config.partitions_file).exists()
+
+
+def test_guid_with_the_top_bit_set(client, manager, config):
+    # OpenStack's MAC addresses start with fa:16:3e, so their GUIDs do too.
+    _post(client, "Network", conftest.network())
+    response = _post(
+        client, "Port", conftest.port(client_id="20:fa:16:3e:00:00:12:34:56")
+    )
+    manager.apply_pending()
+    assert _job(client, response)["Status"] == "Completed"
+    assert "0xfa163e0000123456=full" in _file(config)

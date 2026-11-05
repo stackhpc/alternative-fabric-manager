@@ -40,10 +40,11 @@ class NotFound(LookupError):
 
 
 class Manager:
-    def __init__(self, config, sessionmaker, reloader):
+    def __init__(self, config, sessionmaker, driver, template=None):
         self.config = config
         self.sessionmaker = sessionmaker
-        self.reloader = reloader
+        self.driver = driver
+        self.template = template or partitions.load_template(config.partitions_template)
         # One SQLite connection is shared by every thread, so all database
         # access is serialised.
         self._lock = threading.Lock()
@@ -120,7 +121,7 @@ class Manager:
                 port = db.Port(id=port_id)
                 session.add(port)
             port.network_id = network_id
-            port.guid = guid
+            port.guid = f"{guid:016x}"
             port.host = str(data.get("binding:host_id") or "")[:255]
             return self._commit_job(session, "put_port", port_id)
 
@@ -143,6 +144,9 @@ class Manager:
     # Applying the desired state
 
     def start(self):
+        """Write the current state, start OpenSM, then apply changes"""
+        self._write_current()
+        self.driver.start()
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
         self._thread.start()
         # Apply what was pending when the service last stopped.
@@ -153,22 +157,63 @@ class Manager:
         self._wakeup.set()
         if self._thread is not None:
             self._thread.join()
+        self.driver.stop()
 
     def _run(self):
         while not self._stop.is_set():
-            self._wakeup.wait()
+            self._wakeup.wait(self.config.check_interval)
             self._wakeup.clear()
             if self._stop.is_set():
                 return
             try:
+                self._check_opensm()
                 self.apply_pending()
             except Exception:
                 LOG.exception("Failed to apply the partitions")
                 time.sleep(RETRY_DELAY)
                 self._wakeup.set()
 
+    def _check_opensm(self):
+        """Start OpenSM again if it has stopped, with the current state"""
+        if self.driver.running():
+            return
+        LOG.error("OpenSM isn't running; starting it again")
+        try:
+            self._write_current()
+            self.driver.start()
+        except (OSError, ReloadError, partitions.InvalidPartitions) as e:
+            LOG.error("Failed to start OpenSM: %s", e)
+
+    def _render(self, session):
+        """Return the partitions file for the current state, checked"""
+        state = session.get(db.State, GENERATION)
+        if state is None:
+            state = db.State(name=GENERATION, value=0)
+            session.add(state)
+        state.value += 1
+        members = {}
+        for port in session.scalars(sa.select(db.Port)):
+            members.setdefault(port.network_id, []).append(int(port.guid, 16))
+        networks = [
+            (network, members.get(network.id, []))
+            for network in session.scalars(sa.select(db.Network))
+        ]
+        content = partitions.render(self.config, networks, state.value, self.template)
+        partitions.validate(
+            content, {network.pkey: set(guids) for network, guids in networks}
+        )
+        return content
+
+    def _write_current(self):
+        """Write the current state's partitions file, before OpenSM starts"""
+        with self._lock, self.sessionmaker() as session:
+            content = self._render(session)
+            session.commit()
+        partitions.write_atomically(self.config.partitions_file, content)
+
     def _snapshot(self):
-        """Return the pending jobs, and the file that covers them"""
+        """Return the pending jobs, and the file that covers them or why
+        there can't be one"""
         with self._lock, self.sessionmaker() as session:
             job_ids = list(
                 session.scalars(
@@ -178,27 +223,18 @@ class Manager:
                 )
             )
             if not job_ids:
-                return [], None
-            state = session.get(db.State, GENERATION)
-            if state is None:
-                state = db.State(name=GENERATION, value=0)
-                session.add(state)
-            state.value += 1
-            members = {}
-            for port in session.scalars(sa.select(db.Port)):
-                members.setdefault(port.network_id, []).append(port.guid)
-            networks = [
-                (network, members.get(network.id, []))
-                for network in session.scalars(sa.select(db.Network))
-            ]
-            content = partitions.render(self.config, networks, state.value)
+                return [], None, None
+            try:
+                content, error = self._render(session), None
+            except partitions.InvalidPartitions as e:
+                content, error = None, str(e)
             session.execute(
                 sa.update(db.Job)
                 .where(db.Job.id.in_(job_ids))
                 .values(status=db.JobStatus.RUNNING)
             )
             session.commit()
-            return job_ids, content
+            return job_ids, content, error
 
     def _finish(self, job_ids, status, error=""):
         with self._lock, self.sessionmaker() as session:
@@ -215,15 +251,20 @@ class Manager:
 
     def apply_pending(self):
         """Apply the desired state, if any job is waiting for it"""
-        job_ids, content = self._snapshot()
+        job_ids, content, error = self._snapshot()
         if not job_ids:
             return
+        if error:
+            # Retrying wouldn't render anything else, and the file must not
+            # be written.
+            LOG.error("Refusing to write the partitions file: %s", error)
+            self._finish(job_ids, db.JobStatus.FAILED, error)
+            return
         LOG.info("Applying partitions for %d jobs", len(job_ids))
-        error = ""
         for attempt in range(1, self.config.apply_attempts + 1):
             try:
                 partitions.write_atomically(self.config.partitions_file, content)
-                self.reloader.reload()
+                self.driver.reload()
             except (OSError, ReloadError) as e:
                 error = str(e)
                 LOG.warning(

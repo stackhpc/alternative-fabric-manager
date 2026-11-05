@@ -44,7 +44,9 @@ class Port(Base):
     network_id: orm.Mapped[str] = orm.mapped_column(
         sa.ForeignKey("networks.id", ondelete="CASCADE"), index=True
     )
-    guid: orm.Mapped[int] = orm.mapped_column(sa.BigInteger)
+    # As 16 hex digits: a GUID often has its top bit set, which no SQL
+    # integer type holds unsigned.
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16))
     host: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
 
 

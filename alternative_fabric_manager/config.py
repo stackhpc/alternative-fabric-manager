@@ -14,8 +14,18 @@
 
 import configparser
 import dataclasses
+import os
 
 DEFAULT_PARTITION = "Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=full, SELF=full ;"
+DEFAULT_VOLUMES = (
+    "/lib/modules:/lib/modules:ro,"
+    "/etc/localtime:/etc/localtime:ro,"
+    "opensm_logs:/var/log,"
+    "opensm_cache:/var/cache/opensm"
+)
+DRIVERS = ("managed", "docker", "none")
+# opensm.conf keys that the manager sets, which overrides can't change
+MANAGED_OPENSM_KEYS = ("partition_config_file", "daemon")
 
 
 class ConfigError(Exception):
@@ -39,19 +49,40 @@ class Config:
     database: str = "/var/lib/alternative-fabric-manager/afm.sqlite"
 
     # [opensm]
-    partitions_file: str = "/etc/opensm/partitions.conf"
-    # How OpenSM is told to read the file: "docker" sends SIGHUP to a
-    # container and waits for the pkey sweep in its log, "none" only writes
-    # the file (for tests).
-    reload: str = "docker"
+    # managed: the manager runs OpenSM in a container of its own, in the
+    #   manager's PID namespace, so OpenSM never outlives the manager.
+    # docker: OpenSM runs in a container that something else starts; the
+    #   manager only sends it SIGHUP.
+    # none: only write the files (for tests).
+    driver: str = "managed"
+    # The OpenSM container: created with this name (managed), or signalled.
     container: str = "opensm"
-    # Seconds to wait for OpenSM to finish the pkey sweep.
+    # managed: the OpenSM image, extra OpenSM arguments, and the container's
+    # mounts as source:destination[:mode], separated by commas.
+    image: str = "ghcr.io/stackhpc/docker-opensm:latest"
+    opensm_args: str = ""
+    volumes: str = DEFAULT_VOLUMES
+    # managed: the manager's own container, whose PID namespace OpenSM joins.
+    # Empty when the manager isn't in a container, for development only:
+    # OpenSM then survives the manager.
+    manager_container: str = "alternative-fabric-manager"
+    # The directory with OpenSM's files, as the manager sees it, and as the
+    # host sees it for OpenSM's bind mount (managed). OpenSM sees it at
+    # /etc/opensm.
+    config_dir: str = "/etc/opensm"
+    host_config_dir: str = "/etc/opensm"
+    # A Jinja template for the partitions file, instead of the default.
+    partitions_template: str = ""
+    # Seconds to wait for OpenSM to start, and to finish a pkey sweep.
+    start_timeout: float = 120.0
     sweep_timeout: float = 30.0
+    # Seconds between checks that OpenSM is running (managed).
+    check_interval: float = 5.0
     # Times to try applying a change before its jobs fail.
     apply_attempts: int = 3
-    # The rule for the default partition, written as is. All flat networks
-    # share it. Keep ALL=full while ports on flat networks must reach each
-    # other; otherwise give ports limited membership.
+    # The rule for the default partition. All flat networks share it. Keep
+    # ALL=full while ports on flat networks must reach each other; otherwise
+    # give ports limited membership.
     default_partition: str = DEFAULT_PARTITION
     # IPoIB broadcast group settings for networks' partitions, as IBTA
     # values (rate 3 = 10 Gb/s, mtu 4 = 2048).
@@ -59,32 +90,31 @@ class Config:
     ipoib_mtu: int = 4
     ipoib_sl: int = 0
 
+    # [opensm_conf]: opensm.conf options, as key = value (managed)
+    opensm_conf: dict = dataclasses.field(default_factory=dict)
+
+    @property
+    def partitions_file(self):
+        return os.path.join(self.config_dir, "partitions.conf")
+
+    @property
+    def opensm_conf_file(self):
+        return os.path.join(self.config_dir, "opensm.conf")
+
     @classmethod
     def load(cls, path):
         parser = configparser.ConfigParser(interpolation=None)
         if not parser.read(path):
             raise ConfigError(f"Can't read configuration file {path}")
         config = cls()
-        for section, names in (
-            ("api", ("host", "port", "url_prefix", "domain", "token")),
-            ("database", ("database",)),
-            (
-                "opensm",
-                (
-                    "partitions_file",
-                    "reload",
-                    "container",
-                    "sweep_timeout",
-                    "apply_attempts",
-                    "default_partition",
-                    "ipoib_rate",
-                    "ipoib_mtu",
-                    "ipoib_sl",
-                ),
-            ),
-        ):
+        for section, names in OPTIONS:
             if not parser.has_section(section):
                 continue
+            unknown = set(parser.options(section)) - set(names)
+            if unknown:
+                raise ConfigError(
+                    f"[{section}] has unknown options: {', '.join(sorted(unknown))}"
+                )
             for name in names:
                 if not parser.has_option(section, name):
                     continue
@@ -96,15 +126,54 @@ class Config:
                     raise ConfigError(
                         f"[{section}] {name} must be a {kind.__name__}, not {value!r}"
                     ) from None
+        if parser.has_section("opensm_conf"):
+            config.opensm_conf = dict(parser.items("opensm_conf"))
         config.validate()
         return config
 
     def validate(self):
         if not self.token:
             raise ConfigError("[api] token must be set")
-        if self.reload not in ("docker", "none"):
-            raise ConfigError("[opensm] reload must be docker or none")
+        if self.driver not in DRIVERS:
+            raise ConfigError(f"[opensm] driver must be one of {', '.join(DRIVERS)}")
         if not self.default_partition.strip().endswith(";"):
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
+        managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
+        if managed:
+            raise ConfigError(
+                f"[opensm_conf] can't set {', '.join(sorted(managed))}, "
+                "which the manager sets"
+            )
+        for key, value in self.opensm_conf.items():
+            if not key.replace("_", "").isalnum() or "\n" in value:
+                raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
+
+
+OPTIONS = (
+    ("api", ("host", "port", "url_prefix", "domain", "token")),
+    ("database", ("database",)),
+    (
+        "opensm",
+        (
+            "driver",
+            "container",
+            "image",
+            "opensm_args",
+            "volumes",
+            "manager_container",
+            "config_dir",
+            "host_config_dir",
+            "partitions_template",
+            "start_timeout",
+            "sweep_timeout",
+            "check_interval",
+            "apply_attempts",
+            "default_partition",
+            "ipoib_rate",
+            "ipoib_mtu",
+            "ipoib_sl",
+        ),
+    ),
+)

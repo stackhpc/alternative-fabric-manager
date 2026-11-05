@@ -16,10 +16,25 @@ GUID = 0x12345600007821B6
 
 
 class FakeReloader:
+    """A driver whose OpenSM is always running"""
+
     def __init__(self):
         self.calls = 0
         self.error = None
         self.during = None
+        self.starts = 0
+        self.is_running = True
+        self.stopped = False
+
+    def start(self):
+        self.starts += 1
+        self.is_running = True
+
+    def running(self):
+        return self.is_running
+
+    def stop(self):
+        self.stopped = True
 
     def reload(self):
         self.calls += 1
@@ -33,9 +48,9 @@ class FakeReloader:
 def config(tmp_path):
     return config_mod.Config(
         token=TOKEN,
-        reload="none",
+        driver="none",
         database=":memory:",
-        partitions_file=str(tmp_path / "partitions.conf"),
+        config_dir=str(tmp_path),
     )
 
 

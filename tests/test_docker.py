@@ -25,7 +25,7 @@ class FakeContainer:
         self.signals.append(signal)
         self.log = "\n".join(filter(None, (self.log, self.after)))
 
-    def logs(self, since, stdout, stderr):
+    def logs(self, stdout, stderr, since=None):
         return self.log.encode()
 
 
@@ -84,3 +84,106 @@ def test_stopped_container_fails():
     with pytest.raises(ReloadError, match="exited"):
         _reloader(container).reload()
     assert container.signals == []
+
+
+STARTED = """\
+Nov 05 17:00:01 [275FE640] 0x02 -> SUBNET UP
+*************************** SUBNET UP ****************************"""
+
+
+class FakeManagedContainer(FakeContainer):
+    def __init__(self, log="", status="running"):
+        super().__init__(before=log, status=status)
+        self.removed = False
+
+    def reload(self):
+        pass
+
+    def remove(self, force):
+        self.removed = True
+
+
+class FakeManagedClient:
+    def __init__(self, existing=None, log=STARTED, status="running"):
+        self.containers = self
+        self.existing = existing
+        self.log = log
+        self.status = status
+        self.runs = []
+
+    def get(self, name):
+        if self.existing is None:
+            raise docker_driver.docker.errors.NotFound("no container")
+        return self.existing
+
+    def run(self, **kwargs):
+        self.runs.append(kwargs)
+        self.existing = FakeManagedContainer(self.log, self.status)
+        return self.existing
+
+
+@pytest.fixture
+def managed_config(config):
+    config.driver = "managed"
+    config.start_timeout = 0.05
+    config.opensm_conf = {"sm_priority": "15"}
+    return config
+
+
+def test_managed_start(managed_config):
+    old = FakeManagedContainer()
+    client = FakeManagedClient(existing=old)
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    driver.start()
+
+    assert old.removed
+    (kwargs,) = client.runs
+    assert kwargs["pid_mode"] == "container:alternative-fabric-manager"
+    assert kwargs["restart_policy"] == {"Name": "no"}
+    assert kwargs["network_mode"] == "host"
+    assert kwargs["command"][:2] == ["-F", "/etc/opensm/opensm.conf"]
+    assert kwargs["volumes"][0] == "/etc/opensm:/etc/opensm:ro"
+    with open(managed_config.opensm_conf_file) as f:
+        assert "sm_priority 15" in f.read().splitlines()
+    assert driver.running()
+
+
+def test_managed_start_without_manager_container(managed_config):
+    managed_config.manager_container = ""
+    client = FakeManagedClient()
+    docker_driver.ManagedDocker(managed_config, client=client).start()
+    assert "pid_mode" not in client.runs[0]
+
+
+def test_managed_start_fails_if_opensm_exits(managed_config):
+    client = FakeManagedClient(log="opensm: cannot bind", status="exited")
+    with pytest.raises(ReloadError, match="exited"):
+        docker_driver.ManagedDocker(managed_config, client=client).start()
+
+
+def test_managed_start_times_out(managed_config):
+    client = FakeManagedClient(log="still discovering")
+    with pytest.raises(ReloadError, match="didn't start"):
+        docker_driver.ManagedDocker(managed_config, client=client).start()
+
+
+def test_managed_start_as_standby(managed_config):
+    client = FakeManagedClient(log="0x02 -> Entering STANDBY state")
+    docker_driver.ManagedDocker(managed_config, client=client).start()
+
+
+def test_managed_running(managed_config):
+    client = FakeManagedClient()
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    assert not driver.running()
+    client.existing = FakeManagedContainer(status="exited")
+    assert not driver.running()
+
+
+def test_managed_stop(managed_config):
+    container = FakeManagedContainer()
+    driver = docker_driver.ManagedDocker(
+        managed_config, client=FakeManagedClient(existing=container)
+    )
+    driver.stop()
+    assert container.removed

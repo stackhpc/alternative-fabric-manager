@@ -39,7 +39,12 @@ them, but not their networks, so they are rejected too.
 
 ## Running it
 
-The image runs next to the OpenSM container, on the same host:
+By default (`[opensm] driver = managed`) the manager runs OpenSM itself, in
+a container of its own that joins the manager's PID namespace, so OpenSM
+dies with the manager however it stops: it never runs with partitions that
+no manager keeps up to date. The manager writes `opensm.conf` and
+`partitions.conf` before it starts OpenSM, and starts OpenSM again if it
+stops.
 
 ```sh
 docker build -t alternative-fabric-manager .
@@ -52,14 +57,14 @@ docker run -d --name alternative-fabric-manager --restart unless-stopped \
   alternative-fabric-manager
 ```
 
-OpenSM must read its partitions from the same directory, mounted into its
-container (`-v /etc/opensm:/etc/opensm:ro`). Mount the directory rather than
-the file, so that the atomic rename reaches the container. The Docker
-socket lets the manager signal OpenSM and read its log, so treat the manager
-as root on its host.
+Stop any other OpenSM on the host first. The manager's container must be
+called as `[opensm] manager_container` says, `alternative-fabric-manager` by
+default. The Docker socket lets the manager start OpenSM and read its log,
+so treat the manager as root on its host.
 
 Copy [etc/afm.conf.sample](etc/afm.conf.sample) to
-`/etc/alternative-fabric-manager/afm.conf` and set a token. Then configure
+`/etc/alternative-fabric-manager/afm.conf` and set a token. OpenSM's options
+go in `[opensm_conf]`, for example `sm_priority = 15`. Then configure
 networking-mlnx in `ml2_conf.ini`:
 
 ```ini
@@ -73,6 +78,21 @@ domain = cloudx
 token = <token>
 physical_networks = <InfiniBand physical networks>
 ```
+
+With `driver = docker`, something else runs OpenSM, which must read its
+partitions from `config_dir`, bind mounted into its container: mount the
+directory rather than the file, so that the atomic rename reaches it. The
+manager then only sends it SIGHUP.
+
+### The partitions template
+
+`partitions.conf` is rendered from a Jinja template, in a sandbox. Set
+`[opensm] partitions_template` to use your own, for example to add static
+partitions or multicast groups. Whatever it renders is checked before it is
+written: the default partition must be defined, every network's pkey must
+have exactly the network's ports as full members, and no other partition may
+have one of them. A file that fails the check fails the jobs and isn't
+written.
 
 ### The default partition
 
@@ -97,7 +117,7 @@ uv run pytest
 
 ## Limitations
 
-- One OpenSM, on the same host. Subnet manager failover needs every OpenSM
-  to have the same partitions.
+- One OpenSM, on the same host. High availability is designed in
+  [specs/ha.md](specs/ha.md).
 - A job that fails leaves its change in the recorded state, so the next
   change that applies also applies it.

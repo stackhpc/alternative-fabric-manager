@@ -18,7 +18,7 @@ port = 9000
 token = secret
 
 [opensm]
-reload = none
+driver = none
 ipoib_rate = 7
 default_partition = Default=0x7fff : ALL=limited, SELF=full ;
 """,
@@ -35,7 +35,7 @@ default_partition = Default=0x7fff : ALL=limited, SELF=full ;
     [
         "[api]\n",
         "[api]\ntoken = x\nport = eighty\n",
-        "[api]\ntoken = x\n[opensm]\nreload = restart\n",
+        "[api]\ntoken = x\n[opensm]\ndriver = restart\n",
         "[api]\ntoken = x\n[opensm]\ndefault_partition = Default=0x7fff\n",
     ],
 )

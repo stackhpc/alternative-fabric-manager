@@ -185,21 +185,27 @@ OpenSM would make every port a full member of the default partition.
 
 ### Supervising OpenSM
 
-The local OpenSM must never outlive or out-run its manager. The manager runs
-OpenSM as its child process, in one container, with the manager (or tini
-with the manager as its only child) as the container's PID 1, so OpenSM is
-killed when the manager dies. The child also gets `PR_SET_PDEATHSIG`. If
-OpenSM exits on its own, the manager marks its node `fenced` itself, which is
-safe since OpenSM isn't running, and rejoins as above. A node whose applies
-keep failing, past a threshold, does the same rather than hold every job
-until it times out.
+The local OpenSM must never outlive its manager. The manager spawns OpenSM
+as its own container, from the OpenSM image, with Docker's
+`--pid container:<manager>`, so OpenSM runs in the manager's PID namespace.
+When the manager's PID 1 exits, the kernel kills every other process in the
+namespace, so OpenSM dies with the manager, however the manager stops. This
+was checked on Docker: a container sharing another's PID namespace was
+killed when the other was. OpenSM's container has no restart policy; the
+manager starts it, and only after the join order above.
 
-A watchdog beside the existing OpenSM image was considered instead. It needs
-the manager to touch a heartbeat file, and a hung manager whose file-touch
-thread still runs would leave a stale OpenSM. Supervising avoids that, so for
-HA the manager does control OpenSM's lifecycle, as a supervised process
-rather than through a Docker driver. The OpenSM log is then the child's
-output, which the manager reads for the sweep markers.
+If OpenSM exits on its own, the manager marks its node `fenced` itself, which
+is safe since OpenSM isn't running, and rejoins as above. A node whose
+applies keep failing, past a threshold, does the same rather than hold every
+job until it times out.
+
+This keeps OpenSM's image, with NVIDIA's OpenSM build, separate from the
+manager's and upgraded on its own, while the manager controls its lifecycle.
+The manager reads OpenSM's log through Docker for the sweep markers. Two
+other ways were considered: OpenSM as a child process in the manager's own
+image, which ties the two images together, and a watchdog beside an OpenSM
+the manager doesn't start, which a hung manager whose file-touch thread
+still runs defeats.
 
 ### Removal
 
@@ -221,6 +227,32 @@ After the master OpenSM stops, a standby takes over after about
 Give all OpenSMs the same `sm_priority`. With unequal priorities, a
 higher-priority OpenSM that rejoins forces a handover and a heavy sweep
 every time.
+
+## Configuration
+
+The manager writes both of OpenSM's files, so every node's OpenSM is
+configured the same way and the rendering hash covers all of it:
+
+- **`opensm.conf`** is built from operator overrides, `key value` pairs in
+  the manager's configuration, such as `sm_priority`, `routing_engine` or
+  `sweep_interval`. The manager sets the keys it depends on itself, such as
+  `partition_config_file`, and refuses overrides of them.
+- **`partitions.conf`** is rendered from a Jinja template, in a sandboxed
+  environment with undefined variables as errors. The default template gives
+  every network a partition; an operator's template can change the IPoIB
+  flags, add multicast groups or add static partitions. The template gets
+  the networks, each with its pkey and member GUIDs, and the generation.
+
+Before writing a rendered file, the manager parses it and refuses to apply
+it, failing the jobs, unless the default partition is defined and every
+network's pkey has exactly that network's ports as full members, with no
+keyword such as `ALL` and no other GUID. A static partition must give its
+pkey and must not use a network's. So a template, however it is edited,
+can't put a port in another network's partition.
+
+A change to `opensm.conf` needs OpenSM to restart. The manager does that as
+a rolling restart, standbys first and the master last, each node rejoining
+as above.
 
 ## Galera specifics
 
@@ -291,7 +323,8 @@ ACTIVE without its partition on every OpenSM that could be master.
 | Raft among the manager instances, with a single leader | Galera already gives replicated state with quorum, so Raft would duplicate it, with a consensus implementation, its own log and membership changes to maintain. A leader also can't control which OpenSM becomes master: only fencing stops a stale one |
 | One active manager, behind keepalived, that pushes the file to every OpenSM node over SSH | It needs remote access to every node, and the manager's own failover still needs shared state. A node that misses a push has no way to catch up by itself |
 | Each instance with its own SQLite, behind HAProxy | A request reaches one instance, so the other OpenSMs never see it, and a poll on another instance finds no job |
-| A watchdog beside the existing OpenSM image | A hung manager whose file-touch thread still runs leaves a stale OpenSM (see Supervising OpenSM) |
+| OpenSM as a child process in the manager's image | Ties the manager's image to NVIDIA's OpenSM build and its upgrades. A spawned container in the manager's PID namespace gives the same guarantee |
+| A watchdog beside an OpenSM the manager doesn't start | A hung manager whose file-touch thread still runs leaves a stale OpenSM (see Supervising OpenSM) |
 | Leader election with tooz, over the MySQL or etcd backend | Not needed now, since nothing must run on only one instance. Use it if that changes, rather than a Raft of our own |
 
 ## Implementation plan
@@ -301,7 +334,7 @@ level-triggered, so these are additions rather than a rewrite. Each step
 keeps single-node SQLite working.
 
 - [ ] Verify the standby behaviours on a fabric with two OpenSMs.
-- [ ] Single node, now: a DELETE of an unknown object creates a job rather
+- [x] Single node: a DELETE of an unknown object creates a job rather
       than answering 404.
 - [ ] Database: a `[database] connection` URL, Alembic migrations, schema
       version and rendering hash, `wsrep_sync_wait`, deadlock retry around
@@ -312,10 +345,12 @@ keeps single-node SQLite working.
       heartbeats on their own thread, leases on the monotonic clock.
 - [ ] Job status computed from the active nodes' applied generations, with
       `min_active_nodes`, a job timeout, and terminal statuses written once.
-- [ ] Supervisor: OpenSM as the manager's child in one image, its log read
-      from its output, its state read with `sminfo`, SIGHUP only to the
-      master, the join order, self-fencing on lease expiry, OpenSM exit or
-      repeated apply failures.
+- [ ] Single node, now: the manager spawns OpenSM's container in its PID
+      namespace, builds `opensm.conf` from overrides, and renders
+      `partitions.conf` from a checked Jinja template.
+- [ ] Supervisor for HA: OpenSM's state read with `sminfo`, SIGHUP only to
+      the master, the join order, self-fencing on lease expiry, OpenSM exit
+      or repeated apply failures, and rolling restarts.
 - [ ] Fencing others by compare-and-set, and a CLI to mark a fenced node
       `removed`.
 - [ ] Job purge.
