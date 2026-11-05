@@ -91,10 +91,15 @@ class Manager:
     def delete_network(self, network_id):
         with self._lock, self.sessionmaker() as session:
             network = session.get(db.Network, network_id)
-            if network is None:
-                raise NotFound(f"Network {network_id}")
-            session.execute(sa.delete(db.Port).where(db.Port.network_id == network_id))
-            session.delete(network)
+            if network is not None:
+                session.execute(
+                    sa.delete(db.Port).where(db.Port.network_id == network_id)
+                )
+                session.delete(network)
+            # Even when the network is gone, answer with a job rather than
+            # 404, which networking-mlnx takes as done: a DELETE is sent again
+            # when its first job failed, and OpenSM may still have the
+            # network's partition until an apply succeeds.
             return self._commit_job(session, "delete_network", network_id)
 
     def put_port(self, port_id, data):
@@ -122,9 +127,10 @@ class Manager:
     def delete_port(self, port_id):
         with self._lock, self.sessionmaker() as session:
             port = session.get(db.Port, port_id)
-            if port is None:
-                raise NotFound(f"Port {port_id}")
-            session.delete(port)
+            if port is not None:
+                session.delete(port)
+            # As for networks: the GUID may still be in the partition until an
+            # apply succeeds.
             return self._commit_job(session, "delete_port", port_id)
 
     def get_job(self, job_id):

@@ -20,8 +20,9 @@ networking-mlnx sends, with "Authorization: Basic <token>":
 with the Neutron network or port as the JSON body. A change is answered with
 the path of a job, as a JSON string, which it then polls with
 GET <url>/<job path> until the job's "Status" is "Completed". 400 means the
-request can never succeed, and 404 to a DELETE that there is nothing to
-delete.
+request can never succeed. A DELETE of something that isn't recorded still
+gets a job, rather than 404, which networking-mlnx would take as done before
+OpenSM had applied the deletion.
 """
 
 import hmac

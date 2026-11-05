@@ -185,10 +185,34 @@ def test_delete_port(client, manager, config):
     assert f"0x{GUID:016x}" not in _file(config)
 
 
-def test_delete_unknown_is_not_found(client):
+def test_delete_unknown_waits_for_an_apply(client, manager, reloader):
+    # networking-mlnx sends a DELETE again when its job failed, and takes 404
+    # as done, while OpenSM may still have the GUID until an apply succeeds.
     for kind in ("Port", "Network"):
         response = client.delete(f"{URL}/{kind}/{PORT_ID}", headers=AUTH)
-        assert response.status_code == 404
+        assert _job(client, response)["Status"] == "Pending"
+        manager.apply_pending()
+        assert _job(client, response)["Status"] == "Completed"
+    assert reloader.calls == 2
+
+
+def test_delete_after_a_failed_job_is_applied(client, manager, config, reloader):
+    from alternative_fabric_manager.drivers import ReloadError
+
+    _post(client, "Network", conftest.network())
+    _post(client, "Port", conftest.port())
+    manager.apply_pending()
+    config.apply_attempts = 1
+    reloader.error = ReloadError("OpenSM is down")
+    first = client.delete(f"{URL}/Port/{PORT_ID}", headers=AUTH)
+    manager.apply_pending()
+    assert _job(client, first)["Status"] == "Failed"
+
+    reloader.error = None
+    again = client.delete(f"{URL}/Port/{PORT_ID}", headers=AUTH)
+    manager.apply_pending()
+    assert _job(client, again)["Status"] == "Completed"
+    assert f"0x{conftest.GUID:016x}" not in _file(config)
 
 
 def test_delete_network_removes_its_ports(client, manager, config):
@@ -200,8 +224,11 @@ def test_delete_network_removes_its_ports(client, manager, config):
     assert _job(client, response)["Status"] == "Completed"
     assert NETWORK_ID not in _file(config)
     assert f"0x{GUID:016x}" not in _file(config)
-    # So the port can be sent again once the network is.
-    assert client.delete(f"{URL}/Port/{PORT_ID}", headers=AUTH).status_code == 404
+    # Its ports went with it, so a port can't join it until it is sent again.
+    assert (
+        client.post(f"{URL}/Port", json=conftest.port(), headers=AUTH).status_code
+        == 400
+    )
 
 
 def test_failed_reload_fails_jobs(client, manager, config, reloader):
