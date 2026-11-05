@@ -34,6 +34,16 @@ class InvalidRequest(ValueError):
     """The request can't be applied, so must not be sent again"""
 
 
+# Neutron's IDs are UUIDs; anything else could change the partitions file's
+# syntax, since a network's ID is in its partition's name.
+_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def check_id(object_id):
+    if not isinstance(object_id, str) or not _ID.match(object_id):
+        raise InvalidRequest(f"{object_id!r} isn't a valid ID")
+
+
 def pkey_from_network(network):
     """Return a network's partition key, which is its VLAN ID, or None for a
     flat network, which uses the default partition"""
@@ -105,26 +115,32 @@ def guid_from_port(port):
 #   default_partition  [opensm] default_partition, as is
 #   networks           each VLAN network, with id, name, pkey (an int),
 #                      pkey_hex and guids (a sorted list of "0x..." strings)
-#   flat_guids         the GUIDs of ports on flat networks, which must be
-#                      full members of the default partition
+#   flat               the flat networks' partition, with the same keys:
+#                      pkey and pkey_hex are [opensm] flat_pkey, and guids
+#                      those of every flat network's ports
 #   ipoib              rate, mtu and sl, from [opensm] ipoib_*
 #   generation         the state's generation
 # Whatever it renders is checked by validate() before it is written.
 #
 # indx0 puts a network's pkey at index 0 of its ports' pkey tables. A guest's
 # IPoIB interface uses the pkey at index 0, so without it the interface is in
-# the default partition, not the network's.
+# the default partition, not the network's. Members go one to a line, since
+# OpenSM reads the file a line at a time.
 DEFAULT_TEMPLATE = """\
 {{ default_partition }}
-{% if flat_guids -%}
-Default=0x7fff : {{ flat_guids | join("=full, ") }}=full ;
-{% endif -%}
-{% for network in networks -%}
+{% for network in networks + ([flat] if flat.guids else []) -%}
+{% if network.pkey == 0x7fff -%}
+Default=0x7fff :
+{% else -%}
 {{ network.name }}={{ network.pkey_hex }}, indx0, ipoib, rate={{ ipoib.rate }}, \
-mtu={{ ipoib.mtu }}, sl={{ ipoib.sl }} : \
-{% for guid in network.guids %}{{ guid }}=full{{ ", " if not loop.last else "" }}\
-{% endfor %} ;
+mtu={{ ipoib.mtu }}, sl={{ ipoib.sl }} :
+{% endif -%}
+{% for guid in network.guids %}    {{ guid }}=full{{ "," if not loop.last else "" }}
+{% endfor %}    ;
 {% endfor %}"""
+
+# OpenSM reads the partitions file a line at a time, into a fixed buffer.
+MAX_LINE = 1000
 
 
 class InvalidPartitions(ValueError):
@@ -142,6 +158,15 @@ def load_template(path=""):
         return env.from_string(f.read())
 
 
+def _partition(name, pkey, guids):
+    return {
+        "name": name,
+        "pkey": pkey,
+        "pkey_hex": f"0x{pkey:04x}",
+        "guids": [f"0x{guid:016x}" for guid in sorted(set(guids))],
+    }
+
+
 def render(config, networks, generation, template):
     """Return the partitions file for networks, a list of
     (network, [port GUID]) pairs, flat networks' pkey being None"""
@@ -150,7 +175,6 @@ def render(config, networks, generation, template):
     }
     networks = [(n, guids) for n, guids in networks if n.pkey is not None]
     context = {
-        "flat_guids": [f"0x{guid:016x}" for guid in sorted(flat)],
         "default_partition": config.default_partition.strip(),
         "ipoib": {
             "rate": config.ipoib_rate,
@@ -158,14 +182,9 @@ def render(config, networks, generation, template):
             "sl": config.ipoib_sl,
         },
         "generation": generation,
+        "flat": _partition("flat", config.flat_pkey, flat),
         "networks": [
-            {
-                "id": network.id,
-                "name": f"net-{network.id}",
-                "pkey": network.pkey,
-                "pkey_hex": f"0x{network.pkey:04x}",
-                "guids": [f"0x{guid:016x}" for guid in sorted(set(guids))],
-            }
+            dict(_partition(f"net-{network.id}", network.pkey, guids), id=network.id)
             for network, guids in sorted(networks, key=lambda n: n[0].pkey)
         ],
     }
@@ -187,12 +206,22 @@ def render(config, networks, generation, template):
 
 
 _KEYWORDS = {"ALL", "ALL_CAS", "ALL_VCAS", "ALL_SWITCHES", "ALL_ROUTERS", "SELF"}
+# The keywords that take in tenants' ports
+_TENANT_KEYWORDS = {"ALL", "ALL_CAS", "ALL_VCAS"}
 _MEMBERSHIPS = {"full", "limited", "both"}
+_GUID = re.compile(r"^(0x[0-9a-fA-F]{1,16}|[1-9][0-9]{0,19})$")
+_PKEY = re.compile(r"^(0x[0-9a-fA-F]{1,4}|[0-9]{1,5})$")
 
 
 def _parse(content):
     """Return the partition statements of a partitions file, as
     (pkey, {member: membership}) pairs, following OpenSM's syntax"""
+    for number, line in enumerate(content.splitlines(), 1):
+        if len(line) > MAX_LINE:
+            raise InvalidPartitions(
+                f"Line {number} is longer than {MAX_LINE} characters; put "
+                "members on lines of their own"
+            )
     text = "\n".join(line.split("#", 1)[0] for line in content.splitlines())
     statements = []
     for statement in text.split(";"):
@@ -207,10 +236,9 @@ def _parse(content):
                 f"Partition {name!r} has no pkey; give every partition one"
             )
         name, pkey = (part.strip() for part in name.split("=", 1))
-        try:
-            pkey = int(pkey, 0) & DEFAULT_PKEY
-        except ValueError:
-            raise InvalidPartitions(f"Partition {name!r} has pkey {pkey!r}") from None
+        if not _PKEY.match(pkey):
+            raise InvalidPartitions(f"Partition {name!r} has pkey {pkey!r}")
+        pkey = int(pkey, 0) & DEFAULT_PKEY
         default = "limited"
         for flag in flags:
             if flag.startswith("defmember="):
@@ -232,70 +260,114 @@ def _parse(content):
                     membership = "limited"
                 member = member.strip()
                 if member not in _KEYWORDS:
-                    try:
-                        member = int(member, 0)
-                    except ValueError:
+                    if not _GUID.match(member):
                         raise InvalidPartitions(
                             f"Partition {name!r} has member {member!r}"
-                        ) from None
+                        )
+                    member = int(member, 0)
                 members[member] = membership
         statements.append((pkey, members))
     return statements
 
 
-def validate(content, expected, flat=frozenset()):
+def pkeys(content):
+    """Return the pkeys that a partitions file defines"""
+    return {pkey for pkey, _members in _parse(content)}
+
+
+def validate(
+    content,
+    expected,
+    flat=frozenset(),
+    flat_pkey=DEFAULT_PKEY - 1,
+    shared_default=False,
+):
     """Check a rendered partitions file against the networks' membership
 
     expected maps each VLAN network's pkey to its ports' GUIDs, and flat holds
-    the GUIDs of ports on flat networks. Every network's pkey must have
-    exactly its GUIDs as full members, no keyword and no other member, and no
-    other partition may have one of the networks' ports as a member. The
-    default partition must be defined, with the flat networks' ports as full
-    members.
+    the GUIDs of ports on flat networks, whose partition is flat_pkey. Every
+    network's partition, and the flat networks', must have exactly its GUIDs
+    as full members, and no keyword. A GUID may be in only one of them, and no
+    other partition may have one of them as a member. No partition other than
+    a network's may have ALL, ALL_CAS or ALL_VCAS as full members, except the
+    default partition with shared_default. The default partition must be
+    defined.
     """
     found = {}
     for pkey, members in _parse(content):
         found.setdefault(pkey, {}).update(members)
     if DEFAULT_PKEY not in found:
         raise InvalidPartitions("The default partition (0x7fff) isn't defined")
-    default = found[DEFAULT_PKEY]
-    everyone = any(default.get(k) in ("full", "both") for k in ("ALL", "ALL_CAS"))
-    for guid in flat:
-        if not everyone and default.get(guid) not in ("full", "both"):
+    expected = {pkey: set(guids) for pkey, guids in expected.items()}
+    if flat_pkey != DEFAULT_PKEY and (flat or flat_pkey in found):
+        if flat_pkey in expected:
+            raise InvalidPartitions(f"Flat partition 0x{flat_pkey:04x} is a network's")
+        expected[flat_pkey] = set(flat)
+    managed = {}
+    for pkey, guids in expected.items():
+        for guid in guids:
+            if guid in managed:
+                raise InvalidPartitions(
+                    f"Port 0x{guid:016x} is in partitions 0x{managed[guid]:04x} and "
+                    f"0x{pkey:04x}"
+                )
+            managed[guid] = pkey
+    if flat_pkey == DEFAULT_PKEY:
+        for guid in flat:
+            if guid in managed:
+                raise InvalidPartitions(
+                    f"Port 0x{guid:016x} is on a flat network and in partition "
+                    f"0x{managed[guid]:04x}"
+                )
+    for pkey, members in found.items():
+        full = {k for k in _TENANT_KEYWORDS if members.get(k) in ("full", "both")}
+        if full and not (pkey == DEFAULT_PKEY and shared_default):
             raise InvalidPartitions(
-                f"Port 0x{guid:016x} of a flat network must be a full member of "
-                "the default partition"
+                f"Partition 0x{pkey:04x} has {', '.join(sorted(full))} as full "
+                "members, which would share it with every tenant"
             )
-    managed = set().union(*expected.values(), flat) if expected else set(flat)
     for pkey, guids in expected.items():
         members = found.get(pkey)
         if members is None:
             raise InvalidPartitions(f"Network partition 0x{pkey:04x} is missing")
-        wanted = {guid: "full" for guid in guids}
-        if members != wanted:
+        if members != {guid: "full" for guid in guids}:
             raise InvalidPartitions(
                 f"Partition 0x{pkey:04x} must have exactly its ports as full members"
             )
+    default = found[DEFAULT_PKEY]
+    if flat_pkey == DEFAULT_PKEY:
+        everyone = any(default.get(k) in ("full", "both") for k in ("ALL", "ALL_CAS"))
+        for guid in flat:
+            if not everyone and default.get(guid) not in ("full", "both"):
+                raise InvalidPartitions(
+                    f"Port 0x{guid:016x} of a flat network must be a full member of "
+                    "the default partition"
+                )
     for pkey, members in found.items():
-        if pkey in expected or pkey == DEFAULT_PKEY:
+        if pkey in expected:
             continue
-        if managed & set(members):
+        others = set(managed) & set(members)
+        if others:
             raise InvalidPartitions(
-                f"Partition 0x{pkey:04x} isn't a network's, but has a "
-                "network's port as a member"
+                f"Partition 0x{pkey:04x} isn't a network's, but has a network's "
+                f"port 0x{min(others):016x} as a member"
             )
 
 
-def write_atomically(path, content):
-    """Replace a file, so that OpenSM never reads half of it"""
+def write_atomically(path, content, mode=0o644):
+    """Replace a file, so that OpenSM never reads half of it
+
+    The file is created with mode, so that it is never readable by others
+    before it should be.
+    """
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".partitions.")
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".afm.")
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w") as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):

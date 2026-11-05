@@ -22,6 +22,16 @@ def _file(config):
     return pathlib.Path(config.partitions_file).read_text()
 
 
+def _members(config):
+    """The partitions file's members, by pkey"""
+    from alternative_fabric_manager import partitions
+
+    found = {}
+    for pkey, members in partitions._parse(_file(config)):
+        found.setdefault(pkey, {}).update(members)
+    return found
+
+
 def test_requests_need_the_token(client):
     for headers in (
         {},
@@ -54,9 +64,10 @@ def test_network_job_completes_once_applied(client, manager, config, reloader):
 
     assert _job(client, response)["Status"] == "Completed"
     assert reloader.calls == 1
-    assert f"net-{NETWORK_ID}=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 :  ;" in _file(
+    assert f"net-{NETWORK_ID}=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 :" in _file(
         config
     )
+    assert _members(config)[0x64] == {}
 
 
 def test_port_is_a_full_member(client, manager, config):
@@ -65,7 +76,7 @@ def test_port_is_a_full_member(client, manager, config):
     manager.apply_pending()
 
     assert _job(client, response)["Status"] == "Completed"
-    assert f"0x{GUID:016x}=full ;" in _file(config)
+    assert _members(config)[0x64] == {GUID: "full"}
 
 
 @pytest.mark.parametrize(
@@ -169,9 +180,9 @@ def test_update_moves_port(client, manager, config):
     manager.apply_pending()
 
     assert _job(client, response)["Status"] == "Completed"
-    lines = _file(config).splitlines()
-    assert f"0x{GUID:016x}=full" in next(line for line in lines if "=0x00c8" in line)
-    assert f"0x{GUID:016x}" not in next(line for line in lines if "=0x0064" in line)
+    members = _members(config)
+    assert members[0xC8] == {GUID: "full"}
+    assert members[0x64] == {}
 
 
 def test_delete_port(client, manager, config):
@@ -349,7 +360,7 @@ def _flat_network():
     )
 
 
-def test_flat_network_ports_join_the_default_partition(client, manager, config):
+def test_flat_network_ports_join_the_flat_partition(client, manager, config):
     # networking-mlnx sends ports on flat networks, and their networks' PUT
     # and DELETE.
     _post(client, "Network", _flat_network())
@@ -361,7 +372,8 @@ def test_flat_network_ports_join_the_default_partition(client, manager, config):
 
     assert _job(client, response)["Status"] == "Completed"
     assert _job(client, update)["Status"] == "Completed"
-    assert f"Default=0x7fff : 0x{GUID:016x}=full ;" in _file(config)
+    # Their own partition, with indx0, outside the VLAN range
+    assert _members(config)[0x7FFE] == {GUID: "full"}
     assert f"net-{NETWORK_ID}" not in _file(config)
 
 
@@ -410,3 +422,88 @@ def test_opensm_conf_is_written_with_shared_keys(manager, config, tmp_path):
 def test_opensm_conf_only_for_the_managed_driver(manager, config):
     manager._write_current()
     assert not pathlib.Path(config.opensm_conf_file).exists()
+
+
+def test_a_guid_belongs_to_one_port(client):
+    # A port whose deletion never arrived, or two ports with one client ID,
+    # would otherwise be in two networks' partitions.
+    other = "d13bba05-eb07-45ba-ace2-765706b2d701"
+    _post(client, "Network", conftest.network())
+    _post(client, "Network", conftest.network(network_id=other, segmentation_id=200))
+    assert _post(client, "Port", conftest.port()).status_code == 202
+    response = _post(
+        client,
+        "Port",
+        conftest.port(port_id="e13bba05-eb07-45ba-ace2-765706b2d701", network_id=other),
+    )
+    assert response.status_code == 400
+    # The same port moving is fine.
+    response = client.put(
+        f"{URL}/Port/{PORT_ID}", json=conftest.port(network_id=other), headers=AUTH
+    )
+    assert response.status_code == 202
+
+
+def test_reserved_pkeys_are_refused(config, reloader, tmp_path, monkeypatch):
+    from fastapi import testclient
+
+    from alternative_fabric_manager import api, db
+    from alternative_fabric_manager import manager as manager_mod
+
+    path = tmp_path / "partitions.j2"
+    path.write_text(
+        "{{ default_partition }}\nstorage=0x0064 : ALL_SWITCHES=full ;\n"
+        "{% for n in networks %}{{ n.name }}={{ n.pkey_hex }} :"
+        "{% for g in n.guids %} {{ g }}=full{% endfor %} ;\n{% endfor %}"
+    )
+    config.partitions_template = str(path)
+    manager = manager_mod.Manager(config, db.make_sessionmaker(":memory:"), reloader)
+    client = testclient.TestClient(api.create_app(config, manager))
+    assert _post(client, "Network", conftest.network()).status_code == 400
+    assert (
+        _post(client, "Network", conftest.network(segmentation_id=101)).status_code
+        == 202
+    )
+
+
+@pytest.mark.parametrize("object_id", ["net;x", "a:b", "x\ny", "", "a" * 65])
+def test_ids_must_be_safe(client, object_id):
+    body = conftest.network(network_id=object_id)
+    assert _post(client, "Network", body).status_code == 400
+
+
+def test_opensm_starts_with_the_last_good_file(manager, config, reloader):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager._write_current()
+    good = _file(config)
+    # Something that can no longer be rendered, for example a template
+    # changed since
+    manager.template = type(
+        "Broken", (), {"render": lambda self, context: "nonsense\n"}
+    )()
+    manager._write_current()
+    assert _file(config) == good
+
+
+def test_first_start_needs_a_good_file(manager, config):
+    manager.template = type(
+        "Broken", (), {"render": lambda self, context: "nonsense\n"}
+    )()
+    from alternative_fabric_manager import partitions
+
+    with pytest.raises(partitions.InvalidPartitions):
+        manager._write_current()
+
+
+def test_database_and_opensm_conf_are_private(tmp_path, config, reloader):
+    import os
+
+    from alternative_fabric_manager import db
+    from alternative_fabric_manager import manager as manager_mod
+
+    config.driver = "managed"
+    database = str(tmp_path / "afm.sqlite")
+    manager = manager_mod.Manager(config, db.make_sessionmaker(database), reloader)
+    manager._write_current()
+    assert os.stat(database).st_mode & 0o777 == 0o600
+    assert os.stat(config.opensm_conf_file).st_mode & 0o777 == 0o600

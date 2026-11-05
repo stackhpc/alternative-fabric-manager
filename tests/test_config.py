@@ -95,3 +95,31 @@ def test_show_keys(tmp_path, capsys):
     ]
     cli.main(["--config-file", str(path), "--show-keys"])
     assert capsys.readouterr().out == first
+
+
+@pytest.mark.parametrize(
+    "text, match",
+    [
+        ("[opensm]\nhardening = none, m_key\n", "either"),
+        ("[opensm]\ncheck_interval = 0\n", "positive"),
+        ("[opensm]\nipoib_mtu = 6\n", "ipoib_mtu"),
+        ("[opensm]\nflat_pkey = 100\n", "flat_pkey"),
+        ("[opensm_conf]\npart_enforce = off\n", "part_enforce"),
+        ("[opensm_conf]\nlog_flags = 0x01\n", "log_flags"),
+        ("[opensm_conf]\nlog_file = /tmp/x\n", "log_file"),
+        ("[opensm]\nopensm_args = -P /x\n", "unknown"),
+    ],
+)
+def test_more_invalid(tmp_path, text, match):
+    with pytest.raises(config_mod.ConfigError, match=match):
+        _load(tmp_path, "[api]\ntoken = x\n" + text)
+
+
+def test_hex_and_bool_options(tmp_path):
+    config = _load(
+        tmp_path,
+        "[api]\ntoken = x\n[opensm]\nflat_pkey = 0x7fff\n"
+        "shared_default_partition = yes\n",
+    )
+    assert config.flat_pkey == 0x7FFF
+    assert config.shared_default_partition is True

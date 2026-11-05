@@ -67,3 +67,16 @@ def test_new_key():
     assert len(keys) == 20
     for key in keys:
         assert len(key) == 18 and int(key, 16) != 0
+
+
+def test_keys_use_64_bits():
+    keys = [int(opensm_conf.new_key(), 16) for _ in range(200)]
+    assert any(k >> 63 for k in keys)
+    assert any(not k & 1 for k in keys)
+
+
+def test_manager_sets_log_flags():
+    assert "log_flags 0x07" in opensm_conf.render({}).splitlines()
+    assert (
+        "log_flags 0x07" not in opensm_conf.render({"log_flags": "0xff"}).splitlines()
+    )

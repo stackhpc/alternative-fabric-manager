@@ -46,6 +46,11 @@ class Manager:
         self.sessionmaker = sessionmaker
         self.driver = driver
         self.template = template or partitions.load_template(config.partitions_template)
+        # The pkeys that no VLAN network may take: the default partition's,
+        # the flat networks', and those of the template's static partitions
+        self.reserved_pkeys = partitions.pkeys(
+            partitions.render(config, [], 0, self.template)
+        ) | {partitions.DEFAULT_PKEY, config.flat_pkey}
         # One SQLite connection is shared by every thread, so all database
         # access is serialised.
         self._lock = threading.Lock()
@@ -69,7 +74,12 @@ class Manager:
 
     def put_network(self, network_id, data):
         """Create or update a network's partition"""
+        partitions.check_id(network_id)
         pkey = partitions.pkey_from_network(dict(data, id=network_id))
+        if pkey in self.reserved_pkeys:
+            raise partitions.InvalidRequest(
+                f"Partition key 0x{pkey:04x} of network {network_id} is reserved"
+            )
         with self._lock, self.sessionmaker() as session:
             other = None
             if pkey is not None:
@@ -91,6 +101,7 @@ class Manager:
             return self._commit_job(session, "put_network", network_id)
 
     def delete_network(self, network_id):
+        partitions.check_id(network_id)
         with self._lock, self.sessionmaker() as session:
             network = session.get(db.Network, network_id)
             if network is not None:
@@ -106,9 +117,23 @@ class Manager:
 
     def put_port(self, port_id, data):
         """Make a port's GUID a member of its network's partition"""
+        partitions.check_id(port_id)
         guid = partitions.guid_from_port(data)
         network_id = data.get("network_id")
         with self._lock, self.sessionmaker() as session:
+            other = session.scalar(
+                sa.select(db.Port).where(
+                    db.Port.guid == f"{guid:016x}", db.Port.id != port_id
+                )
+            )
+            if other is not None:
+                # A GUID can be in only one network's partition. networking-mlnx
+                # deletes a GUID's old port before it sends a new one, so this is
+                # a port whose deletion never arrived, or two ports with one
+                # client ID.
+                raise partitions.InvalidRequest(
+                    f"Port {port_id} has the GUID of port {other.id}"
+                )
             if session.get(db.Network, network_id) is None:
                 # The network was never sent, or its request failed. Fail
                 # rather than let the port become ACTIVE outside its
@@ -126,6 +151,7 @@ class Manager:
             return self._commit_job(session, "put_port", port_id)
 
     def delete_port(self, port_id):
+        partitions.check_id(port_id)
         with self._lock, self.sessionmaker() as session:
             port = session.get(db.Port, port_id)
             if port is not None:
@@ -145,6 +171,10 @@ class Manager:
 
     def start(self):
         """Write the current state, start OpenSM, then apply changes"""
+        LOG.info(
+            "OpenSM hardening: %s",
+            ", ".join(sorted(self.config.hardening_groups)) or "none",
+        )
         self._write_current()
         self.driver.start()
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
@@ -203,6 +233,8 @@ class Manager:
             content,
             {n.pkey: set(guids) for n, guids in networks if n.pkey is not None},
             {guid for n, guids in networks if n.pkey is None for guid in guids},
+            flat_pkey=self.config.flat_pkey,
+            shared_default=self.config.shared_default_partition,
         )
         return content
 
@@ -228,16 +260,30 @@ class Manager:
             hardening=groups,
             keys=self.keys() if groups & {"m_key", "sm_key", "sa_key"} else None,
         )
-        partitions.write_atomically(self.config.opensm_conf_file, content)
         # The keys are secrets.
-        os.chmod(self.config.opensm_conf_file, 0o600)
+        partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
 
     def _write_current(self):
-        """Write the current state's files, before OpenSM starts"""
+        """Write the current state's files, before OpenSM starts
+
+        If the current state can't be rendered, OpenSM starts with the last
+        partitions file, which passed the checks when it was written, rather
+        than not at all.
+        """
         self._write_opensm_conf()
-        with self._lock, self.sessionmaker() as session:
-            content = self._render(session)
-            session.commit()
+        try:
+            with self._lock, self.sessionmaker() as session:
+                content = self._render(session)
+                session.commit()
+        except partitions.InvalidPartitions as e:
+            if not os.path.exists(self.config.partitions_file):
+                raise
+            LOG.error(
+                "Starting OpenSM with the last partitions file, since the "
+                "current state can't be rendered: %s",
+                e,
+            )
+            return
         partitions.write_atomically(self.config.partitions_file, content)
 
     def _snapshot(self):

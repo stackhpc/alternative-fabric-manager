@@ -28,8 +28,6 @@ database = /var/lib/alternative-fabric-manager/afm.sqlite
 driver = managed
 container = opensm
 image = ghcr.io/stackhpc/docker-opensm:latest
-# Extra OpenSM arguments; prefer [opensm_conf].
-opensm_args =
 # Mounts of the OpenSM container, besides config_dir, as
 # source:destination[:mode], separated by commas.
 volumes = /lib/modules:/lib/modules:ro,/etc/localtime:/etc/localtime:ro,opensm_logs:/var/log,opensm_cache:/var/cache/opensm
@@ -41,8 +39,10 @@ config_dir = /etc/opensm
 host_config_dir = /etc/opensm
 # A Jinja template for partitions.conf, instead of the default. It gets
 # default_partition, networks (each with id, name, pkey, pkey_hex and guids),
-# ipoib (rate, mtu, sl) and generation, and what it renders is checked: every
-# network's pkey must have exactly its ports as full members.
+# flat (the flat networks' partition, with the same keys), ipoib (rate, mtu,
+# sl) and generation. What it renders is checked: every network's partition
+# must have exactly its ports as full members, a port may be in only one,
+# and ALL, ALL_CAS and ALL_VCAS can't be full members elsewhere.
 partitions_template =
 # The groups of hardened OpenSM options, from docs/opensm-hardening.md, to
 # write into opensm.conf, separated by commas: m_key, sm_key, sa_key,
@@ -62,6 +62,14 @@ apply_attempts = 3
 # partition, for example:
 #   Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=limited, SELF=full ;
 default_partition = Default=0x7fff, ipoib : ALL=limited, SELF=full ;
+# The partition of flat networks, outside the VLAN range. 0x7fff makes their
+# ports full members of the default partition instead, which every tenant can
+# reach.
+flat_pkey = 0x7ffe
+# Allow ALL=full in the default partition, which lets every port, other
+# tenants' included, reach every other there. Only for a fabric that relies
+# on it.
+shared_default_partition = false
 # IPoIB broadcast group of networks' partitions, as IBTA values.
 ipoib_rate = 3
 ipoib_mtu = 4

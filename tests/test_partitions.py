@@ -4,7 +4,7 @@ import pytest
 
 from alternative_fabric_manager import partitions
 
-DEFAULT = "Default=0x7fff, ipoib : ALL=full, SELF=full ;"
+DEFAULT = "Default=0x7fff, ipoib : ALL=full, SELF=full ;"  # shared
 GUID = 0x12345600007821B6
 OTHER = 0x0409_73FF_FFC7_5168
 
@@ -21,12 +21,28 @@ def _render(config, networks, template=None, generation=7):
 
 def test_default_template(config):
     content = _render(config, [(_network(), [GUID, GUID])])
-    assert content.splitlines()[1:] == [
+    lines = content.splitlines()
+    assert lines[1:] == [
         "# Generation 7",
         config.default_partition,
-        f"net-net1=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 : 0x{GUID:016x}=full ;",
+        "net-net1=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 :",
+        f"    0x{GUID:016x}=full",
+        "    ;",
     ]
     partitions.validate(content, {0x64: {GUID}})
+
+
+def test_default_template_puts_members_on_lines_of_their_own(config):
+    guids = range(1, 1001)
+    content = _render(config, [(_network(), guids)])
+    assert max(len(line) for line in content.splitlines()) < 80
+    partitions.validate(content, {0x64: set(guids)})
+
+
+def test_long_lines_are_refused():
+    members = ", ".join(f"0x{guid:016x}=full" for guid in range(1, 100))
+    with pytest.raises(partitions.InvalidPartitions, match="longer"):
+        partitions.validate(f"{DEFAULT}\nnet=0x0064 : {members} ;", {0x64: set()})
 
 
 def test_operator_template(config, tmp_path):
@@ -97,42 +113,110 @@ def test_template_is_sandboxed(config, tmp_path):
     ],
 )
 def test_invalid(content):
+    # With ALL=full allowed in the default partition, so that each case fails
+    # for its own reason
     with pytest.raises(partitions.InvalidPartitions):
-        partitions.validate(content, {0x64: {GUID}})
+        partitions.validate(content, {0x64: {GUID}}, shared_default=True)
 
 
 def test_valid_variants():
     # Comments, defmember, a decimal pkey, multicast groups and keywords in a
     # static partition
     content = (
-        f"{DEFAULT}  # the default\n"
+        "Default=0x7fff : ALL=limited, SELF=full ;  # the default\n"
         f"net=100, ipoib, defmember=full : 0x{GUID:x} ;\n"
         "storage=0x0200, ipoib :\n"
         "    mgid=ff12:401b::0707,sl=1\n"
-        "    ALL_SWITCHES=full ;\n"
+        "    ALL_SWITCHES=full, ALL_CAS=limited ;\n"
     )
     partitions.validate(content, {0x64: {GUID}})
 
 
-def test_flat_ports_must_be_full_members_of_the_default():
-    limited = "Default=0x7fff : ALL=limited, SELF=full ;"
+LIMITED = "Default=0x7fff : ALL=limited, SELF=full ;"
+
+
+def test_flat_ports_in_their_own_partition():
+    content = f"{LIMITED}\nflat=0x7ffe, indx0 : 0x{GUID:x}=full ;"
+    partitions.validate(content, {}, {GUID})
+    with pytest.raises(partitions.InvalidPartitions):
+        partitions.validate(LIMITED, {}, {GUID})
+    with pytest.raises(partitions.InvalidPartitions):
+        partitions.validate(f"{content}\nflat=0x7ffe : 0x{OTHER:x}=full ;", {}, {GUID})
+
+
+def test_flat_ports_in_the_default_partition():
+    # flat_pkey = 0x7fff
     with pytest.raises(partitions.InvalidPartitions, match="flat"):
-        partitions.validate(limited, {}, {GUID})
-    partitions.validate(f"{limited}\nDefault=0x7fff : 0x{GUID:x}=full ;", {}, {GUID})
-    # ALL=full covers them.
-    partitions.validate(DEFAULT, {}, {GUID})
+        partitions.validate(LIMITED, {}, {GUID}, flat_pkey=0x7FFF)
+    partitions.validate(
+        f"{LIMITED}\nDefault=0x7fff : 0x{GUID:x}=full ;",
+        {},
+        {GUID},
+        flat_pkey=0x7FFF,
+    )
+    # ALL=full covers them, where it is allowed.
+    partitions.validate(DEFAULT, {}, {GUID}, flat_pkey=0x7FFF, shared_default=True)
 
 
 def test_flat_ports_cant_be_in_another_partition():
     with pytest.raises(partitions.InvalidPartitions, match="isn't a network's"):
         partitions.validate(
-            f"{DEFAULT}\nstorage=0x0200 : 0x{GUID:x}=full ;", {}, {GUID}
+            f"{LIMITED}\nflat=0x7ffe : 0x{GUID:x}=full ;\n"
+            f"storage=0x0200 : 0x{GUID:x}=full ;",
+            {},
+            {GUID},
         )
+
+
+def test_a_guid_in_two_networks_is_refused():
+    content = (
+        f"{LIMITED}\nnet=0x0064 : 0x{GUID:x}=full ;\nnet2=0x0065 : 0x{GUID:x}=full ;"
+    )
+    with pytest.raises(partitions.InvalidPartitions, match="partitions"):
+        partitions.validate(content, {0x64: {GUID}, 0x65: {GUID}})
+    content = (
+        f"{LIMITED}\nnet=0x0064 : 0x{GUID:x}=full ;\nflat=0x7ffe : 0x{GUID:x}=full ;"
+    )
+    with pytest.raises(partitions.InvalidPartitions):
+        partitions.validate(content, {0x64: {GUID}}, {GUID})
+
+
+@pytest.mark.parametrize(
+    "partition",
+    [
+        "storage=0x0200 : ALL=full ;",
+        "storage=0x0200 : ALL_CAS=both ;",
+        "storage=0x0200, defmember=full : ALL_VCAS ;",
+    ],
+)
+def test_tenant_keywords_as_full_members_are_refused(partition):
+    with pytest.raises(partitions.InvalidPartitions, match="every tenant"):
+        partitions.validate(f"{LIMITED}\n{partition}", {})
+
+
+def test_shared_default_partition_needs_its_option():
+    with pytest.raises(partitions.InvalidPartitions, match="every tenant"):
+        partitions.validate(DEFAULT, {})
+    partitions.validate(DEFAULT, {}, shared_default=True)
+
+
+@pytest.mark.parametrize("member", ["0x_1", "\u0661", "1e5", "0x" + "1" * 17])
+def test_strict_guids(member):
+    with pytest.raises(partitions.InvalidPartitions):
+        partitions.validate(f"{LIMITED}\nstorage=0x0200 : {member} ;", {})
 
 
 def test_default_template_with_flat_ports(config):
     flat = types.SimpleNamespace(id="flat1", pkey=None)
     content = _render(config, [(flat, [GUID]), (_network(), [OTHER])])
-    assert f"Default=0x7fff : 0x{GUID:016x}=full ;" in content
+    assert "flat=0x7ffe, indx0, ipoib" in content
     assert "net-flat1" not in content
     partitions.validate(content, {0x64: {OTHER}}, {GUID})
+
+
+def test_default_template_with_flat_ports_in_the_default(config):
+    config.flat_pkey = 0x7FFF
+    flat = types.SimpleNamespace(id="flat1", pkey=None)
+    content = _render(config, [(flat, [GUID])])
+    assert "flat=" not in content
+    partitions.validate(content, {}, {GUID}, flat_pkey=0x7FFF)

@@ -185,3 +185,22 @@ def test_managed_stop(managed_config):
     )
     driver.stop()
     assert container.removed
+
+
+def test_a_sweep_must_start_after_the_signal():
+    # A heavy sweep already under way may finish after OpenSM logs the signal,
+    # without having read the new file.
+    already = (
+        "Nov 05 16:59:16 190569 [275FE640] 0x04 -> handle_hup_signal:\n"
+        "*************************** SUBNET UP ****************************"
+    )
+    container = FakeContainer(after=already)
+    with pytest.raises(ReloadError, match="didn't finish"):
+        _reloader(container, timeout=0.05).reload()
+
+
+def test_failed_start_removes_the_container(managed_config):
+    client = FakeManagedClient(log="0x01 -> PARSE ERROR line 3")
+    with pytest.raises(ReloadError, match="couldn't read"):
+        docker_driver.ManagedDocker(managed_config, client=client).start()
+    assert client.existing.removed

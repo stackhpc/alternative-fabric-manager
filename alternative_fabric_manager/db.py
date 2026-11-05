@@ -47,7 +47,8 @@ class Port(Base):
     )
     # As 16 hex digits: a GUID often has its top bit set, which no SQL
     # integer type holds unsigned.
-    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16))
+    # Unique: a GUID in two networks' partitions would be on both.
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), unique=True)
     host: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
 
 
@@ -124,4 +125,7 @@ def make_sessionmaker(database):
         cursor.close()
 
     Base.metadata.create_all(engine)
+    if database != ":memory:":
+        # It holds the fabric's OpenSM keys.
+        os.chmod(database, 0o600)
     return orm.sessionmaker(engine, expire_on_commit=False)

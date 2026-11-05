@@ -20,7 +20,6 @@ sweep instead, which ends with "SUBNET UP" or "HEAVY SWEEP COMPLETE".
 
 import contextlib
 import logging
-import shlex
 import time
 
 import docker
@@ -31,8 +30,10 @@ from alternative_fabric_manager.drivers import ReloadError
 
 LOG = logging.getLogger(__name__)
 
-# OpenSM logs this when it handles SIGHUP, before and after the sweep.
+# OpenSM logs this when it handles SIGHUP, before and after the sweep, and
+# then starts a pkey sweep, or a heavy one if another of its files changed.
 HUP_MARKER = "handle_hup_signal"
+SWEEP_START_MARKERS = ("INITIATING PKEY SWEEP", "INITIATING HEAVY SWEEP")
 DONE_MARKERS = ("PKEY SWEEP COMPLETE", "HEAVY SWEEP COMPLETE", "SUBNET UP")
 # OpenSM logs one of these once it has started, as master or standby.
 STARTED_MARKERS = ("SUBNET UP", "Entering STANDBY state")
@@ -94,9 +95,11 @@ class DockerReloader:
         return container.logs(**kwargs).decode(errors="replace").splitlines()
 
     def _wait_for_sweep(self, container, since, seen):
-        """Wait for OpenSM to handle the signal and finish its sweep"""
+        """Wait for OpenSM to handle the signal, then for a sweep that starts
+        after that to finish: one already under way may not have read the
+        file"""
         deadline = time.monotonic() + self.timeout
-        handled = False
+        handled = started = False
         while time.monotonic() < deadline:
             lines = self._log(container, since)[seen:]
             seen += len(lines)
@@ -107,7 +110,9 @@ class DockerReloader:
                     )
                 if HUP_MARKER in line:
                     handled = True
-                elif handled and any(m in line for m in DONE_MARKERS):
+                elif handled and any(m in line for m in SWEEP_START_MARKERS):
+                    started = True
+                elif started and any(m in line for m in DONE_MARKERS):
                     LOG.debug("OpenSM: %s", line.strip(" *"))
                     return
             time.sleep(POLL_INTERVAL)
@@ -136,11 +141,7 @@ class ManagedDocker(DockerReloader):
         kwargs = {
             "image": config.image,
             # After the image's own -F, so that this one is used
-            "command": [
-                "-F",
-                f"{opensm_conf.CONTAINER_CONFIG_DIR}/opensm.conf",
-                *shlex.split(config.opensm_args),
-            ],
+            "command": ["-F", f"{opensm_conf.CONTAINER_CONFIG_DIR}/opensm.conf"],
             "name": config.container,
             "detach": True,
             "network_mode": "host",
@@ -171,7 +172,12 @@ class ManagedDocker(DockerReloader):
             container = self.client.containers.run(**self._run_kwargs())
             LOG.info("Started OpenSM container %s", self.container_name)
             self._wait_for_start(container)
-        except docker.errors.DockerException as e:
+        except (docker.errors.DockerException, ReloadError) as e:
+            # An OpenSM that didn't start properly, for example one that
+            # rejected part of its partitions file, mustn't keep running.
+            self.stop()
+            if isinstance(e, ReloadError):
+                raise
             raise ReloadError(f"Docker: {e}") from e
 
     def _wait_for_start(self, container):

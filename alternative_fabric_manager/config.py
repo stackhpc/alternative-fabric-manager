@@ -36,8 +36,20 @@ HARDENING_GROUPS = (
     "enforcement",
     "babbling_ports",
 )
-# opensm.conf keys that the manager sets, which overrides can't change
-MANAGED_OPENSM_KEYS = ("partition_config_file", "daemon")
+# opensm.conf keys that the manager sets, which overrides can't change: the
+# manager depends on OpenSM reading its partitions file, staying in the
+# foreground, logging to its container's output, and enforcing partitions.
+MANAGED_OPENSM_KEYS = (
+    "partition_config_file",
+    "daemon",
+    "log_file",
+    "no_partition_enforcement",
+)
+# The log levels whose messages the manager watches for: errors, info and
+# verbose, which has the sweep banners
+REQUIRED_LOG_FLAGS = 0x07
+NO_HARDENING = ("none", "false", "no")
+ALL_HARDENING = ("all", "true", "yes")
 
 
 class ConfigError(Exception):
@@ -69,10 +81,10 @@ class Config:
     driver: str = "managed"
     # The OpenSM container: created with this name (managed), or signalled.
     container: str = "opensm"
-    # managed: the OpenSM image, extra OpenSM arguments, and the container's
-    # mounts as source:destination[:mode], separated by commas.
+    # managed: the OpenSM image, and the container's mounts as
+    # source:destination[:mode], separated by commas. OpenSM's options go in
+    # [opensm_conf].
     image: str = "ghcr.io/stackhpc/docker-opensm:latest"
-    opensm_args: str = ""
     volumes: str = DEFAULT_VOLUMES
     # managed: the manager's own container, whose PID namespace OpenSM joins.
     # Empty when the manager isn't in a container, for development only:
@@ -96,6 +108,16 @@ class Config:
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
     default_partition: str = DEFAULT_PARTITION
+    # The partition of flat networks, which share it, with indx0 like a VLAN
+    # network's. Outside the VLAN range, so that it can't be a network's.
+    # 0x7fff puts flat networks' ports in the default partition as full
+    # members instead, where every port that is a limited member, such as a
+    # VLAN network's, can reach them.
+    flat_pkey: int = 0x7FFE
+    # Allow ALL=full (or ALL_CAS, ALL_VCAS) in the default partition, which
+    # lets every port reach every other there, including other tenants'. Only
+    # for a fabric where that is already relied on.
+    shared_default_partition: bool = False
     # IPoIB broadcast group settings for networks' partitions, as IBTA
     # values (rate 3 = 10 Gb/s, mtu 4 = 2048).
     ipoib_rate: int = 3
@@ -115,11 +137,9 @@ class Config:
     def hardening_groups(self):
         """The hardening groups that [opensm] hardening names"""
         words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        if words & {"all", "true", "yes"}:
+        if words & set(ALL_HARDENING):
             return set(HARDENING_GROUPS)
-        if words <= {"none", "false", "no"}:
-            return set()
-        return words
+        return words - set(NO_HARDENING)
 
     @property
     def partitions_file(self):
@@ -149,7 +169,12 @@ class Config:
                 kind = type(getattr(config, name))
                 value = parser.get(section, name)
                 try:
-                    setattr(config, name, kind(value))
+                    if kind is bool:
+                        setattr(config, name, parser.getboolean(section, name))
+                    elif kind is int:
+                        setattr(config, name, int(value, 0))
+                    else:
+                        setattr(config, name, kind(value))
                 except ValueError:
                     raise ConfigError(
                         f"[{section}] {name} must be a {kind.__name__}, not {value!r}"
@@ -169,15 +194,43 @@ class Config:
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
         words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        unknown = (
-            words
-            - set(HARDENING_GROUPS)
-            - {"all", "none", "true", "false", "yes", "no"}
-        )
+        unknown = words - set(HARDENING_GROUPS) - set(ALL_HARDENING) - set(NO_HARDENING)
         if unknown:
             raise ConfigError(
                 f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
             )
+        if len(words) > 1 and words & (set(ALL_HARDENING) | set(NO_HARDENING)):
+            raise ConfigError(
+                "[opensm] hardening is either all, none, or a list of groups"
+            )
+        for name in ("start_timeout", "sweep_timeout", "check_interval"):
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"[opensm] {name} must be positive")
+        for name, low, high in (
+            ("ipoib_rate", 2, 22),
+            ("ipoib_mtu", 1, 5),
+            ("ipoib_sl", 0, 15),
+        ):
+            if not low <= getattr(self, name) <= high:
+                raise ConfigError(f"[opensm] {name} must be from {low} to {high}")
+        if not 4095 <= self.flat_pkey <= 0x7FFF:
+            raise ConfigError(
+                "[opensm] flat_pkey must be from 0x0fff to 0x7fff, outside the "
+                "VLAN range"
+            )
+        if self.opensm_conf.get("part_enforce", "both") != "both":
+            raise ConfigError("[opensm_conf] part_enforce must be both")
+        log_flags = self.opensm_conf.get("log_flags")
+        if log_flags is not None:
+            try:
+                flags = int(log_flags, 0)
+            except ValueError:
+                raise ConfigError("[opensm_conf] log_flags isn't a number") from None
+            if flags & REQUIRED_LOG_FLAGS != REQUIRED_LOG_FLAGS:
+                raise ConfigError(
+                    f"[opensm_conf] log_flags must include 0x{REQUIRED_LOG_FLAGS:02x}, "
+                    "whose messages the manager watches for"
+                )
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(
@@ -198,7 +251,6 @@ OPTIONS = (
             "driver",
             "container",
             "image",
-            "opensm_args",
             "volumes",
             "manager_container",
             "config_dir",
@@ -210,6 +262,8 @@ OPTIONS = (
             "check_interval",
             "apply_attempts",
             "default_partition",
+            "flat_pkey",
+            "shared_default_partition",
             "ipoib_rate",
             "ipoib_mtu",
             "ipoib_sl",

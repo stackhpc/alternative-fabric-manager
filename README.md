@@ -34,12 +34,11 @@ to `ERROR`: a port without a usable client ID, a port on a network without a
 partition, or a network whose VLAN ID another network's partition already
 uses.
 
-A flat network has no partition of its own: its ports are added as full
-members of the default partition, which all flat networks share. That keeps
-them able to reach each other when the default partition gives every other
-port only limited membership. networking-mlnx needs "Send flat network
-creation to the SDN controller" for the manager to learn of a flat network
-when it is created; until then its ports are rejected.
+Flat networks share one partition, `[opensm] flat_pkey`, 0x7ffe by default,
+outside the VLAN range. networking-mlnx needs "Send flat network creation to
+the SDN controller" (https://review.opendev.org/c/x/networking-mlnx/+/1014376)
+for the manager to learn of a flat network when it is created; until then its
+ports are rejected. A port's GUID can be in only one network's partition.
 
 ## Running it
 
@@ -61,9 +60,10 @@ docker run -d --name alternative-fabric-manager --restart unless-stopped \
   alternative-fabric-manager
 ```
 
-Stop any other OpenSM on the host first. The manager's container must be
-called as `[opensm] manager_container` says, `alternative-fabric-manager` by
-default. The Docker socket lets the manager start OpenSM and read its log,
+Stop any other OpenSM on the host first: the manager removes any container
+called as `[opensm] container` says, `opensm` by default, and starts its own.
+The manager's container must be called as `[opensm] manager_container` says,
+`alternative-fabric-manager` by default. The Docker socket lets the manager start OpenSM and read its log,
 so treat the manager as root on its host.
 
 Copy [etc/afm.conf.sample](etc/afm.conf.sample) to
@@ -104,22 +104,25 @@ needing the M_Key (`alternative-fabric-manager --show-keys`).
 `partitions.conf` is rendered from a Jinja template, in a sandbox. Set
 `[opensm] partitions_template` to use your own, for example to add static
 partitions or multicast groups. Whatever it renders is checked before it is
-written: the default partition must be defined, every network's pkey must
-have exactly the network's ports as full members, and no other partition may
-have one of them. A file that fails the check fails the jobs and isn't
-written.
+written: the default partition must be defined, every network's partition,
+and the flat networks', must have exactly its ports as full members, a port
+may be in only one of them and in no other partition, and `ALL`, `ALL_CAS`
+and `ALL_VCAS` can't be full members of any partition but a network's. A
+file that fails the check fails the jobs and isn't written. A network whose
+VLAN ID is a static partition's pkey is rejected when it is sent.
 
 ### The default partition
 
-`[opensm] default_partition` is written to the file as is. If OpenSM ran
-without a partitions file, every port was a full member of the default
-partition. Keep that, `ALL=full`, while ports on flat networks must reach
-each other. Otherwise give ports limited membership, so that they can only
-reach the subnet manager there.
+`[opensm] default_partition` is written to the file as is. By default every
+port is only a limited member, so tenants can't reach each other there. On a
+fabric where ports rely on full membership, `ALL=full`, the checks refuse it
+unless `[opensm] shared_default_partition` is true; see
+[docs/opensm-hardening.md](docs/opensm-hardening.md) for what that exposes.
 
-Give the default partition's IPoIB broadcast group the rate and MTU it has
-now, as `saquery -g` shows them. Otherwise OpenSM recreates it, which
-disrupts IPoIB on the default partition across the fabric.
+On a running fabric, give the default partition's IPoIB broadcast group the
+rate and MTU it has now, as `saquery -g` shows them. Otherwise OpenSM
+recreates it, which disrupts IPoIB on the default partition across the
+fabric.
 
 ## Development
 

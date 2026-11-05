@@ -29,13 +29,14 @@ KEYS = ("m_key", "sm_key", "sa_key")
 # key, if it has one, is generated once and kept in the database.
 HARDENING = {
     # Only an SM with the M_Key can read or change a port's settings, with
-    # SubnGet or SubnSet. After a wrong M_Key, the port clears its protection
-    # if no SM uses the right one within the lease, so that a new SM can take
-    # over a fabric whose M_Key was lost.
+    # SubnGet or SubnSet. With no lease, a port never clears its protection,
+    # however long no SM runs: otherwise a host that sends wrong M_Keys while
+    # every SM is down, as the manager's fencing can make them, would get the
+    # port's protection, and its M_Key, back.
     "m_key": {
         "m_key": None,
         "m_key_protection_level": "2",
-        "m_key_lease_period": "60",
+        "m_key_lease_period": "0",
     },
     # Only the fabric's own SMs can hand over to each other.
     "sm_key": {"sm_key": None},
@@ -67,7 +68,10 @@ HARDENING = {
 
 def new_key():
     """Return a random, non-zero 64-bit key, as OpenSM writes them"""
-    return f"0x{secrets_mod.randbits(63) | 1:016x}"
+    key = 0
+    while not key:
+        key = secrets_mod.randbits(64)
+    return f"0x{key:016x}"
 
 
 def hardened_options(groups, keys):
@@ -94,6 +98,9 @@ def render(overrides, hardening=(), keys=None):
         f"partition_config_file {CONTAINER_CONFIG_DIR}/partitions.conf",
         "daemon FALSE",
     ]
+    if "log_flags" not in overrides:
+        # The levels whose messages the manager watches for
+        lines.append("log_flags 0x07")
     hardened = hardened_options(hardening, keys or {})
     hardened = {k: v for k, v in hardened.items() if k not in overrides}
     if hardened:
