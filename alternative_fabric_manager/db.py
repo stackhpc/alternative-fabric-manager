@@ -25,12 +25,13 @@ class Base(orm.DeclarativeBase):
 
 
 class Network(Base):
-    """A Neutron network, which has a partition"""
+    """A Neutron network: a VLAN network has its own partition, a flat
+    network (pkey None) shares the default partition"""
 
     __tablename__ = "networks"
 
     id: orm.Mapped[str] = orm.mapped_column(sa.String(36), primary_key=True)
-    pkey: orm.Mapped[int] = orm.mapped_column(unique=True)
+    pkey: orm.Mapped[int | None] = orm.mapped_column(unique=True, nullable=True)
     name: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
 
 

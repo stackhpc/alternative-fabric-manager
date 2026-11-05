@@ -34,8 +34,12 @@ to `ERROR`: a port without a usable client ID, a port on a network without a
 partition, or a network whose VLAN ID another network's partition already
 uses.
 
-Ports on flat networks stay in the default partition. networking-mlnx sends
-them, but not their networks, so they are rejected too.
+A flat network has no partition of its own: its ports are added as full
+members of the default partition, which all flat networks share. That keeps
+them able to reach each other when the default partition gives every other
+port only limited membership. networking-mlnx needs "Send flat network
+creation to the SDN controller" for the manager to learn of a flat network
+when it is created; until then its ports are rejected.
 
 ## Running it
 

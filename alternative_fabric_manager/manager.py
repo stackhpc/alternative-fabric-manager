@@ -68,15 +68,15 @@ class Manager:
 
     def put_network(self, network_id, data):
         """Create or update a network's partition"""
-        pkey = partitions.pkey_from_segmentation_id(
-            data.get("provider:segmentation_id")
-        )
+        pkey = partitions.pkey_from_network(dict(data, id=network_id))
         with self._lock, self.sessionmaker() as session:
-            other = session.scalar(
-                sa.select(db.Network).where(
-                    db.Network.pkey == pkey, db.Network.id != network_id
+            other = None
+            if pkey is not None:
+                other = session.scalar(
+                    sa.select(db.Network).where(
+                        db.Network.pkey == pkey, db.Network.id != network_id
+                    )
                 )
-            )
             if other is not None:
                 raise partitions.InvalidRequest(
                     f"Partition key 0x{pkey:04x} is already network {other.id}'s"
@@ -109,10 +109,9 @@ class Manager:
         network_id = data.get("network_id")
         with self._lock, self.sessionmaker() as session:
             if session.get(db.Network, network_id) is None:
-                # Either a port on a flat network, which networking-mlnx
-                # never sends, or on a network whose partition was never
-                # made. Fail rather than let the port become ACTIVE outside
-                # its partition.
+                # The network was never sent, or its request failed. Fail
+                # rather than let the port become ACTIVE outside its
+                # partition.
                 raise partitions.InvalidRequest(
                     f"Port {port_id} is on network {network_id}, which has no partition"
                 )
@@ -200,7 +199,9 @@ class Manager:
         ]
         content = partitions.render(self.config, networks, state.value, self.template)
         partitions.validate(
-            content, {network.pkey: set(guids) for network, guids in networks}
+            content,
+            {n.pkey: set(guids) for n, guids in networks if n.pkey is not None},
+            {guid for n, guids in networks if n.pkey is None for guid in guids},
         )
         return content
 

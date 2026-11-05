@@ -112,3 +112,27 @@ def test_valid_variants():
         "    ALL_SWITCHES=full ;\n"
     )
     partitions.validate(content, {0x64: {GUID}})
+
+
+def test_flat_ports_must_be_full_members_of_the_default():
+    limited = "Default=0x7fff : ALL=limited, SELF=full ;"
+    with pytest.raises(partitions.InvalidPartitions, match="flat"):
+        partitions.validate(limited, {}, {GUID})
+    partitions.validate(f"{limited}\nDefault=0x7fff : 0x{GUID:x}=full ;", {}, {GUID})
+    # ALL=full covers them.
+    partitions.validate(DEFAULT, {}, {GUID})
+
+
+def test_flat_ports_cant_be_in_another_partition():
+    with pytest.raises(partitions.InvalidPartitions, match="isn't a network's"):
+        partitions.validate(
+            f"{DEFAULT}\nstorage=0x0200 : 0x{GUID:x}=full ;", {}, {GUID}
+        )
+
+
+def test_default_template_with_flat_ports(config):
+    flat = types.SimpleNamespace(id="flat1", pkey=None)
+    content = _render(config, [(flat, [GUID]), (_network(), [OTHER])])
+    assert f"Default=0x7fff : 0x{GUID:016x}=full ;" in content
+    assert "net-flat1" not in content
+    partitions.validate(content, {0x64: {OTHER}}, {GUID})

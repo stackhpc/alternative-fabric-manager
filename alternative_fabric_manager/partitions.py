@@ -34,6 +34,20 @@ class InvalidRequest(ValueError):
     """The request can't be applied, so must not be sent again"""
 
 
+def pkey_from_network(network):
+    """Return a network's partition key, which is its VLAN ID, or None for a
+    flat network, which uses the default partition"""
+    network_type = network.get("provider:network_type")
+    if network_type == "flat":
+        return None
+    if network_type not in ("vlan", None):
+        raise InvalidRequest(
+            f"Network {network.get('id')} is a {network_type} network, which has "
+            "no partition"
+        )
+    return pkey_from_segmentation_id(network.get("provider:segmentation_id"))
+
+
 def pkey_from_segmentation_id(segmentation_id):
     """Return a network's partition key, which is its VLAN ID"""
     try:
@@ -89,13 +103,18 @@ def guid_from_port(port):
 # Renders each network's partition. Operators can replace it with their own
 # template ([opensm] partitions_template), which gets the same variables:
 #   default_partition  [opensm] default_partition, as is
-#   networks           each with id, name, pkey (an int), pkey_hex and guids
-#                      (a sorted list of "0x..." strings)
+#   networks           each VLAN network, with id, name, pkey (an int),
+#                      pkey_hex and guids (a sorted list of "0x..." strings)
+#   flat_guids         the GUIDs of ports on flat networks, which must be
+#                      full members of the default partition
 #   ipoib              rate, mtu and sl, from [opensm] ipoib_*
 #   generation         the state's generation
 # Whatever it renders is checked by validate() before it is written.
 DEFAULT_TEMPLATE = """\
 {{ default_partition }}
+{% if flat_guids -%}
+Default=0x7fff : {{ flat_guids | join("=full, ") }}=full ;
+{% endif -%}
 {% for network in networks -%}
 {{ network.name }}={{ network.pkey_hex }}, ipoib, rate={{ ipoib.rate }}, \
 mtu={{ ipoib.mtu }}, sl={{ ipoib.sl }} : \
@@ -121,8 +140,13 @@ def load_template(path=""):
 
 def render(config, networks, generation, template):
     """Return the partitions file for networks, a list of
-    (network, [port GUID]) pairs"""
+    (network, [port GUID]) pairs, flat networks' pkey being None"""
+    flat = {
+        guid for network, guids in networks if network.pkey is None for guid in guids
+    }
+    networks = [(n, guids) for n, guids in networks if n.pkey is not None]
     context = {
+        "flat_guids": [f"0x{guid:016x}" for guid in sorted(flat)],
         "default_partition": config.default_partition.strip(),
         "ipoib": {
             "rate": config.ipoib_rate,
@@ -215,20 +239,30 @@ def _parse(content):
     return statements
 
 
-def validate(content, expected):
+def validate(content, expected, flat=frozenset()):
     """Check a rendered partitions file against the networks' membership
 
-    expected maps each network's pkey to its ports' GUIDs. Every network's
-    pkey must have exactly those GUIDs as full members, no keyword and no
-    other member, and no other partition may have one of the networks' ports
-    as a member. The default partition must be defined.
+    expected maps each VLAN network's pkey to its ports' GUIDs, and flat holds
+    the GUIDs of ports on flat networks. Every network's pkey must have
+    exactly its GUIDs as full members, no keyword and no other member, and no
+    other partition may have one of the networks' ports as a member. The
+    default partition must be defined, with the flat networks' ports as full
+    members.
     """
     found = {}
     for pkey, members in _parse(content):
         found.setdefault(pkey, {}).update(members)
     if DEFAULT_PKEY not in found:
         raise InvalidPartitions("The default partition (0x7fff) isn't defined")
-    managed = set().union(*expected.values()) if expected else set()
+    default = found[DEFAULT_PKEY]
+    everyone = any(default.get(k) in ("full", "both") for k in ("ALL", "ALL_CAS"))
+    for guid in flat:
+        if not everyone and default.get(guid) not in ("full", "both"):
+            raise InvalidPartitions(
+                f"Port 0x{guid:016x} of a flat network must be a full member of "
+                "the default partition"
+            )
+    managed = set().union(*expected.values(), flat) if expected else set(flat)
     for pkey, guids in expected.items():
         members = found.get(pkey)
         if members is None:

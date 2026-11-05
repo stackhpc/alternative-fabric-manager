@@ -339,3 +339,48 @@ def test_guid_with_the_top_bit_set(client, manager, config):
     manager.apply_pending()
     assert _job(client, response)["Status"] == "Completed"
     assert "0xfa163e0000123456=full" in _file(config)
+
+
+def _flat_network():
+    return conftest.network(
+        **{"provider:network_type": "flat", "provider:segmentation_id": None}
+    )
+
+
+def test_flat_network_ports_join_the_default_partition(client, manager, config):
+    # networking-mlnx sends ports on flat networks, and their networks' PUT
+    # and DELETE.
+    _post(client, "Network", _flat_network())
+    response = _post(client, "Port", conftest.port())
+    update = client.put(
+        f"{URL}/Network/{NETWORK_ID}", json=_flat_network(), headers=AUTH
+    )
+    manager.apply_pending()
+
+    assert _job(client, response)["Status"] == "Completed"
+    assert _job(client, update)["Status"] == "Completed"
+    assert f"Default=0x7fff : 0x{GUID:016x}=full ;" in _file(config)
+    assert f"net-{NETWORK_ID}" not in _file(config)
+
+
+def test_flat_networks_dont_clash(client):
+    _post(client, "Network", _flat_network())
+    other = dict(_flat_network(), id="d13bba05-eb07-45ba-ace2-765706b2d701")
+    assert _post(client, "Network", other).status_code == 202
+
+
+def test_flat_ports_with_a_limited_default_partition(client, manager, config):
+    # The only way ports on flat networks reach each other then
+    config.default_partition = "Default=0x7fff, ipoib : ALL=limited, SELF=full ;"
+    _post(client, "Network", _flat_network())
+    response = _post(client, "Port", conftest.port())
+    manager.apply_pending()
+    assert _job(client, response)["Status"] == "Completed"
+
+
+@pytest.mark.parametrize("network_type", ["vxlan", "geneve", "local"])
+def test_network_without_a_partition_is_rejected(client, network_type):
+    response = _post(
+        client, "Network", conftest.network(**{"provider:network_type": network_type})
+    )
+    assert response.status_code == 400
