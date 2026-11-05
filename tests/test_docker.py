@@ -165,9 +165,12 @@ def test_managed_start_times_out(managed_config):
         docker_driver.ManagedDocker(managed_config, client=client).start()
 
 
-def test_managed_start_as_standby(managed_config):
+def test_managed_start_as_standby_fails(managed_config):
+    # Another subnet manager is master: this one must not count as applying
+    # anything.
     client = FakeManagedClient(log="0x02 -> Entering STANDBY state")
-    docker_driver.ManagedDocker(managed_config, client=client).start()
+    with pytest.raises(ReloadError):
+        docker_driver.ManagedDocker(managed_config, client=client).start()
 
 
 def test_managed_running(managed_config):

@@ -21,13 +21,19 @@ SWEEP COMPLETE", and ends with "SUBNET UP".
 
 import contextlib
 import logging
+import re
 import time
 
 import docker
 import docker.errors
 
 from alternative_fabric_manager import opensm_conf
-from alternative_fabric_manager.drivers import ReloadError
+from alternative_fabric_manager.drivers import (
+    Fabric,
+    PartitionsRejected,
+    ReloadError,
+    SweepReport,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -38,8 +44,30 @@ SWEEP_START_MARKERS = ("INITIATING PKEY SWEEP", "INITIATING HEAVY SWEEP")
 # A heavy sweep logs "HEAVY SWEEP COMPLETE" before it reads the partitions
 # file, so only "SUBNET UP" marks its end.
 DONE_MARKERS = ("PKEY SWEEP COMPLETE", "SUBNET UP")
-# OpenSM logs one of these once it has started, as master or standby.
-STARTED_MARKERS = ("SUBNET UP", "Entering STANDBY state")
+# OpenSM logs this once it has started as master. A managed OpenSM that
+# enters STANDBY has found another subnet manager, so its start failed.
+STARTED_MARKERS = ("SUBNET UP",)
+STANDBY_MARKER = "Entering STANDBY state"
+# The pkey manager's and virtualisation manager's errors setting pkey tables,
+# in OpenSM 5.17, by code (see specs/ha.md, OpenSM errors)
+PKEY_ERROR_CODES = (
+    "0502",
+    "0505",
+    "0506",
+    "0508",
+    "0509",
+    "0512",
+    "0F12",
+    "1503",
+    "5703",
+    "6B06",
+)
+# A switch port with too few pkey entries: OpenSM clears its enforcement bit
+ENFORCEMENT_ERROR_CODES = ("0507", "0513")
+_ERR = re.compile(r"ERR ([0-9A-F]{4}):")
+_GUID = re.compile(r"0x([0-9a-fA-F]{1,16})\b")
+_SWITCH_PORT = re.compile(r"switch 0x([0-9a-fA-F]{1,16}) port (\d+)")
+_PARSE_LINE = re.compile(r"PARSE ERROR: line (\d+)")
 POLL_INTERVAL = 0.5
 
 
@@ -47,6 +75,30 @@ def _is_partitions_error(line):
     # OpenSM skips a line of the partitions file that it can't parse, and
     # still completes the sweep.
     return "PARSE ERROR" in line or ("prtn" in line and "ERR" in line)
+
+
+def _rejected(line):
+    match = _PARSE_LINE.search(line)
+    return PartitionsRejected(
+        f"OpenSM couldn't read the partitions file: {line.strip()}",
+        line=int(match.group(1)) if match else None,
+    )
+
+
+def _note_pkey_error(report, line):
+    """Record a pkey or enforcement error that OpenSM logged"""
+    match = _ERR.search(line)
+    if not match:
+        return
+    code = match.group(1)
+    if code in ENFORCEMENT_ERROR_CODES:
+        for switch, port in _SWITCH_PORT.findall(line):
+            report.enforcement_errors.add(f"{int(switch, 16):016x}:{port}")
+        LOG.error("OpenSM cleared a switch port's enforcement: %s", line.strip())
+    elif code in PKEY_ERROR_CODES:
+        guids = {int(g, 16) for g in _GUID.findall(line)}
+        report.pkey_errors |= guids
+        LOG.warning("OpenSM couldn't set a pkey table: %s", line.strip())
 
 
 class DockerReloader:
@@ -86,9 +138,47 @@ class DockerReloader:
             since = time.time() - 1
             seen = len(self._log(container, since))
             container.kill(signal="SIGHUP")
-            self._wait_for_sweep(container, since, seen)
+            return self._wait_for_sweep(container, since, seen)
         except docker.errors.DockerException as e:
             raise ReloadError(f"Docker: {e}") from e
+
+    def fabric(self, m_key=None, sa_key=None):
+        """Ask the fabric, from OpenSM's container, for its switches and the
+        subnet managers its SA knows"""
+        try:
+            container = self.client.containers.get(self.container_name)
+            if container.status != "running":
+                raise ReloadError(
+                    f"OpenSM container {self.container_name} isn't running"
+                )
+            m_key_args = ["-y", m_key] if m_key else []
+            switches = self._exec(container, ["ibswitches", *m_key_args])
+            sm_records = self._exec(
+                container, ["saquery", *(["--smkey", sa_key] if sa_key else []), "SMIR"]
+            )
+            ports = self._exec(container, ["ibstat", "-p"])
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: {e}") from e
+        switch_guids = {
+            int(g, 16)
+            for g in re.findall(r"^Switch\s*:\s*0x([0-9a-fA-F]+)", switches, re.M)
+        }
+        sms = [
+            (int(guid, 16), int(state))
+            for guid, state in re.findall(
+                r"GUID\.+0x([0-9a-fA-F]+).*?SMState\.+(\d+)", sm_records, re.S
+            )
+        ]
+        own = [int(g, 16) for g in re.findall(r"0x([0-9a-fA-F]+)", ports)]
+        return Fabric(switch_guids, sms, own[0] if own else None)
+
+    @staticmethod
+    def _exec(container, command):
+        code, output = container.exec_run(command)
+        output = output.decode(errors="replace")
+        if code != 0:
+            raise ReloadError(f"{command[0]} failed: {output.strip()[:200]}")
+        return output
 
     @staticmethod
     def _log(container, since=None):
@@ -100,24 +190,29 @@ class DockerReloader:
     def _wait_for_sweep(self, container, since, seen):
         """Wait for OpenSM to handle the signal, then for a sweep that starts
         after that to finish: one already under way may not have read the
-        file"""
+        file. Returns what it reported about pkey tables it couldn't set."""
         deadline = time.monotonic() + self.timeout
         handled = started = False
+        report = SweepReport()
         while time.monotonic() < deadline:
             lines = self._log(container, since)[seen:]
             seen += len(lines)
             for line in lines:
+                if "PARSE ERROR" in line:
+                    raise _rejected(line)
                 if _is_partitions_error(line):
                     raise ReloadError(
                         f"OpenSM couldn't read the partitions file: {line.strip()}"
                     )
+                if started:
+                    _note_pkey_error(report, line)
                 if HUP_MARKER in line:
                     handled = True
                 elif handled and any(m in line for m in SWEEP_START_MARKERS):
                     started = True
                 elif started and any(m in line for m in DONE_MARKERS):
                     LOG.debug("OpenSM: %s", line.strip(" *"))
-                    return
+                    return report
             time.sleep(POLL_INTERVAL)
         raise ReloadError(
             f"OpenSM didn't finish a sweep within {self.timeout} seconds of SIGHUP"
@@ -188,9 +283,15 @@ class ManagedDocker(DockerReloader):
         while time.monotonic() < deadline:
             lines = self._log(container)
             for line in lines:
+                if "PARSE ERROR" in line:
+                    raise _rejected(line)
                 if _is_partitions_error(line):
                     raise ReloadError(
                         f"OpenSM couldn't read the partitions file: {line.strip()}"
+                    )
+                if STANDBY_MARKER in line:
+                    raise ReloadError(
+                        "OpenSM entered STANDBY: another subnet manager is master"
                     )
                 if any(m in line for m in STARTED_MARKERS):
                     LOG.info("OpenSM: %s", line.strip(" *"))

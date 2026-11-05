@@ -35,6 +35,19 @@ def main(argv=None):
         help="Print the fabric's OpenSM keys, for diagnostic tools such as "
         "smpquery -y <m_key>, and exit",
     )
+    parser.add_argument(
+        "--confirm-switches",
+        action="store_true",
+        help="Record the switches OpenSM sees now as the fabric's expected "
+        "ones, which every fabric check must find, and exit",
+    )
+    parser.add_argument(
+        "--clear-enforcement-errors",
+        action="store_true",
+        help="Forget the switch ports whose partition enforcement OpenSM "
+        "cleared, once they are dealt with, and exit; until then no job "
+        "completes",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -52,6 +65,25 @@ def main(argv=None):
         )
         for name, value in manager.keys().items():
             print(f"{name} {value}")
+        return
+
+    if args.confirm_switches:
+        manager = manager_mod.Manager(
+            config, db.make_sessionmaker(config.database), drivers.make_driver(config)
+        )
+        switches = manager.confirm_switches()
+        if not switches:
+            sys.exit("alternative-fabric-manager: OpenSM sees no switches")
+        for guid in switches:
+            print(f"0x{guid:016x}")
+        return
+
+    if args.clear_enforcement_errors:
+        manager = manager_mod.Manager(
+            config, db.make_sessionmaker(config.database), drivers.NoOpenSM()
+        )
+        for port in manager.clear_enforcement_errors():
+            print(port)
         return
 
     manager = manager_mod.Manager(

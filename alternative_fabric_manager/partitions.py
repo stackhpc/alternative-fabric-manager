@@ -150,7 +150,16 @@ MAX_LINE = 1000
 
 
 class InvalidPartitions(ValueError):
-    """A rendered partitions file that would break the networks' isolation"""
+    """A rendered partitions file that would break the networks' isolation
+
+    pkeys and guids are those the failure involves, so that it can be traced
+    to the networks and ports that caused it.
+    """
+
+    def __init__(self, message, pkeys=(), guids=()):
+        super().__init__(message)
+        self.pkeys = set(pkeys)
+        self.guids = set(guids)
 
 
 def load_template(path=""):
@@ -225,7 +234,8 @@ _PKEY = re.compile(r"^(0x[0-9a-fA-F]{1,4}|[0-9]{1,5})$")
 
 def _parse(content):
     """Return the partition statements of a partitions file, as
-    (pkey, {member: membership}) pairs, following OpenSM's syntax"""
+    (pkey, {member: membership}, line number) triples, following OpenSM's
+    syntax"""
     for number, line in enumerate(content.splitlines(), 1):
         if len(line) > MAX_LINE:
             raise InvalidPartitions(
@@ -234,9 +244,13 @@ def _parse(content):
             )
     text = "\n".join(line.split("#", 1)[0] for line in content.splitlines())
     statements = []
+    offset = 0
     for statement in text.split(";"):
+        start = offset + len(statement) - len(statement.lstrip())
+        offset += len(statement) + 1
         if not statement.strip():
             continue
+        line = text.count("\n", 0, start) + 1
         if ":" not in statement:
             raise InvalidPartitions(f"No ':' in partition {statement.strip()!r}")
         definition, properties = statement.split(":", 1)
@@ -254,12 +268,12 @@ def _parse(content):
             if flag.startswith("defmember="):
                 default = flag.split("=", 1)[1].strip()
         members = {}
-        for line in properties.splitlines():
-            line = line.strip()
-            if not line or line.startswith("mgid="):
+        for text_line in properties.splitlines():
+            text_line = text_line.strip()
+            if not text_line or text_line.startswith("mgid="):
                 # A multicast group, whose flags are separated by commas too
                 continue
-            for spec in line.split(","):
+            for spec in text_line.split(","):
                 spec = spec.strip()
                 if not spec:
                     continue
@@ -276,13 +290,13 @@ def _parse(content):
                         )
                     member = int(member, 0)
                 members[member] = membership
-        statements.append((pkey, members))
+        statements.append((pkey, members, line))
     return statements
 
 
 def pkeys(content):
     """Return the pkeys that a partitions file defines"""
-    return {pkey for pkey, _members in _parse(content)}
+    return {pkey for pkey, _members, _line in _parse(content)}
 
 
 def validate(
@@ -304,14 +318,16 @@ def validate(
     defined.
     """
     found = {}
-    for pkey, members in _parse(content):
+    for pkey, members, _line in _parse(content):
         found.setdefault(pkey, {}).update(members)
     if DEFAULT_PKEY not in found:
         raise InvalidPartitions("The default partition (0x7fff) isn't defined")
     expected = {pkey: set(guids) for pkey, guids in expected.items()}
     if flat_pkey != DEFAULT_PKEY and (flat or flat_pkey in found):
         if flat_pkey in expected:
-            raise InvalidPartitions(f"Flat partition 0x{flat_pkey:04x} is a network's")
+            raise InvalidPartitions(
+                f"Flat partition 0x{flat_pkey:04x} is a network's", pkeys={flat_pkey}
+            )
         expected[flat_pkey] = set(flat)
     managed = {}
     for pkey, guids in expected.items():
@@ -319,7 +335,8 @@ def validate(
             if guid in managed:
                 raise InvalidPartitions(
                     f"Port 0x{guid:016x} is in partitions 0x{managed[guid]:04x} and "
-                    f"0x{pkey:04x}"
+                    f"0x{pkey:04x}",
+                    guids={guid},
                 )
             managed[guid] = pkey
     if flat_pkey == DEFAULT_PKEY:
@@ -327,22 +344,34 @@ def validate(
             if guid in managed:
                 raise InvalidPartitions(
                     f"Port 0x{guid:016x} is on a flat network and in partition "
-                    f"0x{managed[guid]:04x}"
+                    f"0x{managed[guid]:04x}",
+                    guids={guid},
                 )
     for pkey, members in found.items():
         full = {k for k in _TENANT_KEYWORDS if members.get(k) in ("full", "both")}
         if full and not (pkey == DEFAULT_PKEY and shared_default):
             raise InvalidPartitions(
                 f"Partition 0x{pkey:04x} has {', '.join(sorted(full))} as full "
-                "members, which would share it with every tenant"
+                "members, which would share it with every tenant",
+                pkeys={pkey},
             )
     for pkey, guids in expected.items():
         members = found.get(pkey)
         if members is None:
-            raise InvalidPartitions(f"Network partition 0x{pkey:04x} is missing")
-        if members != {guid: "full" for guid in guids}:
             raise InvalidPartitions(
-                f"Partition 0x{pkey:04x} must have exactly its ports as full members"
+                f"Network partition 0x{pkey:04x} is missing", pkeys={pkey}
+            )
+        if members != {guid: "full" for guid in guids}:
+            differ = {m for m in set(members) ^ set(guids) if isinstance(m, int)}
+            differ |= {
+                g
+                for g in guids
+                if isinstance(members.get(g), str) and members[g] != "full"
+            }
+            raise InvalidPartitions(
+                f"Partition 0x{pkey:04x} must have exactly its ports as full members",
+                pkeys={pkey},
+                guids=differ,
             )
     default = found[DEFAULT_PKEY]
     if flat_pkey == DEFAULT_PKEY:
@@ -351,7 +380,8 @@ def validate(
             if not everyone and default.get(guid) not in ("full", "both"):
                 raise InvalidPartitions(
                     f"Port 0x{guid:016x} of a flat network must be a full member of "
-                    "the default partition"
+                    "the default partition",
+                    guids={guid},
                 )
     for pkey, members in found.items():
         if pkey in expected:
@@ -360,8 +390,39 @@ def validate(
         if others:
             raise InvalidPartitions(
                 f"Partition 0x{pkey:04x} isn't a network's, but has a network's "
-                f"port 0x{min(others):016x} as a member"
+                f"port 0x{min(others):016x} as a member",
+                pkeys={pkey},
+                guids=others,
             )
+
+
+def attribute(content, networks, ports):
+    """Return which networks and ports a partitions file's contents are for
+
+    networks maps the pkeys of networks' partitions to their networks' IDs,
+    the flat partition's to "flat", and ports maps GUIDs to their ports' IDs.
+    Only explicit memberships count, never keywords. Returns a dict, as JSON
+    stores it:
+      partitions  {pkey: network ID}, for the partitions in the file
+      members     {port ID: [[pkey, membership], ...]}
+      lines       {line number: [["network" or "port", ID], ...]}
+    """
+    result = {"partitions": {}, "members": {}, "lines": {}}
+    for pkey, members, line in _parse(content):
+        objects = result["lines"].setdefault(str(line), [])
+        network_id = networks.get(pkey)
+        if network_id is not None:
+            result["partitions"][str(pkey)] = network_id
+            if network_id != "flat" and ["network", network_id] not in objects:
+                objects.append(["network", network_id])
+        for member, membership in members.items():
+            port_id = ports.get(member) if isinstance(member, int) else None
+            if port_id is None:
+                continue
+            result["members"].setdefault(port_id, []).append([pkey, membership])
+            if ["port", port_id] not in objects:
+                objects.append(["port", port_id])
+    return result
 
 
 def write_atomically(path, content, mode=0o644):

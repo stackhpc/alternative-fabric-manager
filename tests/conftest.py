@@ -4,6 +4,7 @@ from fastapi import testclient
 from alternative_fabric_manager import api, db
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
+from alternative_fabric_manager.drivers import SweepReport
 
 TOKEN = "dGVzdDp0ZXN0"
 AUTH = {"Authorization": f"Basic {TOKEN}"}
@@ -25,6 +26,11 @@ class FakeReloader:
         self.starts = 0
         self.is_running = True
         self.stopped = False
+        # What reload() reports, and what fabric() returns: None for no
+        # fabric to check, a Fabric, or an exception to raise
+        self.report = None
+        self.fabric_result = None
+        self.fabric_calls = []
 
     def start(self):
         self.starts += 1
@@ -42,6 +48,13 @@ class FakeReloader:
             self.during()
         if self.error:
             raise self.error
+        return self.report or SweepReport()
+
+    def fabric(self, m_key=None, sa_key=None):
+        self.fabric_calls.append((m_key, sa_key))
+        if isinstance(self.fabric_result, Exception):
+            raise self.fabric_result
+        return self.fabric_result
 
 
 @pytest.fixture

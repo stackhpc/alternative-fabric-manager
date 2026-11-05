@@ -16,13 +16,46 @@ A driver has:
 - start(): start OpenSM, once its partitions file is written, and return
   once it is running;
 - running(): whether OpenSM is still running;
-- reload(): make OpenSM apply the partitions file, and return once it has;
+- reload(): make OpenSM apply the partitions file, and return a SweepReport
+  once it has; raise PartitionsRejected if it couldn't parse it;
+- fabric(): return a Fabric, or None if there is no fabric to check;
 - stop(): stop OpenSM, if the driver started it.
 """
 
 
 class ReloadError(Exception):
     """OpenSM didn't confirm that it applied the partitions file"""
+
+
+class PartitionsRejected(ReloadError):
+    """OpenSM couldn't parse a line of the partitions file"""
+
+    def __init__(self, message, line=None):
+        super().__init__(message)
+        self.line = line
+
+
+class SweepReport:
+    """What OpenSM reported, while applying a partitions file, about ports
+    whose pkey tables it couldn't set"""
+
+    def __init__(self, pkey_errors=(), enforcement_errors=()):
+        # GUIDs, as ints
+        self.pkey_errors = set(pkey_errors)
+        # Switch ports whose partition enforcement OpenSM cleared, as
+        # "<switch GUID>:<port>"
+        self.enforcement_errors = set(enforcement_errors)
+
+
+class Fabric:
+    """What a fabric check sees: switch GUIDs, and the subnet managers the SA
+    knows, as (port GUID, state) pairs, state 3 being master; and the GUID
+    of OpenSM's own port"""
+
+    def __init__(self, switches, sms, own_guid):
+        self.switches = set(switches)
+        self.sms = list(sms)
+        self.own_guid = own_guid
 
 
 class NoOpenSM:
@@ -35,7 +68,10 @@ class NoOpenSM:
         return True
 
     def reload(self):
-        pass
+        return SweepReport()
+
+    def fabric(self, m_key=None, sa_key=None):
+        return None
 
     def stop(self):
         pass

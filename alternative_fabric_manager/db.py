@@ -79,6 +79,14 @@ class Job(Base):
     )
     operation: orm.Mapped[str] = orm.mapped_column(sa.String(64))
     object_id: orm.Mapped[str] = orm.mapped_column(sa.String(36))
+    # The first generation of the state that includes the change
+    generation: orm.Mapped[int] = orm.mapped_column(default=0, index=True)
+    # What must hold in a swept partitions file for the job to complete, as
+    # JSON (see effects.py)
+    effect: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
+    deadline: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
     error: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
     created_at: orm.Mapped[datetime.datetime] = orm.mapped_column(
         sa.DateTime(timezone=True), default=_now
@@ -86,6 +94,48 @@ class Job(Base):
     finished_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
+
+
+class Quarantine(Base):
+    """A network or port left out of the partitions file, because it broke
+    a render or OpenSM's parse of it, until its next change"""
+
+    __tablename__ = "quarantine"
+
+    kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    reason: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+
+
+class Applied(Base):
+    """What OpenSM last swept: one row"""
+
+    __tablename__ = "applied"
+
+    id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
+    generation: orm.Mapped[int] = orm.mapped_column(default=0)
+    body: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+    # Which network each partition, and which port each membership, of the
+    # body comes from, as JSON (see partitions.attribute())
+    attribution: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
+    # GUIDs whose pkey tables OpenSM couldn't set in that sweep, and switch
+    # ports whose partition enforcement it cleared, as JSON lists
+    pkey_errors: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    enforcement_errors: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # The last fabric check
+    check_ok: orm.Mapped[bool] = orm.mapped_column(default=False)
+    check_time: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+
+
+class ExpectedSwitch(Base):
+    """A switch that a complete fabric has, as an operator confirmed"""
+
+    __tablename__ = "expected_switches"
+
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
 
 
 class Secret(Base):
@@ -104,6 +154,44 @@ class State(Base):
 
     name: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
     value: orm.Mapped[int] = orm.mapped_column(default=0)
+
+
+# Columns added to existing tables since the first release, until the
+# schema is managed by Alembic
+_ADDED_COLUMNS = {
+    "jobs": {
+        "generation": "INTEGER NOT NULL DEFAULT 0",
+        "effect": "TEXT NOT NULL DEFAULT '{}'",
+        "deadline": "DATETIME",
+    },
+}
+
+
+def _upgrade(engine):
+    """Add the columns an older database lacks
+
+    Jobs from before effects existed can't be judged, so the open ones fail,
+    and networking-mlnx sends their requests again.
+    """
+    inspector = sa.inspect(engine)
+    with engine.begin() as connection:
+        for table, columns in _ADDED_COLUMNS.items():
+            present = {c["name"] for c in inspector.get_columns(table)}
+            missing = [name for name in columns if name not in present]
+            for name in missing:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {columns[name]}"
+                )
+            if table == "jobs" and "effect" in missing:
+                connection.execute(
+                    sa.update(Job.__table__)
+                    .where(
+                        Job.__table__.c.status.in_(
+                            [JobStatus.PENDING, JobStatus.RUNNING]
+                        )
+                    )
+                    .values(status=JobStatus.FAILED, error="Superseded by an upgrade")
+                )
 
 
 def make_sessionmaker(database):
@@ -125,6 +213,7 @@ def make_sessionmaker(database):
         cursor.close()
 
     Base.metadata.create_all(engine)
+    _upgrade(engine)
     if database != ":memory:":
         # It holds the fabric's OpenSM keys.
         os.chmod(database, 0o600)

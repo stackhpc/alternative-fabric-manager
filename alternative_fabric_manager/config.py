@@ -102,8 +102,13 @@ class Config:
     sweep_timeout: float = 30.0
     # Seconds between checks that OpenSM is running (managed).
     check_interval: float = 5.0
-    # Times to try applying a change before its jobs fail.
+    # Times to try applying a change in a row, before the manager waits for
+    # the next check_interval.
     apply_attempts: int = 3
+    # Seconds after which a job that hasn't completed fails. networking-mlnx
+    # sets a port whose job failed to ERROR, so this must be longer than the
+    # longest the manager can take to apply a change.
+    job_timeout: float = 180.0
     # The rule for the default partition. All flat networks share it. Keep
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
@@ -203,7 +208,7 @@ class Config:
             raise ConfigError(
                 "[opensm] hardening is either all, none, or a list of groups"
             )
-        for name in ("start_timeout", "sweep_timeout", "check_interval"):
+        for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
         for name, low, high in (
@@ -261,6 +266,7 @@ OPTIONS = (
             "sweep_timeout",
             "check_interval",
             "apply_attempts",
+            "job_timeout",
             "default_partition",
             "flat_pkey",
             "shared_default_partition",
