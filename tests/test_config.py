@@ -49,12 +49,28 @@ def test_missing_file(tmp_path):
         config_mod.Config.load(str(tmp_path / "missing.conf"))
 
 
-def test_hardening_option(tmp_path):
-    assert _load(tmp_path, "[api]\ntoken = x\n").hardening is True
-    config = _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = false\n")
-    assert config.hardening is False
-    with pytest.raises(config_mod.ConfigError):
-        _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = maybe\n")
+@pytest.mark.parametrize(
+    "value, groups",
+    [
+        (None, set(config_mod.HARDENING_GROUPS)),
+        ("all", set(config_mod.HARDENING_GROUPS)),
+        ("true", set(config_mod.HARDENING_GROUPS)),
+        ("none", set()),
+        ("false", set()),
+        ("m_key", {"m_key"}),
+        ("m_key, Enforcement", {"m_key", "enforcement"}),
+    ],
+)
+def test_hardening_option(tmp_path, value, groups):
+    text = "[api]\ntoken = x\n"
+    if value is not None:
+        text += f"[opensm]\nhardening = {value}\n"
+    assert _load(tmp_path, text).hardening_groups == groups
+
+
+def test_unknown_hardening_group(tmp_path):
+    with pytest.raises(config_mod.ConfigError, match="mkey"):
+        _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = mkey\n")
 
 
 def test_managed_opensm_options_cant_be_overridden(tmp_path):

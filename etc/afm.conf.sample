@@ -44,11 +44,12 @@ host_config_dir = /etc/opensm
 # ipoib (rate, mtu, sl) and generation, and what it renders is checked: every
 # network's pkey must have exactly its ports as full members.
 partitions_template =
-# Write the hardened OpenSM options of docs/opensm-hardening.md into
-# opensm.conf: M_Key protection, secret SM and SA keys kept in the database,
-# the SA enhanced trust model, and more. Override any of them in
-# [opensm_conf].
-hardening = true
+# The groups of hardened OpenSM options, from docs/opensm-hardening.md, to
+# write into opensm.conf, separated by commas: m_key, sm_key, sa_key,
+# sa_trust, enforcement, babbling_ports; or all, or none. For example
+# "m_key, enforcement" for M_Key protection only. [opensm_conf] overrides any
+# single option.
+hardening = all
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5

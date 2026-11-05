@@ -27,6 +27,15 @@ DEFAULT_VOLUMES = (
     "opensm_cache:/var/cache/opensm"
 )
 DRIVERS = ("managed", "docker", "none")
+# The hardening groups of opensm_conf.HARDENING
+HARDENING_GROUPS = (
+    "m_key",
+    "sm_key",
+    "sa_key",
+    "sa_trust",
+    "enforcement",
+    "babbling_ports",
+)
 # opensm.conf keys that the manager sets, which overrides can't change
 MANAGED_OPENSM_KEYS = ("partition_config_file", "daemon")
 
@@ -93,12 +102,24 @@ class Config:
     ipoib_mtu: int = 4
     ipoib_sl: int = 0
 
-    # Write the hardened OpenSM options of docs/opensm-hardening.md into
-    # opensm.conf (managed). [opensm_conf] overrides any of them.
-    hardening: bool = True
+    # The groups of hardened OpenSM options of docs/opensm-hardening.md to
+    # write into opensm.conf (managed), separated by commas: m_key, sm_key,
+    # sa_key, sa_trust, enforcement, babbling_ports, or all or none.
+    # [opensm_conf] overrides any single option.
+    hardening: str = "all"
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)
+
+    @property
+    def hardening_groups(self):
+        """The hardening groups that [opensm] hardening names"""
+        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
+        if words & {"all", "true", "yes"}:
+            return set(HARDENING_GROUPS)
+        if words <= {"none", "false", "no"}:
+            return set()
+        return words
 
     @property
     def partitions_file(self):
@@ -128,10 +149,7 @@ class Config:
                 kind = type(getattr(config, name))
                 value = parser.get(section, name)
                 try:
-                    if kind is bool:
-                        setattr(config, name, parser.getboolean(section, name))
-                    else:
-                        setattr(config, name, kind(value))
+                    setattr(config, name, kind(value))
                 except ValueError:
                     raise ConfigError(
                         f"[{section}] {name} must be a {kind.__name__}, not {value!r}"
@@ -150,6 +168,16 @@ class Config:
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
+        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
+        unknown = (
+            words
+            - set(HARDENING_GROUPS)
+            - {"all", "none", "true", "false", "yes", "no"}
+        )
+        if unknown:
+            raise ConfigError(
+                f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
+            )
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(

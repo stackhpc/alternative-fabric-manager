@@ -222,10 +222,11 @@ class Manager:
     def _write_opensm_conf(self):
         if self.config.driver != "managed":
             return
+        groups = self.config.hardening_groups
         content = opensm_conf.render(
             self.config.opensm_conf,
-            hardening=self.config.hardening,
-            keys=self.keys() if self.config.hardening else None,
+            hardening=groups,
+            keys=self.keys() if groups & {"m_key", "sm_key", "sa_key"} else None,
         )
         partitions.write_atomically(self.config.opensm_conf_file, content)
         # The keys are secrets.

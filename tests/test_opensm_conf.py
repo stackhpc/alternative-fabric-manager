@@ -1,4 +1,7 @@
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import opensm_conf
+
+ALL = set(config_mod.HARDENING_GROUPS)
 
 
 def test_render():
@@ -17,7 +20,7 @@ def test_render_without_overrides():
 
 def test_hardening():
     keys = {"m_key": "0x1234", "sm_key": "0x5678", "sa_key": "0x9abc"}
-    lines = opensm_conf.render({}, hardening=True, keys=keys).splitlines()
+    lines = opensm_conf.render({}, hardening=ALL, keys=keys).splitlines()
     for line in (
         "m_key 0x1234",
         "sm_key 0x5678",
@@ -32,8 +35,8 @@ def test_hardening():
 def test_overrides_win_over_hardening():
     content = opensm_conf.render(
         {"m_key_protection_level": "1", "sa_key": "0x1"},
-        hardening=True,
-        keys={"m_key": "0x1234", "sa_key": "0x9abc"},
+        hardening=ALL,
+        keys={"m_key": "0x1234", "sm_key": "0x5678", "sa_key": "0x9abc"},
     )
     lines = content.splitlines()
     assert "m_key_protection_level 1" in lines
@@ -44,8 +47,19 @@ def test_overrides_win_over_hardening():
 
 
 def test_no_hardening():
-    content = opensm_conf.render({}, hardening=False, keys={"m_key": "0x1234"})
+    content = opensm_conf.render({}, hardening=set(), keys={"m_key": "0x1234"})
     assert "m_key" not in content
+    assert "Hardening" not in content
+
+
+def test_one_hardening_group():
+    # An operator enables only M_Key protection with one option.
+    lines = opensm_conf.render(
+        {}, hardening={"m_key"}, keys={"m_key": "0x1234", "sm_key": "0x5678"}
+    ).splitlines()
+    assert "m_key 0x1234" in lines
+    assert "m_key_protection_level 2" in lines
+    assert not any(line.startswith(("sm_key", "sa_", "part_enforce")) for line in lines)
 
 
 def test_new_key():

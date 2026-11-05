@@ -7,30 +7,43 @@ administration (SA) request, or run a subnet manager of its own. A guest on
 a virtual function has less control, but can still make SA requests.
 
 So with the managed driver, the manager writes a hardened set of options into
-`opensm.conf` unless `[opensm] hardening = false`. Any of them can be
-overridden in `[opensm_conf]`, for example `m_key_protection_level = 1`.
+`opensm.conf`, in groups. `[opensm] hardening` names the groups, separated by
+commas, `all` by default, or `none`: one option chooses what to harden, for
+example `hardening = m_key, enforcement` on a fabric where only M_Key
+protection is wanted. A single OpenSM option can still be overridden in
+`[opensm_conf]`, for example `m_key_lease_period = 120`, and wins over the
+groups.
 
-| Option | OpenSM default | Hardened | Stops |
-| --- | --- | --- | --- |
-| `m_key` | `0` | Random, shared | A host reading or changing port settings with SMPs |
-| `m_key_protection_level` | `0` | `2` | As above |
-| `m_key_lease_period` | `0` | `60` | A fabric staying locked after its M_Key is lost |
-| `sm_key` | `0x1` | Random, shared | A rogue subnet manager taking over by handover |
-| `sa_key` | `0x1` | Random, shared | Any client being trusted by the SA with the well-known key |
-| `sa_enhanced_trust_model` | `FALSE` | `TRUE` | Untrusted clients using SA requests beyond the minimal set |
-| `sa_etm_allow_untrusted_proxy_requests` | `TRUE` | `FALSE` | A client acting for another port |
-| `sa_etm_allow_untrusted_guidinfo_rec` | `TRUE` | `FALSE` | A client adding alias GUIDs to its port |
-| `sa_etm_allow_guidinfo_rec_by_vf` | `TRUE` | `FALSE` | A virtual function adding alias GUIDs |
-| `sa_etm_max_num_mcgs` | `0` (no limit) | `128` | One port exhausting the SA's multicast groups |
-| `sa_etm_max_num_srvcs` | `0` (no limit) | `32` | One port exhausting the SA's service records |
-| `sa_etm_max_num_event_subs` | `0` (no limit) | `32` | One port exhausting the SA's event subscriptions |
-| `sa_check_sgid_spoofing` | `TRUE` | `TRUE` | A client claiming another port's GID in an SA request |
-| `part_enforce` | `both` | `both` | Packets crossing partitions at a switch port |
-| `allow_both_pkeys` | `FALSE` | `FALSE` | A port being both a full and a limited member of a partition |
-| `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
+| Group | Option | OpenSM default | Hardened | Stops |
+| --- | --- | --- | --- | --- |
+| `m_key` | `m_key` | `0` | Random, shared | A host reading or changing port settings with SMPs |
+| `m_key` | `m_key_protection_level` | `0` | `2` | As above |
+| `m_key` | `m_key_lease_period` | `0` | `60` | A fabric staying locked after its M_Key is lost |
+| `sm_key` | `sm_key` | `0x1` | Random, shared | A rogue subnet manager taking over by handover |
+| `sa_key` | `sa_key` | `0x1` | Random, shared | Any client being trusted by the SA with the well-known key |
+| `sa_trust` | `sa_enhanced_trust_model` | `FALSE` | `TRUE` | Untrusted clients using SA requests beyond the minimal set |
+| `sa_trust` | `sa_etm_allow_untrusted_proxy_requests` | `TRUE` | `FALSE` | A client acting for another port |
+| `sa_trust` | `sa_etm_allow_untrusted_guidinfo_rec` | `TRUE` | `FALSE` | A client adding alias GUIDs to its port |
+| `sa_trust` | `sa_etm_allow_guidinfo_rec_by_vf` | `TRUE` | `FALSE` | A virtual function adding alias GUIDs |
+| `sa_trust` | `sa_etm_max_num_mcgs` | `0` (no limit) | `128` | One port exhausting the SA's multicast groups |
+| `sa_trust` | `sa_etm_max_num_srvcs` | `0` (no limit) | `32` | One port exhausting the SA's service records |
+| `sa_trust` | `sa_etm_max_num_event_subs` | `0` (no limit) | `32` | One port exhausting the SA's event subscriptions |
+| `enforcement` | `part_enforce` | `both` | `both` | Packets crossing partitions at a switch port |
+| `enforcement` | `allow_both_pkeys` | `FALSE` | `FALSE` | A port being both a full and a limited member of a partition |
+| `enforcement` | `sa_check_sgid_spoofing` | `TRUE` | `TRUE` | A client claiming another port's GID in an SA request |
+| `babbling_ports` | `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
 
-The last few are OpenSM's defaults already. They are written anyway, so that
-`opensm.conf` shows them and an override can't weaken them by accident.
+The `enforcement` group is OpenSM's defaults already. It is written anyway,
+so that `opensm.conf` shows the options and nothing weakens them by
+accident.
+
+## Choosing what to harden
+
+| Fabric | `hardening` |
+| --- | --- |
+| Only OpenStack's hosts, guests and bare metal nodes (the default) | `all` |
+| Shared with hosts outside OpenStack that run SA diagnostics or ConnectX-3 SR-IOV | `m_key, sm_key, enforcement`, see the costs below |
+| Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it a bare metal tenant can reconfigure switch ports |
 
 ## The keys
 
@@ -39,7 +52,8 @@ random 64-bit values, and keeps them in its database. Every OpenSM of the
 fabric must use the same keys: in high availability, a standby that took
 over with another M_Key couldn't configure the ports. Keeping them in the
 database gives every manager the same keys, and keeps them across restarts.
-A key set in `[opensm_conf]` wins over the generated one.
+Only the keys of the chosen groups are written. A key set in
+`[opensm_conf]` wins over the generated one.
 
 `opensm.conf` holds the keys, so the manager writes it readable only by
 root. To print them:

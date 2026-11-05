@@ -96,6 +96,8 @@ database, the SA enhanced trust model, and a default partition in which every
 port is only a limited member. [docs/opensm-hardening.md](docs/opensm-hardening.md)
 explains each option, why, and what it costs, such as diagnostic tools
 needing the M_Key (`alternative-fabric-manager --show-keys`).
+`[opensm] hardening` chooses the groups of options in one line, for example
+`hardening = m_key, enforcement` for M_Key protection only.
 
 ### The partitions template
 
