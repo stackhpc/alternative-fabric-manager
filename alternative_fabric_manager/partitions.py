@@ -118,25 +118,31 @@ def guid_from_port(port):
 #   flat               the flat networks' partition, with the same keys:
 #                      pkey and pkey_hex are [opensm] flat_pkey, and guids
 #                      those of every flat network's ports
-#   ipoib              rate, mtu and sl, from [opensm] ipoib_*
+#   ipoib              rate, mtu and sl, from [opensm] ipoib_*, and flags,
+#                      those as partition flags: "ipoib, rate=3, mtu=4, sl=0"
 #   generation         the state's generation
 # Whatever it renders is checked by validate() before it is written.
 #
 # indx0 puts a network's pkey at index 0 of its ports' pkey tables. A guest's
 # IPoIB interface uses the pkey at index 0, so without it the interface is in
-# the default partition, not the network's. Members go one to a line, since
-# OpenSM reads the file a line at a time.
+# the default partition, not the network's. OpenSM reads a partition's
+# definition and members from one line, into a fixed buffer, so a partition
+# with many members is written as several definitions of the same name and
+# pkey, which OpenSM merges, of at most 20 members each.
 DEFAULT_TEMPLATE = """\
 {{ default_partition }}
 {% for network in networks + ([flat] if flat.guids else []) -%}
 {% if network.pkey == 0x7fff -%}
-Default=0x7fff :
+{% set head = "Default=0x7fff" -%}
+{% set flags = "" -%}
 {% else -%}
-{{ network.name }}={{ network.pkey_hex }}, indx0, ipoib, rate={{ ipoib.rate }}, \
-mtu={{ ipoib.mtu }}, sl={{ ipoib.sl }} :
+{% set head = network.name ~ "=" ~ network.pkey_hex -%}
+{% set flags = ", indx0, " ~ ipoib.flags -%}
 {% endif -%}
-{% for guid in network.guids %}    {{ guid }}=full{{ "," if not loop.last else "" }}
-{% endfor %}    ;
+{% for chunk in (network.guids | batch(20) | list) or [[]] -%}
+{{ head }}{{ flags if loop.first else "" }} : \
+{% for guid in chunk %}{{ guid }}=full{{ ", " if not loop.last else "" }}{% endfor %} ;
+{% endfor -%}
 {% endfor %}"""
 
 # OpenSM reads the partitions file a line at a time, into a fixed buffer.
@@ -180,6 +186,10 @@ def render(config, networks, generation, template):
             "rate": config.ipoib_rate,
             "mtu": config.ipoib_mtu,
             "sl": config.ipoib_sl,
+            "flags": (
+                f"ipoib, rate={config.ipoib_rate}, mtu={config.ipoib_mtu}, "
+                f"sl={config.ipoib_sl}"
+            ),
         },
         "generation": generation,
         "flat": _partition("flat", config.flat_pkey, flat),
@@ -219,8 +229,8 @@ def _parse(content):
     for number, line in enumerate(content.splitlines(), 1):
         if len(line) > MAX_LINE:
             raise InvalidPartitions(
-                f"Line {number} is longer than {MAX_LINE} characters; put "
-                "members on lines of their own"
+                f"Line {number} is longer than {MAX_LINE} characters; split the "
+                "partition into several definitions with the same name and pkey"
             )
     text = "\n".join(line.split("#", 1)[0] for line in content.splitlines())
     statements = []

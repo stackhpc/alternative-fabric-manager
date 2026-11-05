@@ -14,8 +14,9 @@
 
 When OpenSM gets SIGHUP and only its partitions file has changed, it runs a
 pkey sweep, which updates the pkey tables of the fabric's ports, and logs
-"PKEY SWEEP COMPLETE". If another of its files has changed, it runs a heavy
-sweep instead, which ends with "SUBNET UP" or "HEAVY SWEEP COMPLETE".
+"PKEY SWEEP COMPLETE". Otherwise, for example when the file hasn't changed,
+it runs a heavy sweep, which reads the partitions file after it logs "HEAVY
+SWEEP COMPLETE", and ends with "SUBNET UP".
 """
 
 import contextlib
@@ -34,7 +35,9 @@ LOG = logging.getLogger(__name__)
 # then starts a pkey sweep, or a heavy one if another of its files changed.
 HUP_MARKER = "handle_hup_signal"
 SWEEP_START_MARKERS = ("INITIATING PKEY SWEEP", "INITIATING HEAVY SWEEP")
-DONE_MARKERS = ("PKEY SWEEP COMPLETE", "HEAVY SWEEP COMPLETE", "SUBNET UP")
+# A heavy sweep logs "HEAVY SWEEP COMPLETE" before it reads the partitions
+# file, so only "SUBNET UP" marks its end.
+DONE_MARKERS = ("PKEY SWEEP COMPLETE", "SUBNET UP")
 # OpenSM logs one of these once it has started, as master or standby.
 STARTED_MARKERS = ("SUBNET UP", "Entering STANDBY state")
 POLL_INTERVAL = 0.5

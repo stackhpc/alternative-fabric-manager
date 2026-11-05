@@ -204,3 +204,32 @@ def test_failed_start_removes_the_container(managed_config):
     with pytest.raises(ReloadError, match="couldn't read"):
         docker_driver.ManagedDocker(managed_config, client=client).start()
     assert client.existing.removed
+
+
+# What OpenSM 5.17 logged when SIGHUP found an unchanged file: a heavy sweep,
+# which reads the partitions file after "HEAVY SWEEP COMPLETE"
+HEAVY = """\
+Nov 05 18:10:00 237426 [5A1FE640] 0x04 -> handle_hup_signal: No configuration \
+changes, heavy sweep suggestion: TRUE
+********************* INITIATING HEAVY SWEEP *********************
+********************** HEAVY SWEEP COMPLETE **********************
+Nov 05 18:10:00 240189 [5A1FE640] 0x01 -> parse_part_conf: PARSE ERROR: line 5: \
+no partition definition found
+PARSE ERROR: line 5: no partition definition found
+Nov 05 18:10:00 242710 [5A1FE640] 0x02 -> SUBNET UP
+*************************** SUBNET UP ****************************"""
+
+
+def test_heavy_sweep_parse_error_fails():
+    with pytest.raises(ReloadError, match="couldn't read"):
+        _reloader(FakeContainer(after=HEAVY)).reload()
+
+
+def test_heavy_sweep_ends_with_subnet_up():
+    # Not with HEAVY SWEEP COMPLETE, which comes before the partitions file
+    # is read
+    partial = HEAVY.split("Nov 05 18:10:00 240189")[0]
+    with pytest.raises(ReloadError, match="didn't finish"):
+        _reloader(FakeContainer(after=partial), timeout=0.05).reload()
+    clean = "\n".join(line for line in HEAVY.splitlines() if "PARSE" not in line)
+    _reloader(FakeContainer(after=clean)).reload()

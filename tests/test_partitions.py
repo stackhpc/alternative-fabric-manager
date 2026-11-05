@@ -21,21 +21,24 @@ def _render(config, networks, template=None, generation=7):
 
 def test_default_template(config):
     content = _render(config, [(_network(), [GUID, GUID])])
-    lines = content.splitlines()
-    assert lines[1:] == [
+    assert content.splitlines()[1:] == [
         "# Generation 7",
         config.default_partition,
-        "net-net1=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 :",
-        f"    0x{GUID:016x}=full",
-        "    ;",
+        f"net-net1=0x0064, indx0, ipoib, rate=3, mtu=4, sl=0 : 0x{GUID:016x}=full ;",
     ]
     partitions.validate(content, {0x64: {GUID}})
 
 
-def test_default_template_puts_members_on_lines_of_their_own(config):
+def test_default_template_splits_large_partitions(config):
+    # OpenSM reads a definition and its members from one line, into a fixed
+    # buffer, and merges definitions of the same name and pkey.
     guids = range(1, 1001)
     content = _render(config, [(_network(), guids)])
-    assert max(len(line) for line in content.splitlines()) < 80
+    lines = [line for line in content.splitlines() if line.startswith("net-net1")]
+    assert len(lines) == 50
+    assert lines[0].startswith("net-net1=0x0064, indx0, ipoib")
+    assert lines[1].startswith("net-net1=0x0064 : ")
+    assert max(len(line) for line in content.splitlines()) < partitions.MAX_LINE
     partitions.validate(content, {0x64: set(guids)})
 
 
