@@ -380,8 +380,8 @@ generation G is **Completed** when, in `applied`:
 
 Recording a sweep clears the last check, so that a sweep is judged only by
 a check taken after it. OpenSM's first sweep after it starts, a
-takeover's included, counts as a sweep, unless the last check, in this
-term or the previous one, was contested: then the leader waits for a
+takeover's included, counts as a sweep, unless the last recorded check,
+whatever its term, was contested: then the leader waits for a
 passing check and sweeps again with SIGHUP. A check that sees another master, or the leader's
 OpenSM not master, invalidates the sweep, since the other SM may have set
 pkey tables meanwhile, and could undo a sweep made while it acts: the
@@ -626,14 +626,18 @@ moved, until the cluster is unfrozen.
   on the minority side of a partition, so it can't decide to keep its
   OpenSM by itself, and a leader that self-stops never acknowledges.
 - **The leader holds** only once it has read back, on a Primary component,
-  that its acknowledgement committed; an acknowledgement whose outcome is
+  that its acknowledgement committed. A leader that self-stopped meanwhile
+  and then finds its acknowledgement committed holds as the frozen node,
+  and starts OpenSM again, rather than release the lease, since a frozen
+  leader never releases; an acknowledgement whose outcome is
   unknown doesn't count until then, and the leader keeps timing self-stop
   meanwhile, since the request may have passed its deadline. The frozen
   leader then stops timing self-stop, ignores every step-down trigger but SIGTERM, never
   releases the lease, and gives its watchdog a held lease, whose deadline
   is the freeze's expiry, if it has one, on the host's monotonic clock,
   plus `T_self`. OpenSM so survives a Galera outage or a hung manager. The
-  leader keeps applying and checking while Galera is up, and raises an
+  leader keeps renewing, so that its `t0` is fresh at the unfreeze, and
+  applying and checking, while Galera is up, and raises an
   alarm while frozen.
 - **Requests wait.** Every instance reads the freeze within a poll
   interval, and then answers new requests with 503, which networking-mlnx
@@ -647,7 +651,10 @@ moved, until the cluster is unfrozen.
   A restarted manager has a new instance UUID: it adopts the frozen lease
   with a compare-and-set that matches the frozen node and term, replaces
   the instance UUID, replaces the old instance's target-set entry with
-  its own, and only then starts OpenSM, with a start request for the frozen term that carries the
+  its own, and clears its node's verified-stop mark, as a takeover does,
+  so that a stop it verified before adopting can't later let a candidate
+  take over, or its entry leave the set, while its OpenSM runs; and only
+  then starts OpenSM, with a start request for the frozen term that carries the
   held deadline rather than `t0` + `T_self`. Rejoining's removal of the
   watchdog's files doesn't apply to the frozen node while it is frozen.
   With Galera down, it may restart OpenSM from the watchdog's held lease

@@ -12,7 +12,6 @@
 
 """The fabric's desired state, and the jobs that apply it"""
 
-import contextlib
 import datetime
 import enum
 import os
@@ -29,6 +28,8 @@ Timestamp = sa.DateTime(timezone=True).with_variant(
 # Each database call's timeout, in seconds: a call blocked on an
 # unreachable database must not hold up its loop (see specs/ha.md)
 CALL_TIMEOUT = 3
+# MariaDB's error for a variable the server doesn't have
+UNKNOWN_SYSTEM_VARIABLE = 1193
 
 
 class Base(orm.DeclarativeBase):
@@ -143,6 +144,10 @@ class Applied(Base):
 
     id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
     generation: orm.Mapped[int] = orm.mapped_column(default=0)
+    # The leader's term when it swept, and whether a check since saw another
+    # master, so that every instance can judge jobs (see specs/ha.md)
+    term: orm.Mapped[int] = orm.mapped_column(default=0)
+    contested: orm.Mapped[bool] = orm.mapped_column(default=False)
     body: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
     # Which network each partition, and which port each membership, of the
     # body comes from, as JSON (see partitions.attribute())
@@ -167,6 +172,72 @@ class ExpectedSwitch(Base):
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
 
 
+class Lease(Base):
+    """Which instance leads, and runs OpenSM: one row (see specs/ha.md)"""
+
+    __tablename__ = "lease"
+
+    id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
+    holder_node: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    holder_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    # Only goes up; every leader's write to the database is a compare-and-set
+    # on it
+    term: orm.Mapped[int] = orm.mapped_column(default=0)
+    # The holder bumps it to renew; others watch it for expiry.
+    counter: orm.Mapped[int] = orm.mapped_column(sa.BigInteger, default=0)
+    released: orm.Mapped[bool] = orm.mapped_column(default=True)
+    moved_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # The freeze: "", "requested", "frozen" or "ending"
+    freeze_state: orm.Mapped[str] = orm.mapped_column(sa.String(16), default="")
+    freeze_term: orm.Mapped[int] = orm.mapped_column(default=0)
+    freeze_by: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    freeze_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # A request's deadline for the leader's acknowledgement
+    freeze_request_deadline: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    freeze_expires: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # An operator's confirmation that the holder's OpenSM can't act, for a
+    # manual takeover, or one while a freeze is ending: the term it's for
+    confirmed_term: orm.Mapped[int] = orm.mapped_column(default=0)
+
+
+class TargetEntry(Base):
+    """An instance that may have run OpenSM since the last verified stop"""
+
+    __tablename__ = "target_entries"
+
+    node: orm.Mapped[str] = orm.mapped_column(sa.String(255), primary_key=True)
+    instance_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), primary_key=True)
+    term: orm.Mapped[int] = orm.mapped_column()
+
+
+class Node(Base):
+    """A manager instance's node, as it registers and heartbeats"""
+
+    __tablename__ = "nodes"
+
+    name: orm.Mapped[str] = orm.mapped_column(sa.String(255), primary_key=True)
+    instance_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    heartbeat: orm.Mapped[int] = orm.mapped_column(sa.BigInteger, default=0)
+    config_hash: orm.Mapped[str] = orm.mapped_column(sa.String(64), default="")
+    # Expected switches it reaches from its own port
+    reach: orm.Mapped[int] = orm.mapped_column(default=0)
+    # Its adapters' node GUIDs, as a JSON list of hex strings
+    adapters: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # Its OpenSM verified stopped: by which instance, at which lease term
+    verified_stop_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    verified_stop_term: orm.Mapped[int] = orm.mapped_column(default=-1)
+    # Stopped cleanly, so not a live candidate
+    stopped: orm.Mapped[bool] = orm.mapped_column(default=False)
+
+
 class Secret(Base):
     """Keys that every OpenSM of the fabric must share, kept across restarts"""
 
@@ -188,6 +259,10 @@ class State(Base):
 # Columns added to existing tables since the first release, until the
 # schema is managed by Alembic
 _ADDED_COLUMNS = {
+    "applied": {
+        "term": "INTEGER NOT NULL DEFAULT 0",
+        "contested": "BOOLEAN NOT NULL DEFAULT 0",
+    },
     "jobs": {
         "generation": "INTEGER NOT NULL DEFAULT 0",
         "effect": "TEXT NOT NULL DEFAULT '{}'",
@@ -289,10 +364,14 @@ def _make_server_engine(url):
     def _session_settings(dbapi_connection, _record):
         cursor = dbapi_connection.cursor()
         cursor.execute("SET SESSION time_zone = '+00:00'")
-        # Read what other Galera nodes have committed (see specs/ha.md); a
-        # server without wsrep has no such variable.
-        with contextlib.suppress(Exception):
+        # Read what other Galera nodes have committed (see specs/ha.md). A
+        # server without wsrep has no such variable, but any other failure
+        # must not be hidden.
+        try:
             cursor.execute("SET SESSION wsrep_sync_wait = 1")
+        except Exception as e:
+            if UNKNOWN_SYSTEM_VARIABLE not in getattr(e, "args", ())[:1]:
+                raise
         cursor.close()
 
     return engine

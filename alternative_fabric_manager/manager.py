@@ -74,6 +74,30 @@ def _body(content):
     )
 
 
+def _increment(session, name):
+    """Increment a counter in place, which locks its row until the
+    transaction ends, so that concurrent instances never lose an increment,
+    as a read and a write would under Galera; return its new value"""
+    for _attempt in range(2):
+        result = session.execute(
+            sa.update(db.State)
+            .where(db.State.name == name)
+            .values(value=db.State.value + 1)
+        )
+        if result.rowcount == 1:
+            return session.scalar(
+                sa.select(db.State.value).where(db.State.name == name)
+            )
+        try:
+            with session.begin_nested():
+                session.add(db.State(name=name, value=1))
+            return 1
+        except sa.exc.IntegrityError:
+            # Another instance created it first; increment it.
+            continue
+    raise RuntimeError(f"Can't increment {name}")
+
+
 class Manager:
     def __init__(self, config, sessionmaker, driver, template=None):
         self.config = config
@@ -106,13 +130,7 @@ class Manager:
     @staticmethod
     def _bump(session):
         """Bump the generation, first in a request's transaction"""
-        state = session.get(db.State, GENERATION)
-        if state is None:
-            state = db.State(name=GENERATION, value=0)
-            session.add(state)
-        state.value += 1
-        session.flush()
-        return state.value
+        return _increment(session, GENERATION)
 
     @staticmethod
     def _release(session, kind, object_id):
@@ -733,12 +751,7 @@ class Manager:
         apply, and runs a pkey sweep. It goes last, so that OpenSM's line
         numbers are those of the attribution."""
         with self._lock, self.sessionmaker() as session:
-            state = session.get(db.State, APPLIES)
-            if state is None:
-                state = db.State(name=APPLIES, value=0)
-                session.add(state)
-            state.value += 1
-            count = state.value
+            count = _increment(session, APPLIES)
             session.commit()
         return content + f"{APPLY_PREFIX}{count}\n"
 
