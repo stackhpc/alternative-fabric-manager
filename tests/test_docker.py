@@ -343,3 +343,32 @@ def test_fabric_parses_the_tools_output():
     assert fabric.own_guids == {0x040973FFFFC75168}
     assert ["ibswitches", "-y", "0x11"] in container.commands
     assert ["saquery", "--smkey", "0x22", "SMIR"] in container.commands
+
+
+MAD_PKEY_FAILURES = (
+    "sm_mad_ctrl_send_err_cb: ERR 3113: MAD completed in error (IB_TIMEOUT): "
+    "SubnSet(PKeyTable), attr_mod 0x0, TID 0x1234, dest_guid 0x0002c90300001234",
+    "sm_mad_ctrl_rcv_callback: ERR 3119: Set method failed for attribute 0x16 "
+    "(PKeyTable)",
+)
+
+
+def test_mad_failures_setting_pkey_tables_fail_closed():
+    for line in MAD_PKEY_FAILURES:
+        report = SweepReport()
+        docker_driver._note_pkey_error(report, line)
+        assert report.unattributed, line
+    # Other attributes' failures aren't pkey errors.
+    report = SweepReport()
+    docker_driver._note_pkey_error(
+        report,
+        "x: ERR 3113: MAD completed in error (IB_TIMEOUT): SubnGet(NodeInfo), "
+        "attr_mod 0x0, TID 0x1, dest_guid 0x1",
+    )
+    assert not report.unattributed
+
+
+def test_managed_start_reports_its_first_sweep(managed_config):
+    client = FakeManagedClient(log=MAD_PKEY_FAILURES[1] + "\n" + STARTED)
+    report = docker_driver.ManagedDocker(managed_config, client=client).start()
+    assert report is not None and report.unattributed

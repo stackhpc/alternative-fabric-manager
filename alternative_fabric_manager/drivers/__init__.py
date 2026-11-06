@@ -14,7 +14,8 @@
 
 A driver has:
 - start(): start OpenSM, once its partitions file is written, and return
-  once it is running;
+  once it is running: a SweepReport if it saw OpenSM's first sweep, which
+  read that file, or None if it can't tell;
 - running(): whether OpenSM is still running;
 - reload(): make OpenSM apply the partitions file, and return a SweepReport
   once it has; raise PartitionsRejected if it couldn't parse it;
@@ -68,7 +69,7 @@ class NoOpenSM:
     """Only write the files, for tests and for reloading by other means"""
 
     def start(self):
-        pass
+        return None
 
     def running(self):
         return True

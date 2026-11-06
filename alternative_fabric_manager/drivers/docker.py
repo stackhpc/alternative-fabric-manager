@@ -92,12 +92,23 @@ def _rejected(line):
     )
 
 
+# The MAD layer's errors, which a PKeyTable set or get can fail with: they
+# name no port GUID, so they hold every job of the sweep
+MAD_ERROR_CODES = ("3113", "3119", "3120")
+_PKEY_TABLE_ATTR = re.compile(r"PKeyTable|attribute 0x16\b")
+
+
 def _note_pkey_error(report, line):
     """Record a pkey or enforcement error that OpenSM logged"""
     match = _ERR.search(line)
     if not match:
         return
     code = match.group(1)
+    if code in MAD_ERROR_CODES:
+        if _PKEY_TABLE_ATTR.search(line):
+            report.unattributed = True
+            LOG.warning("OpenSM couldn't set a pkey table: %s", line.strip())
+        return
     # What can't be traced fails closed: it holds every job of the sweep.
     if code in ENFORCEMENT_ERROR_CODES:
         ports = _SWITCH_PORT.findall(line)
@@ -129,7 +140,8 @@ class DockerReloader:
         return self._client
 
     def start(self):
-        pass
+        # Something else starts OpenSM, so there is no sweep to report.
+        return None
 
     def running(self):
         # Whatever starts OpenSM restarts it too.
@@ -286,7 +298,7 @@ class ManagedDocker(DockerReloader):
             self._remove()
             container = self.client.containers.run(**self._run_kwargs())
             LOG.info("Started OpenSM container %s", self.container_name)
-            self._wait_for_start(container)
+            return self._wait_for_start(container)
         except (docker.errors.DockerException, ReloadError) as e:
             # An OpenSM that didn't start properly, for example one that
             # rejected part of its partitions file, mustn't keep running.
@@ -296,10 +308,14 @@ class ManagedDocker(DockerReloader):
             raise ReloadError(f"Docker: {e}") from e
 
     def _wait_for_start(self, container):
+        """Wait for OpenSM's first sweep as master, which reads the
+        partitions file, and report its pkey errors"""
         deadline = time.monotonic() + self.config.start_timeout
         while time.monotonic() < deadline:
             lines = self._log(container)
+            report = SweepReport()
             for line in lines:
+                _note_pkey_error(report, line)
                 if "PARSE ERROR" in line:
                     raise _rejected(line)
                 if _is_partitions_error(line):
@@ -312,7 +328,7 @@ class ManagedDocker(DockerReloader):
                     )
                 if any(m in line for m in STARTED_MARKERS):
                     LOG.info("OpenSM: %s", line.strip(" *"))
-                    return
+                    return report
             container.reload()
             if container.status not in ("created", "running"):
                 raise ReloadError(

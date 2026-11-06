@@ -674,3 +674,41 @@ def test_a_waiting_request_isnt_failed_by_a_render_it_wasnt_in(manager, fabric):
     fabric.reload = reload
     manager.reconcile()
     assert _status(manager, waiting) == db.JobStatus.PENDING
+
+
+def test_a_sweep_needs_a_fabric_check_after_it(manager, fabric):
+    manager.check_fabric()
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    manager.sync()
+    # The last check is from before the sweep.
+    assert _status(manager, job) == db.JobStatus.PENDING
+    manager.check_fabric()
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_another_master_invalidates_the_last_sweep(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.sync()
+    # Another SM masters for a while, after the sweep.
+    fabric.fabric_result = _fabric(sms=((OWN, 2), (0x1234, 3)))
+    manager.check_fabric()
+    fabric.fabric_result = _fabric()
+    manager.check_fabric()
+    manager.evaluate_jobs()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    calls = fabric.calls
+    manager.reconcile()
+    assert fabric.calls == calls + 1
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_a_start_that_swept_is_recorded(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    fabric.start = lambda: SweepReport()
+    manager._start_opensm()
+    manager.check_fabric()
+    manager.evaluate_jobs()
+    assert _status(manager, job) == db.JobStatus.COMPLETED

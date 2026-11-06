@@ -554,9 +554,8 @@ class Manager:
         than not at all, and the next sync deals with the state.
         """
         self._write_opensm_conf()
-        # What OpenSM starts with is never recorded as swept: its start
-        # reports no pkey errors, and a driver may not start OpenSM at all.
-        # The next sync sweeps and records it.
+        # What OpenSM starts with is recorded as swept only if the driver saw
+        # OpenSM's first sweep read it; a driver may not start OpenSM at all.
         self._written = None
         while True:
             try:
@@ -571,12 +570,10 @@ class Manager:
                 )
                 self.driver.start()
                 return
-            partitions.write_atomically(
-                self.config.partitions_file, self._stamp(content)
-            )
+            stamped = self._stamp(content)
+            partitions.write_atomically(self.config.partitions_file, stamped)
             try:
-                self.driver.start()
-                return
+                report = self.driver.start()
             except PartitionsRejected as e:
                 if self._quarantine_line(e, attribution, generation):
                     continue
@@ -590,6 +587,11 @@ class Manager:
                 )
                 self.driver.start()
                 return
+            # A start that the driver saw sweep is a sweep, with its pkey
+            # errors; otherwise the next sync sweeps and records it.
+            if report is not None:
+                self._record(stamped, generation, attribution, report)
+            return
 
     def _check_opensm(self):
         """Start OpenSM again if it has stopped, with the current state"""
@@ -751,6 +753,9 @@ class Manager:
             applied.generation = generation
             applied.body = content
             applied.attribution = json.dumps(attribution, sort_keys=True)
+            # A sweep is judged only by a fabric check taken after it.
+            applied.check_ok = False
+            applied.check_detail = "Not checked since the last sweep"
             pkey_errors = report.pkey_errors if report else set()
             recorded = sorted(f"{g:016x}" for g in pkey_errors)
             if report and report.unattributed:
@@ -953,10 +958,15 @@ class Manager:
             restored = self._stamp(_body(body))
             partitions.write_atomically(self.config.partitions_file, restored)
             self._written = None
-            self.driver.reload()
-            self._written = restored
+            report = self.driver.reload()
         except (OSError, ReloadError) as e:
             LOG.error("Failed to restore the last partitions: %s", e)
+            return
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            generation = applied.generation
+            attribution = json.loads(applied.attribution or "{}")
+        self._record(restored, generation, attribution, report)
 
     # The fabric
 
@@ -969,6 +979,14 @@ class Manager:
             ok, detail = False, f"Can't query the fabric: {e}"
         else:
             ok, detail = self._judge(fabric)
+            if fabric is not None and self._contested(fabric):
+                # Another master may have set pkey tables since the last
+                # sweep, so it is no evidence: sweep again, once the check
+                # passes, before any job completes.
+                LOG.error(
+                    "Another subnet manager acted; the last sweep no longer counts"
+                )
+                self._written = None
         if not ok:
             LOG.error("Fabric check failed: %s", detail)
         with self._lock, self.sessionmaker() as session:
@@ -977,6 +995,13 @@ class Manager:
             applied.check_time = _now()
             session.commit()
         return ok
+
+    @staticmethod
+    def _contested(fabric):
+        """Whether another SM is master, or OpenSM's own isn't"""
+        own = [state for guid, state in fabric.sms if guid in fabric.own_guids]
+        others = [state for guid, state in fabric.sms if guid not in fabric.own_guids]
+        return 3 not in own or 3 in others
 
     def _judge(self, fabric):
         if fabric is None:
