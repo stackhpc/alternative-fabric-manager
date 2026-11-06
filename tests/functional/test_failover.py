@@ -465,3 +465,12 @@ def test_an_unfreeze_the_leader_never_acknowledges_needs_an_operator(cluster):
     successor = cluster.wait_leader(other_than=leader)
     cluster.signal(leader, signal.SIGCONT)
     apply_change(cluster, successor, 9)
+
+
+def test_a_candidate_whose_link_is_down_doesnt_take_over(cluster):
+    leader = cluster.wait_leader()
+    down, up = (i for i in NODES if i != leader)
+    with open(os.path.join(cluster.fabric, f"linkdown-node-{down}"), "w") as f:
+        f.write("down")
+    cluster.signal(leader, signal.SIGKILL)
+    assert cluster.wait_leader(other_than=leader) == up

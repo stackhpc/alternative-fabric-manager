@@ -356,6 +356,15 @@ def _ha_problems(config):
         problems.append("watchdog_timeout must exceed ha_period + call_timeout")
     if config.driver == "none":
         problems.append("[opensm] driver must start OpenSM")
+    # Without them, a tenant's SM could set ports or win a handover, and Ask
+    # has no key (see Fencing, Required keys).
+    missing = {"m_key", "sm_key"} - config.hardening_groups
+    if missing:
+        problems.append(
+            "[opensm] hardening must include " + " and ".join(sorted(missing))
+        )
+    if str(config.opensm_conf.get("m_key_protection_level", "1")) == "0":
+        problems.append("M_Key protection level must be 1 or more")
     return problems
 
 

@@ -122,6 +122,11 @@ class Manager:
         # The leader's term, recorded with each sweep (see specs/ha.md)
         self.term = 0
         self._iteration_started = None
+        # Consecutive fabric checks that got no answer, and applies that
+        # failed to write, signal or sweep: the coordinator steps down on
+        # three of either (see Stepping down)
+        self.unanswered_checks = 0
+        self.failed_applies = 0
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
         self._contested_fabric = False
@@ -543,6 +548,11 @@ class Manager:
     def start(self):
         """Write the current state, start OpenSM, then keep it in sync"""
         self._stop.clear()
+        # A new leader inherits a contested check: its first sweep then
+        # doesn't count until a check passes (see Job completion).
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            self._contested_fabric = bool(applied and applied.contested)
         LOG.info(
             "OpenSM hardening: %s",
             ", ".join(sorted(self.config.hardening_groups)) or "none",
@@ -794,6 +804,11 @@ class Manager:
         """Record what OpenSM swept"""
         with self._lock, self.sessionmaker() as session:
             applied = self._applied(session)
+            if self.term and (applied.term or 0) > self.term:
+                # A deposed leader's late write: the successor's sweep stands.
+                LOG.error("Not recording a sweep of term %s", self.term)
+                session.rollback()
+                return
             applied.generation = generation
             applied.term = self.term
             applied.body = content
@@ -933,10 +948,12 @@ class Manager:
                 continue
             self._record(stamped, generation, attribution, report)
             self._failed_generation = None
+            self.failed_applies = 0
             LOG.info("Applied generation %d", generation)
             return
         # Leave the file as it is: OpenSM may have applied it, the next sync
         # tries again, and the jobs fail at their deadlines.
+        self.failed_applies += 1
         LOG.error("Failed to apply the partitions: %s", error)
 
     def _quarantine_line(self, error, attribution, generation):
@@ -1029,7 +1046,9 @@ class Manager:
             # Not knowing is no evidence either way: a contested fabric stays
             # contested until a check passes.
             ok, detail = False, f"Can't query the fabric: {e}"
+            self.unanswered_checks += 1
         else:
+            self.unanswered_checks = 0
             ok, detail = self._judge(fabric)
             # Only a passing check ends a contest; one that fails for another
             # reason, such as a missing switch, which the other SM may sit
@@ -1049,8 +1068,12 @@ class Manager:
             LOG.error("Fabric check failed: %s", detail)
         with self._lock, self.sessionmaker() as session:
             applied = self._applied(session)
+            if self.term and (applied.term or 0) > self.term:
+                session.rollback()
+                return ok
             applied.check_ok, applied.check_detail = ok, detail
             applied.check_time = _now()
+            applied.contested = self._contested_fabric
             session.commit()
         return ok
 
@@ -1141,6 +1164,8 @@ class Manager:
             and running
             and not self._contested_fabric
             and self._written is not None
+            # Condition 1: evidence from this leader's own term, in HA mode
+            and (not self.term or applied.term == self.term)
             and applied.check_ok
             and applied.check_time is not None
             and _now() - _aware(applied.check_time) <= fresh

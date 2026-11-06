@@ -113,6 +113,12 @@ class ProcessRunner:
                     pids.append(int(pid))
         return pids
 
+    def reach(self):
+        """The one switch, unless a test cut this node's link"""
+        if os.path.exists(os.path.join(self.fabric_dir, f"linkdown-{self.node}")):
+            return None
+        return 1
+
     def verify_stopped(self):
         return not self._own_sms()
 

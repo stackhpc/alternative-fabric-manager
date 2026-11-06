@@ -55,11 +55,18 @@ class Runner:
     def ask(self, node):
         self.calls.append(("ask", node))
 
+    def reach(self):
+        return self.reach_value
+
+    reach_value = 1
+
 
 class Manager:
     def __init__(self, calls):
         self.calls = calls
         self.term = 0
+        self.unanswered_checks = 0
+        self.failed_applies = 0
         self.on_opensm_stopped = None
         self.starts = 0
 
@@ -84,7 +91,11 @@ def clock(monkeypatch):
 
 @pytest.fixture
 def lease():
-    return lease_mod.GaleraLease(db.make_sessionmaker(":memory:"))
+    sessionmaker = db.make_sessionmaker(":memory:")
+    with sessionmaker() as session:
+        session.add(db.ExpectedSwitch(guid="0000000000000001"))
+        session.commit()
+    return lease_mod.GaleraLease(sessionmaker)
 
 
 def make(lease, node, **overrides):
@@ -286,3 +297,45 @@ def test_a_takeover_doesnt_start_opensm_on_a_stale_renewal(lease, clock, monkeyp
     clock.now += TIMINGS["self_stop_timeout"] + 1
     b._take_over(term_b, clock.now - TIMINGS["watchdog_timeout"] - 1)
     assert "manager.start" not in b.calls
+
+
+def test_a_candidate_whose_link_is_down_never_takes_the_lease(lease, clock):
+    a = make(lease, "a")
+    a._rejoin()
+    a.runner.reach_value = None
+    a._watch()
+    clock.now += 100
+    a._watch()
+    assert a.role == coordinator_mod.Role.CANDIDATE
+    assert lease.read().released
+
+
+def test_an_unanswered_fabric_moves_leadership_only_to_a_live_candidate(lease, clock):
+    a = make(lease, "a")
+    lead(a)
+    a.manager.unanswered_checks = 3
+    # Nobody else: stay, rather than leave the fabric with no SM.
+    a._lead()
+    assert a.role == coordinator_mod.Role.LEADER
+    b = make(lease, "b")
+    b._rejoin()
+    b._tick()
+    a._lead()
+    assert a.role == coordinator_mod.Role.STARTING
+    assert "runner.stop" in a.calls
+
+
+def test_a_deposed_leaders_sweep_doesnt_replace_the_successors(lease):
+    from alternative_fabric_manager import manager as manager_mod
+    from alternative_fabric_manager.drivers import NoOpenSM
+
+    config = config_mod.Config(token="t", driver="none", database=":memory:")
+    sessionmaker = lease.sessionmaker
+    old = manager_mod.Manager(config, sessionmaker, NoOpenSM())
+    new = manager_mod.Manager(config, sessionmaker, NoOpenSM())
+    new.term, old.term = 2, 1
+    new._record("new", 5, {}, None)
+    old._record("old", 4, {}, None)
+    with sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        assert (applied.body, applied.term) == ("new", 2)

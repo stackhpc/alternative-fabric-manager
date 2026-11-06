@@ -27,7 +27,10 @@ The coordinator drives OpenSM through a runner:
   which the runner, as its driver, makes under the watchdog;
 - stop(): ask the watchdog to stop OpenSM, killing it if it doesn't;
 - verify_stopped(): whether no OpenSM runs on the node;
-- ask(adapters): SMInfo DISABLE to a node's adapters, best effort.
+- ask(adapters): SMInfo DISABLE to a node's adapters, best effort;
+- reach(), optionally: how many expected switches this node's own port
+  reaches, or None if the port's link is down, below Init, or its
+  neighbouring switch port is disabled (see Taking the lease).
 """
 
 import enum
@@ -86,6 +89,10 @@ class Coordinator:
         self._renewals_stopped = False
         self._opensm_gone = False
         self._restarting = False
+        # Other nodes' heartbeats as last seen, and since when, to tell live
+        # candidates from dead rows
+        self._heartbeats = {}
+        self._expired_since = None
         manager.on_opensm_stopped = self._opensm_stopped
 
     # Lifecycle
@@ -184,7 +191,36 @@ class Coordinator:
             self._watch()
 
     def _reach(self):
-        return 1
+        """Expected switches this node reaches; 0 if its own port is down"""
+        reach = getattr(self.runner, "reach", None)
+        if reach is None:
+            return 1
+        try:
+            value = reach()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("Can't tell what this node reaches: %s", e)
+            return 0
+        return value or 0
+
+    def _live_others(self):
+        """Other nodes whose heartbeat moved within T, not stopped, and not
+        in the target set: the live candidates (see Stepping down)"""
+        now = _now()
+        targets = {instance for _node, instance, _term in self.lease.targets()}
+        live = []
+        for name, instance, heartbeat, reach, stopped in self.lease.nodes():
+            seen = self._heartbeats.get(name)
+            if seen is None or seen[0] != heartbeat:
+                self._heartbeats[name] = (heartbeat, now)
+                seen = self._heartbeats[name]
+            if (
+                name != self.node
+                and not stopped
+                and instance not in targets
+                and now - seen[1] < self.config.lease_timeout
+            ):
+                live.append((name, reach))
+        return live
 
     # Leading
 
@@ -245,6 +281,18 @@ class Coordinator:
             self._opensm_gone = False
             self._step_down("OpenSM stopped")
             return
+        if not self.held and (
+            self.manager.unanswered_checks >= 3 or self.manager.failed_applies >= 3
+        ):
+            # A paused or wedged OpenSM under a healthy manager; only worth
+            # moving if another node could do better.
+            try:
+                others = self._live_others()
+            except Exception:  # noqa: BLE001
+                others = []
+            if others:
+                self._step_down("OpenSM doesn't answer, or can't be applied to")
+                return
         if self._renewals_stopped:
             return
         try:
@@ -371,7 +419,12 @@ class Coordinator:
             self._seen_since is not None
             and returned - self._seen_since >= self.config.lease_timeout
         )
-        if not expired or not self._eligible():
+        if not expired:
+            self._expired_since = None
+            return
+        if self._expired_since is None:
+            self._expired_since = returned
+        if not self._eligible(returned - self._expired_since):
             return
         try:
             term = self.lease.acquire(
@@ -401,16 +454,23 @@ class Coordinator:
         )
         self._takeover.start()
 
-    def _eligible(self):
-        """Whether this node reaches as many expected switches as any live
-        candidate (see The lease, Taking the lease)"""
+    def _eligible(self, waited):
+        """Whether this node may take the lease: its own port is up, and it
+        reaches every expected switch, or, once no candidate has for
+        T_reach, as many as any live candidate (see Taking the lease)"""
+        reach = self._reach()
+        if reach <= 0:
+            return False
         try:
-            nodes = self.lease.nodes()
+            expected = self.lease.expected_switches()
+            others = self._live_others()
         except Exception:  # noqa: BLE001
             return False
-        reach = self._reach()
-        best = max((r for _n, _u, _h, r, stopped in nodes if not stopped), default=0)
-        return reach >= best
+        if expected and reach >= expected:
+            return True
+        if waited < self.config.reach_timeout:
+            return False
+        return reach >= max((r for _name, r in others), default=0)
 
     # Taking over
 

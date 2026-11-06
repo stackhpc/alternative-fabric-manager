@@ -362,6 +362,15 @@ class GaleraLease:
             )
             session.commit()
 
+    def expected_switches(self):
+        """How many switches a complete fabric has"""
+        with self._session() as session:
+            count = session.scalar(
+                sa.select(sa.func.count()).select_from(db.ExpectedSwitch)
+            )
+            session.commit()
+            return count or 0
+
     def nodes(self):
         with self._session() as session:
             rows = [

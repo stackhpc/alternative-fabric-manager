@@ -136,3 +136,18 @@ def test_ha_needs_a_job_timeout_longer_than_a_takeover():
     config_mod.Config(**base, job_timeout=300).validate()
     with pytest.raises(config_mod.ConfigError, match="shutdown_timeout"):
         config_mod.Config(**base, job_timeout=300, shutdown_timeout=40).validate()
+
+
+def test_ha_needs_the_m_key_and_sm_key():
+    from alternative_fabric_manager import config as config_mod
+
+    base = dict(
+        token="t",
+        ha=True,
+        connection="mysql+pymysql://u:p@h/afm",
+        driver="managed",
+        job_timeout=300,
+    )
+    with pytest.raises(config_mod.ConfigError, match="sm_key"):
+        config_mod.Config(**base, hardening="m_key, enforcement").validate()
+    config_mod.Config(**base, hardening="m_key, sm_key").validate()
