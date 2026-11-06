@@ -362,6 +362,11 @@ def _ha_problems(config):
         problems.append("watchdog_timeout must exceed ha_period + call_timeout")
     if config.driver != "managed":
         problems.append("[opensm] driver must be managed: the manager starts OpenSM")
+    if not config.manager_container:
+        problems.append(
+            "[opensm] manager_container must name the manager's container, "
+            "whose PID namespace OpenSM joins, so that it dies with the manager"
+        )
     # Without them, a tenant's SM could set ports or win a handover, and Ask
     # has no key (see Fencing, Required keys).
     missing = {"m_key", "sm_key"} - config.hardening_groups

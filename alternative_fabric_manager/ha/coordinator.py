@@ -335,7 +335,10 @@ class Coordinator:
         missing = getattr(manager, "missing_checks", 0) >= 3
         if not (stalled or missing):
             return None
-        if self._moved_age < self.config.step_down_cooldown:
+        # Unanswered checks mean no working SM: they don't wait for the
+        # cooldown, which is for faults every node may share.
+        unanswered = manager.unanswered_checks >= 3
+        if not unanswered and self._moved_age < self.config.step_down_cooldown:
             return None
         try:
             others = self._live_others()
@@ -370,13 +373,18 @@ class Coordinator:
         # The applier stops while OpenSM starts, so that it neither reports
         # OpenSM gone again nor races the start; start() restarts it.
         self.manager.halt()
+        # The held lease again first: a failed start removes the watchdog's
+        # files.
+        self.runner.write_lease(self.uuid, self.term, None)
         self.runner.prepare(self.uuid, self.term, None)
 
         def restart():
             try:
                 self.manager.start()
             except Exception:
-                LOG.exception("Restarting OpenSM while frozen failed")
+                LOG.exception("Restarting OpenSM while frozen failed; retrying")
+                # Only the frozen node may start it, so keep trying.
+                self._opensm_gone = True
             finally:
                 self._restarting = False
 

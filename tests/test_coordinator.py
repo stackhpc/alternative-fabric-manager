@@ -349,7 +349,7 @@ def test_the_cooldown_keeps_a_new_leader_through_a_shared_fault(lease, clock):
     b = make(lease, "b", step_down_cooldown=300)
     b._rejoin()
     b._tick()
-    a.manager.unanswered_checks = 3
+    a.manager.failed_applies = 3
     a._lead()
     assert a.role == coordinator_mod.Role.LEADER
 
@@ -379,3 +379,35 @@ def test_a_new_leadership_counts_failures_afresh(tmp_path):
     manager.halt()
     assert (manager.unanswered_checks, manager.failed_applies) == (0, 0)
     assert manager.missing_checks == 0
+
+
+def test_a_failed_frozen_restart_is_retried_with_the_held_lease(lease, clock):
+    a = make(lease, "a")
+    lead(a)
+    lease.request_freeze(a.term, "operator", 30)
+    a._freeze_step()
+
+    def fail():
+        raise RuntimeError("OpenSM didn't start")
+
+    a.manager.start = fail
+    a._opensm_gone = True
+    a._restart_frozen()
+    for _ in range(100):
+        if not a._restarting:
+            break
+        threading.Event().wait(0.01)
+    # Retried on the next tick, with the held lease written again
+    assert a._opensm_gone
+    assert a.runner.leases[-1] == (a.term, None)
+
+
+def test_unanswered_checks_dont_wait_for_the_cooldown(lease, clock):
+    a = make(lease, "a", step_down_cooldown=300)
+    lead(a)
+    b = make(lease, "b", step_down_cooldown=300)
+    b._rejoin()
+    b._tick()
+    a.manager.unanswered_checks = 3
+    a._lead()
+    assert a.role == coordinator_mod.Role.STARTING

@@ -46,6 +46,9 @@ WATCHDOG = "watchdog.py"
 REACH_CACHE = 10.0
 _PORT_UP = re.compile(r"State:\s*(Initializing|Armed|Active)\b")
 _LINK_UP = re.compile(r"Physical state:\s*LinkUp\b")
+_INFINIBAND = re.compile(r"Link layer:\s*InfiniBand\b")
+# How long the probe may take
+REACH_TIMEOUT = 20
 _SWITCH = re.compile(r"^Switch\s*:\s*0x[0-9a-fA-F]+", re.M)
 
 
@@ -194,7 +197,8 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         command = [
             "sh",
             "-c",
-            "ibstat; echo ===; ibswitches " + (f"-y {key}" if key else ""),
+            f"timeout {REACH_TIMEOUT} ibstat; echo ===; timeout {REACH_TIMEOUT} "
+            "ibswitches " + (f"-y {key}" if key else ""),
         ]
         try:
             output = self.client.containers.run(
@@ -209,6 +213,10 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             LOG.warning("Can't probe this node's reach: %s", e)
             return None
         status, _, switches = output.decode(errors="replace").partition("===")
-        if not (_PORT_UP.search(status) and _LINK_UP.search(status)):
+        # An InfiniBand port with its link up, in Init or above
+        if not any(
+            _PORT_UP.search(port) and _LINK_UP.search(port) and _INFINIBAND.search(port)
+            for port in status.split("Port ")[1:]
+        ):
             return None
         return len(_SWITCH.findall(switches))

@@ -493,6 +493,11 @@ back a deleted port. The new leader's fabric checks find the other master,
 so no job completes meanwhile, and an alarm is raised. This is the first
 release's known limitation; confirmed fencing removes it.
 
+The first implementation has a second limitation: step 1, Ask, is not yet
+sent, so a leader whose self-stop and watchdog both failed is not asked to
+stop. Its OpenSM is then found by the new leader's fabric checks, as another
+master, so no job completes, and an alarm is raised, until it stops.
+
 ### Rejoining
 
 A node that left the target set unconfirmed rejoins as a candidate once

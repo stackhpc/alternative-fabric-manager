@@ -147,6 +147,7 @@ def test_ha_needs_the_m_key_and_sm_key():
         connection="mysql+pymysql://u:p@h/afm",
         driver="managed",
         job_timeout=300,
+        manager_container="afm",
     )
     with pytest.raises(config_mod.ConfigError, match="sm_key"):
         config_mod.Config(**base, hardening="m_key, enforcement").validate()

@@ -114,6 +114,7 @@ IBSTAT_UP = b"""CA 'mlx5_0'
 \tPort 1:
 \t\tState: Initializing
 \t\tPhysical state: LinkUp
+\t\tLink layer: InfiniBand
 """
 SWITCHES = b'Switch\t: 0xec0d9a0300b12560 ports 41 "SwitchIB" base port 0 lid 2\n'
 
@@ -127,7 +128,16 @@ def test_reach_counts_switches_from_a_port_that_is_up(driver):
 
 def test_reach_is_none_when_the_port_is_down(driver):
     driver.client.probe = (
-        b"\t\tState: Down\n\t\tPhysical state: Disabled\n===\n" + SWITCHES
+        b"\tPort 1:\n\t\tState: Down\n\t\tPhysical state: Disabled\n"
+        b"\t\tLink layer: InfiniBand\n===\n" + SWITCHES
+    )
+    assert driver.reach() is None
+
+
+def test_reach_ignores_ethernet_ports(driver):
+    driver.client.probe = (
+        b"\tPort 1:\n\t\tState: Active\n\t\tPhysical state: LinkUp\n"
+        b"\t\tLink layer: Ethernet\n===\n" + SWITCHES
     )
     assert driver.reach() is None
 
