@@ -74,7 +74,7 @@ would stop itself. The deployment role checks this.
 | `ports` | Port ID, network (foreign key), GUID (unique), host |
 | `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
-| `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), and when leadership last moved |
+| `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), when leadership last moved, and the **freeze**: whether it is frozen, the frozen leader's node, instance UUID and term, who froze it, when, and when it expires (see Freeze) |
 | `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs, and whether its OpenSM is verified stopped (see Fencing, Rejoining) |
 | `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
 | `quarantine` | Objects left out of rendering, and why |
@@ -267,7 +267,9 @@ and the applied state stay in Galera too.
    its request again. The exception is a Galera outage, when every
    `/healthz` fails and HAProxy itself answers 503: networking-mlnx then
    sends its requests again, which, with its default unlimited
-   `retry_count`, only delays them.
+   `retry_count`, only delays them. While the cluster is frozen, new
+   requests are answered with 503 too, but job polls still get their
+   status (see Freeze).
 2. The leader polls the generation, every second or so, and is woken at once
    when it took the request itself.
 3. When it is behind, it reads the generation and the whole state in one
@@ -560,6 +562,57 @@ doesn't by itself: an OpenSM that stops makes its leader step down, and a
 new takeover, possibly by the same node, starts it, except for the shared
 failure in Stepping down, when the leader starts it again itself.
 
+### Freeze
+
+An operator can freeze the cluster for maintenance, such as of Galera
+itself: OpenSM stays on the current leader's node, and isn't stopped or
+moved, until the cluster is unfrozen.
+
+- **Agreement is Galera's.** `alternative-fabric-manager --freeze`
+  commits the freeze to the lease row, with a compare-and-set on the
+  current term, on a Primary component. It is refused unless a leader holds
+  the lease, has no other entry in the target set, has OpenSM running, and
+  its last fabric check passed. Only an instance that reaches a Primary
+  component can take over, and every takeover's compare-and-set requires
+  the cluster not to be frozen, so once committed, no other instance can
+  take over, whatever happens to Galera or the network meanwhile. A
+  majority vote among the managers over another channel wouldn't do: a
+  candidate outside that majority could still reach Galera's.
+  `--drain` first waits, up to the job timeout, for open jobs to end.
+- **The cluster can only be frozen while Galera is up.** A leader that
+  can't reach a Primary component may be on the minority side of a
+  partition whose majority elects another leader, so it can't decide to
+  keep its OpenSM by itself.
+- **The leader holds.** Once it has read the committed freeze, the frozen
+  leader stops timing self-stop, ignores the discretionary step-down
+  triggers, and tells its watchdog to hold: a lease with no deadline, so
+  that OpenSM survives a Galera outage or a hung manager. It keeps applying
+  and checking while Galera is up, and raises an alarm while frozen.
+- **Requests wait.** Every instance reads the freeze within a poll
+  interval, and then answers new requests with 503, which networking-mlnx
+  retries, unlike 400. Job polls are still answered. Requests recorded
+  before the freeze are applied as usual if Galera is up; ports created
+  during a freeze stay DOWN, so Nova's wait fails an instance whose port
+  waits longer than it.
+- **OpenSM's container still dies with the manager**, through the PID
+  namespace. While frozen, only the frozen node's manager may start OpenSM
+  again, with a start request for the frozen term, whether after a restart
+  or after OpenSM exits, and only once it reads the freeze from Galera, or,
+  with Galera down, from the watchdog's hold, which records the term. If
+  the frozen node itself fails, the fabric has no subnet manager until an
+  operator unfreezes the cluster: that is what a freeze trades.
+- **Unfreezing** needs Galera: `--unfreeze` clears the freeze with a
+  compare-and-set, the leader renews at once, gives its watchdog a lease
+  with a deadline again, and resumes timing self-stop, and every candidate
+  restarts its expiry timer from the unfreeze, treating it as a renewal,
+  so nobody takes over on time that passed while frozen. A freeze may be
+  given an expiry, `--for 2h` say, after which any instance that reaches a
+  Primary component unfreezes it, as an operator would.
+- **SIGTERM while frozen** stops OpenSM, since the manager is PID 1 of its
+  namespace, but doesn't release the lease; the node's manager starts it
+  again when it comes back. Shutting the frozen node down for good needs an
+  unfreeze first.
+
 ### Stepping down
 
 A leader steps down, by stopping OpenSM through the watchdog, verifying
@@ -790,6 +843,9 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | A port's pkey table can't be set | Jobs involving its GUID wait, and the leader retries | Other jobs carry on; the leadership stays |
 | A deposed leader writes late | Its compare-and-set on the term fails | Nothing happens |
 | A port is created then deleted before a sweep | No swept body has a membership attributed to it | The create times out and fails; the delete completes |
+| Frozen, and Galera unavailable | The leader holds: no self-stop, and its watchdog holds | OpenSM keeps running; requests get 503 from HAProxy until Galera returns |
+| Frozen, and the leader's manager restarts or OpenSM exits | The frozen node's manager starts OpenSM again for the frozen term | A short gap without an SA |
+| Frozen, and the frozen node fails | Nobody may take over | No subnet manager until an operator unfreezes; alarm |
 
 ## Alternatives considered
 
@@ -850,6 +906,11 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 - [ ] Takeovers: SMInfo DISABLE behind `fence_ask`, the unconfirmed wait,
       `manual_takeover`, rejoining with a verified stop, and the required
       keys check.
+- [ ] Freeze: `--freeze` (with `--drain` and `--for`) and `--unfreeze`,
+      the takeover compare-and-set requiring not frozen, 503 for new
+      requests, the leader's hold and the watchdog's held lease, restarting
+      OpenSM only on the frozen node, and candidates' timers restarted at
+      the unfreeze.
 - [ ] A CLI to confirm a manual takeover, record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
@@ -867,7 +928,11 @@ leader's OpenSM has swept its membership with the whole fabric in view.
         starts OpenSM within a few seconds, without waiting; and with the
         database unreachable, it still exits with OpenSM verified stopped;
       - the leader's manager paused: its watchdog kills OpenSM before the
-        successor's unconfirmed wait ends.
+        successor's unconfirmed wait ends;
+      - frozen: Galera stopped, the leader's manager paused, and the
+        leader's Galera node partitioned, with OpenSM kept on the frozen
+        node throughout, new requests answered 503, and no takeover until
+        the unfreeze, after which a takeover waits a full `T`.
 - [ ] Deployment: a Kayobe or Kolla-Ansible role with the HAProxy backend,
       healthcheck, database credentials, the containers' stop timeout,
       expected switches, and the check that control traffic doesn't run over
