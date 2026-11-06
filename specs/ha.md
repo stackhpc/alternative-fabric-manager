@@ -316,7 +316,7 @@ while its OpenSM still runs. For each target, the new leader records its
 fence intent, the node, the step and the switch ports, with a term
 compare-and-set before it acts, so that a successor can finish or undo it.
 It then climbs a ladder, and the target leaves the set once step 2 or 3
-confirms, or step 4 where it is configured:
+confirms, or step 4 once it exists (a future improvement):
 
 1. **Ask.** Send the target's SM a SubnSet(SMInfo) with the DISABLE modifier
    and the SM_Key, which a live OpenSM honours by going to NOT-ACTIVE. It
@@ -348,7 +348,8 @@ confirms, or step 4 where it is configured:
      that its ports are still disabled every `check_interval`, and after
      every heavy sweep, since a switch reboot or its management can enable
      them again.
-4. **Power it off.** Optional, and off by default: only for a node whose
+4. **Power it off.** A future improvement, not in the first release.
+   Optional, and off by default: only for a node whose
    BMC settings are configured, with `[ha] power_fencing = true`. Through
    the target's BMC, with IPMI or Redfish, as Pacemaker's `fence_ipmilan`
    and `fence_redfish` do, and confirmed by querying the power state. It
@@ -712,8 +713,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       single-use start requests on tmpfs, and the file hashes.
 - [ ] Fencing: the recorded intent, SMInfo DISABLE, the restricted SSH
       script, switch-port disabling with the fabric scan, the static map and
-      the neighbour checks, its re-assertion, optional BMC power fencing,
-      retry by the next leader, and unfencing.
+      the neighbour checks, its re-assertion, retry by the next leader, and
+      unfencing.
 - [ ] A CLI to confirm fences, unfence nodes, record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
@@ -725,6 +726,10 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       healthcheck, database credentials, SSH keys, the static map, expected
       switches, and the check that control traffic doesn't run over fenced
       ports.
+
+## Future improvements
+
+- Optional BMC power fencing, as step 4 of the ladder in Fencing.
 
 ## Open questions
 
