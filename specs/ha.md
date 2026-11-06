@@ -219,6 +219,13 @@ waits for it as for any target.
 A candidate's configuration hash must be one the current configuration
 epoch allows, and its OpenSM must be verified stopped.
 
+The lease sits behind a small coordination driver interface: take the
+lease with a term, renew it, release it, watch it for expiry, and record
+targets leaving the set, each as a compare-and-set on the term. Galera is
+the first driver, since every Kolla deployment has it; others are a future
+improvement (see Coordination drivers). Jobs, objects and the applied
+state stay in Galera whatever the driver.
+
 ## Requests and applying
 
 1. HAProxy sends networking-mlnx's request to any instance. The instance
@@ -744,7 +751,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       version, configuration epochs and cluster settings,
       `wsrep_sync_wait`, UTC timestamps, deadlock retry, the generation bump
       first in every request, constraint errors as 400.
-- [ ] The lease: taking on a Primary component only, renewing, self-stop
+- [ ] The lease, behind a coordination driver interface with Galera as
+      its first driver: taking on a Primary component only, renewing, self-stop
       after `T_self`, releasing on step-down and SIGTERM, expiry on the
       monotonic clock, terms in every compare-and-set, and the target set.
 - [ ] The watchdog: an entrypoint for OpenSM's container, with the lease and
@@ -978,6 +986,29 @@ and unable to start by itself:
 
 If the leader can't verify, the ports stay disabled until an operator
 unfences the node with the CLI.
+
+### Coordination drivers
+
+Other coordination drivers for the lease, where a site runs the service:
+
+- **etcd:** a lease with a TTL that etcd expires itself, kept alive by the
+  leader, and the leader key written in a transaction conditional on its
+  revision, which serves as the term. Expiry no longer needs the
+  candidates' counter-watching, and self-stop follows the keep-alive's
+  failure. etcd is a Raft cluster, so a minority can't renew or take it.
+  tooz's etcd3 driver, used by OpenStack services, is a possible base.
+- **Redis:** only with care. Redis, with Sentinel or Cluster, replicates
+  asynchronously, so a failover can lose a lease just granted, and two
+  instances can both believe they lead; Redlock doesn't remove that. A
+  Redis driver is safe only if every action is fenced by the term in the
+  store that holds the effect, Galera here, which the design does already,
+  and if the paused-leader cases are covered as for Galera.
+
+With a driver other than Galera, the state in Galera and the lease are in
+different systems, so a leader can hold the lease while it can't reach
+Galera, or the reverse. Self-stop must then trigger on either: a leader
+that can't renew its lease, or can't write to Galera, for `T_self`, stops
+its OpenSM.
 
 ## Open questions
 
