@@ -116,7 +116,11 @@ def main(argv=None):
         )
         from alternative_fabric_manager.ha import operator
 
-        print("\n".join(operator.status(lease.read())))
+        try:
+            state = lease.read()
+        except lease_mod.NotPrimary as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
+        print("\n".join(operator.status(state)))
         return
 
     if args.freeze or args.unfreeze or args.confirm_takeover:

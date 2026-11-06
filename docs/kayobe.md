@@ -405,6 +405,11 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   first; each schema change is compatible with the version before. The
   leader steps down when its container is replaced, releasing the lease,
   and another instance takes over at once.
+- **Upgrading from a version with `[ha] manual_takeover`**: if you set it
+  to true, set it to false and deploy that first. During a rolling upgrade
+  an old instance that leads would otherwise wait for a confirmation that
+  the new version's `--confirm-takeover` can't give outside a freeze. The
+  new version ignores the option, with a warning.
 - **Galera maintenance**: freeze the cluster first, so that OpenSM stays on
   the leader whatever happens to Galera, and unfreeze after:
 

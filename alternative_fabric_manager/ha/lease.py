@@ -489,13 +489,20 @@ class GaleraLease:
             session.commit()
             return True
 
-    def confirm(self, term):
-        """An operator confirms that the frozen holder of term's OpenSM can't
-        act, so that a takeover may end a freeze it never acknowledged"""
+    def confirm(self, term, holder_uuid):
+        """An operator confirms that the frozen holder of term, the instance
+        holder_uuid, can't act, so that a takeover may end a freeze it never
+        acknowledged"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.freeze_state != "ending" or term != lease.term:
-                # Only while a freeze ends: never for one still in force
+            if (
+                lease.freeze_state != "ending"
+                or term != lease.term
+                or holder_uuid != lease.holder_uuid
+            ):
+                # Only while a freeze ends: never for one still in force, nor
+                # for an instance that adopted the frozen lease since the
+                # operator read it, which keeps the term
                 session.rollback()
                 return False
             lease.confirmed_term = term

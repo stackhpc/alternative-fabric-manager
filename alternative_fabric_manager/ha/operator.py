@@ -65,16 +65,17 @@ def confirm_takeover(lease):
     """Confirm that the frozen leader's OpenSM can't act, while a freeze it
     never acknowledged ends; returns its node and term
 
-    The confirmation names the term read here, and lease.confirm() takes it
-    only if that freeze is still the one ending, so a freeze that ends and
-    another that starts meanwhile is never confirmed by mistake."""
+    The confirmation names the term and the holding instance read here, and
+    lease.confirm() takes it only if both still hold the ending freeze, so
+    neither a later freeze nor an instance that adopted this one meanwhile
+    is confirmed by mistake."""
     state = lease.read()
     if state.freeze_state != "ending":
         raise OperatorError(
             "Only while a freeze ends: the cluster isn't unfreezing; "
             "run --unfreeze first"
         )
-    if not lease.confirm(state.term):
+    if not lease.confirm(state.term, state.holder_uuid):
         raise OperatorError("The freeze changed meanwhile: check --status")
     return state.holder_node, state.term
 

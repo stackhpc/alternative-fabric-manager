@@ -676,8 +676,10 @@ moved, until the cluster is unfrozen.
   ends unacknowledged, it reports the unfreeze as pending and names the
   frozen leader's node as the one to check; once confirmed, it says so.
   `--confirm-takeover` takes no term: it confirms the freeze ending when it
-  reads the lease row, and `confirm()` accepts it only if that freeze is
-  still ending, so it never confirms a later one.
+  reads the lease row, naming its term and holding instance, and
+  `confirm()` accepts it only if both still hold the ending freeze, so it
+  confirms neither a later freeze nor an instance that adopted this one
+  meanwhile, which keeps the term.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
   freeze's expiry, read by any instance that reaches a Primary component,
   marks the freeze as ending. The frozen leader acknowledges it, in this
@@ -893,6 +895,11 @@ instance can't reach the database.
   version that can't, says so, and needs every instance stopped. Each
   release of the lease restarts OpenSM on another node, so its SA state is
   rebuilt.
+- **From a version with `[ha] manual_takeover`:** an instance of the old
+  version with it set waits for an operator to confirm every takeover it
+  leads, and the new version's CLI can't confirm one outside a freeze. Set
+  it to false and roll that out before upgrading; the new version ignores
+  the option, with a warning, and the stored setting.
 - **From single node:** with the manager stopped, which stops OpenSM too,
   so the fabric has no subnet manager meanwhile:
   1. copy the networks, ports and keys into Galera, and continue the
