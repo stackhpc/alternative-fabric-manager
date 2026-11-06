@@ -18,6 +18,7 @@ anything under `alternative_fabric_manager/ha/`.
 | `alternative_fabric_manager/ha/` | HA: `lease.py` (Galera driver), `watchdog.py`, `coordinator.py`, `operator.py` |
 | `specs/ha.md` | The accepted HA design: the source of truth for HA behaviour |
 | `docs/opensm-hardening.md` | The hardened OpenSM defaults and their rationale |
+| `docs/kayobe.md` | Deploying HA mode with Kayobe's `controller_containers` |
 | `tests/` | Unit tests; `tests/functional/` is the failover harness |
 
 ## Commands
@@ -81,10 +82,13 @@ The development host, infiniband-testing, shares its InfiniBand fabric
   `KEY=$(... --show-keys | awk '/^m_key/{print $2}')`, never to display.
 - **The fabric is M_Key protected.** SMP tools (`ibswitches`, `smpquery`,
   `ibportstate`) need `-y $KEY`. Never disable switch ports or send SMInfo
-  Sets on this fabric: only M_Key protection was approved here.
-- **AFM's database holds the fabric's M_Key.** Never drop or recreate the
-  live `afm_data` volume's database; back it up before every redeploy (see
-  the `deploy-host` skill).
+  Sets on this fabric.
+- **AFM's database holds the fabric's keys.** The host runs AFM in HA mode,
+  with its database in the `afm-mariadb` container; the old SQLite database
+  in the `afm_data` volume is the rollback. Never drop or recreate either;
+  back up before every redeploy (see the `deploy-host` skill).
+- **M_Key and SM_Key protection were approved here**, on 2026-11-06, for
+  HA mode.
 - Don't connect to eswitchd on tcp://127.0.0.1:60001; it crashes on junk.
 - Shared DevStack configuration changes need the user's approval.
 - Delete OpenStack resources by explicit ID only.
