@@ -291,10 +291,10 @@ def test_a_confirmation_from_before_an_adoption_is_refused(lease):
         lease_read = lease.read
         lease.read = lambda: stale
         try:
-            operator.confirm_takeover(lease)
+            operator.force_unfreeze(lease)
         finally:
             lease.read = lease_read
-    assert operator.confirm_takeover(lease) == ("a", term)
+    assert operator.force_unfreeze(lease) == ("a", term)
 
 
 def test_every_instance_agrees_on_the_settings(lease):
@@ -318,19 +318,19 @@ def test_a_setting_a_newer_version_adds_is_stored_and_enforced(lease):
     assert lease.agree_settings('{"t": 30}')
 
 
-def test_confirm_takeover_confirms_the_ending_freeze_without_a_term(lease):
+def test_force_unfreeze_confirms_the_ending_freeze_without_a_term(lease):
     from alternative_fabric_manager.ha import operator
 
     term = _take(lease, "a", "ua")
     # Not while running, nor while frozen
     with pytest.raises(operator.OperatorError):
-        operator.confirm_takeover(lease)
+        operator.force_unfreeze(lease)
     lease.request_freeze(term, "operator", 30)
     lease.acknowledge_freeze("ua", term)
     with pytest.raises(operator.OperatorError):
-        operator.confirm_takeover(lease)
+        operator.force_unfreeze(lease)
     lease.request_unfreeze()
-    assert operator.confirm_takeover(lease) == ("a", term)
+    assert operator.force_unfreeze(lease) == ("a", term)
     state = lease.read()
     assert lease.acquire("b", "ub", state.term, state.counter, False) == term + 1
 
@@ -347,6 +347,6 @@ def test_status_names_the_manager_to_check_while_an_unfreeze_is_pending(lease):
     assert "holder: a (instance ua)" in lines
     assert any(line.startswith("unfreeze pending: a's manager") for line in lines)
     assert any(line.startswith("Check a:") for line in lines)
-    operator.confirm_takeover(lease)
+    operator.force_unfreeze(lease)
     lines = operator.status(lease.read())
-    assert any("is confirmed" in line for line in lines)
+    assert any("forced" in line for line in lines)

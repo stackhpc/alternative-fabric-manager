@@ -675,7 +675,7 @@ moved, until the cluster is unfrozen.
   it was released, and the freeze, with its frozen term. While a freeze
   ends unacknowledged, it reports the unfreeze as pending and names the
   frozen leader's node as the one to check; once confirmed, it says so.
-  `--confirm-takeover` takes no term: it confirms the freeze ending when it
+  `--force-unfreeze` takes no term: it confirms the freeze ending when it
   reads the lease row, naming its term and holding instance, and
   `confirm()` accepts it only if both still hold the ending freeze, so it
   confirms neither a later freeze nor an instance that adopted this one
@@ -691,7 +691,7 @@ moved, until the cluster is unfrozen.
   acknowledges, no candidate takes over on expiry: a leader that never
   acknowledges, because it is paused, hung, or cut off, leaves the lease
   only through a verified stop of its node, or an operator's confirmation,
-  with `--confirm-takeover`, that its OpenSM can't act; its watchdog's
+  with `--force-unfreeze`, that its OpenSM can't act; its watchdog's
   held deadline, if the freeze had an expiry, stops OpenSM meanwhile. A
   takeover while the freeze is ending is a compare-and-set that requires
   either an operator's confirmation recorded in the lease row while the
@@ -1211,8 +1211,9 @@ HA mode refuses to start unless each enabled step has what it needs:
 
 `[ha] fence_manual = true` makes a takeover wait for an operator to
 confirm the fence with the CLI when its enabled confirming steps fail.
-The CLI's `--confirm-takeover` accepts a confirmation only for a freeze
-that is ending, today; implementing `fence_manual` widens it to fences. With no
+The CLI's `--force-unfreeze` is for freezes only; `fence_manual` will have
+its own command, naming the node whose fence the operator confirms, since
+the target set can hold several. With no
 confirming step enabled and `fence_manual` off, HA mode logs a warning at
 start, and the health check reports it.
 

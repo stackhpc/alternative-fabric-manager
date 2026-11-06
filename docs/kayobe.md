@@ -408,7 +408,7 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 - **Upgrading from a version with `[ha] manual_takeover`**: if you set it
   to true, set it to false and deploy that first. During a rolling upgrade
   an old instance that leads would otherwise wait for a confirmation that
-  the new version's `--confirm-takeover` can't give outside a freeze. The
+  the new version's CLI can't give outside a freeze. The
   new version ignores the option, with a warning.
 - **Galera maintenance**: freeze the cluster first, so that OpenSM stays on
   the leader whatever happens to Galera, and unfreeze after:
@@ -427,7 +427,7 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   `--status`: it shows "unfreeze pending" and names the frozen leader's
   host. No instance takes over until that leader's manager acknowledges.
   If its manager is paused or hung, stop its OpenSM, check that no
-  `opensm` process runs on that host, and run `--confirm-takeover`; another
+  `opensm` process runs on that host, and run `--force-unfreeze`; another
   instance then takes over.
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager

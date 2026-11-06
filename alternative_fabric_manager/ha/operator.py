@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Operators' commands: freeze, unfreeze, confirm a takeover"""
+"""Operators' commands: freeze, unfreeze, force an unfreeze, status"""
 
 import socket
 import time
@@ -61,9 +61,9 @@ def unfreeze(config, lease, wait):
     return False
 
 
-def confirm_takeover(lease):
-    """Confirm that the frozen leader's OpenSM can't act, while a freeze it
-    never acknowledged ends; returns its node and term
+def force_unfreeze(lease):
+    """End a freeze its frozen leader never acknowledged, by confirming that
+    that leader's OpenSM can't act; returns its node and term
 
     The confirmation names the term and the holding instance read here, and
     lease.confirm() takes it only if both still hold the ending freeze, so
@@ -94,16 +94,16 @@ def status(state):
     if state.freeze_state == "ending":
         if state.confirmed_term == state.term:
             lines.append(
-                f"unfreeze pending: the takeover from {holder} is confirmed; "
+                f"unfreeze pending: forced, with {holder}'s OpenSM taken as stopped; "
                 "another instance takes over at its next poll"
             )
         else:
             lines += [
                 f"unfreeze pending: {holder}'s manager hasn't acknowledged it, "
                 "so no instance takes over until it does, its node's stop is "
-                "verified, or an operator confirms.",
+                "verified, or an operator forces the unfreeze.",
                 f"Check {holder}: if its manager is paused or hung, stop its "
                 "OpenSM, check that no opensm process runs there, and run "
-                "--confirm-takeover.",
+                "--force-unfreeze.",
             ]
     return lines

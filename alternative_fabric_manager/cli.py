@@ -77,11 +77,12 @@ def main(argv=None):
         "--unfreeze", action="store_true", help="HA: end a freeze, and exit"
     )
     parser.add_argument(
-        "--confirm-takeover",
+        "--force-unfreeze",
         action="store_true",
-        help="HA: while a freeze ends and its frozen leader can't acknowledge "
-        "it, confirm that that leader's OpenSM can't act, so that another "
-        "instance may take over",
+        help="HA: end a freeze whose frozen leader can't acknowledge the "
+        "unfreeze, so that another instance may take over. Only after "
+        "stopping that leader's OpenSM and checking that no opensm process "
+        "runs on its host: nothing checks this for you (see --status)",
     )
     args = parser.parse_args(argv)
 
@@ -123,7 +124,7 @@ def main(argv=None):
         print("\n".join(operator.status(state)))
         return
 
-    if args.freeze or args.unfreeze or args.confirm_takeover:
+    if args.freeze or args.unfreeze or args.force_unfreeze:
         from alternative_fabric_manager.ha import lease as lease_mod
         from alternative_fabric_manager.ha import operator
 
@@ -140,11 +141,14 @@ def main(argv=None):
                     sys.exit(
                         "alternative-fabric-manager: the leader hasn't acknowledged "
                         "the unfreeze; no takeover until it does, its node's stop "
-                        "is verified, or --confirm-takeover"
+                        "is verified, or --force-unfreeze"
                     )
             else:
-                node, term = operator.confirm_takeover(lease)
-                print(f"Confirmed that {node}'s OpenSM, term {term}, can't act")
+                node, term = operator.force_unfreeze(lease)
+                print(
+                    f"Forced the unfreeze: {node}'s OpenSM, term {term}, is taken "
+                    "as stopped, and another instance may take over"
+                )
         except (operator.OperatorError, lease_mod.NotPrimary) as e:
             sys.exit(f"alternative-fabric-manager: {e}")
         return
