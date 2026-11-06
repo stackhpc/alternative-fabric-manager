@@ -300,19 +300,29 @@ def test_an_effect_swept_by_the_deadline_completes(manager, fabric, monkeypatch)
     monkeypatch.setattr(manager_mod, "_now", real)
 
 
-def test_a_port_on_a_quarantined_network_is_refused(manager, fabric, monkeypatch):
+def test_a_port_on_a_quarantined_network_waits_for_it(manager, fabric, monkeypatch):
+    # networking-mlnx resends failed objects independently, so a port may
+    # come before its network's next request; a 400 would be final.
     manager.put_network(NETWORK_ID, conftest.network())
     real = partitions.validate
+    broken = [True]
 
     def validate(content, *args, **kwargs):
-        if f"net-{NETWORK_ID}" in content:
+        if broken[0] and f"net-{NETWORK_ID}" in content:
             raise partitions.InvalidPartitions("bad network", pkeys={0x64})
         return real(content, *args, **kwargs)
 
     monkeypatch.setattr(partitions, "validate", validate)
     manager.reconcile()
-    with pytest.raises(partitions.InvalidRequest, match="quarantined"):
-        manager.put_port(PORT_ID, conftest.port())
+    port = manager.put_port(PORT_ID, conftest.port())
+    manager.reconcile()
+    assert _status(manager, port) == db.JobStatus.PENDING
+    assert "quarantined" in manager.get_job(port).error
+
+    broken[0] = False
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    assert _status(manager, port) == db.JobStatus.COMPLETED
 
 
 def _reject_guid(manager, fabric, times=None):
@@ -527,3 +537,88 @@ def test_a_timed_out_wait_is_dropped(manager, fabric):
     manager.reconcile()
     with manager.sessionmaker() as session:
         assert session.get(db.Network, OTHER) is None
+
+
+def test_a_waiting_guid_change_doesnt_complete_on_the_old_guid(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.put_port(PORT_ID, conftest.port())
+    holder = "20:12:34:56:00:00:00:00:02"
+    manager.put_port(OTHER_PORT, conftest.port(OTHER_PORT, OTHER, client_id=holder))
+    manager.reconcile()
+    # The port takes the GUID that the other port, whose deletion is late,
+    # still holds.
+    job = manager.put_port(PORT_ID, conftest.port(client_id=holder))
+    manager.reconcile()
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    manager.delete_port(OTHER_PORT)
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+    assert manager.get_job(job).error == ""
+
+
+def test_a_port_on_a_network_whose_wait_ended_is_refused(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    with manager.sessionmaker() as session:
+        session.get(db.Job, created).deadline = datetime.datetime(
+            2000, 1, 1, tzinfo=datetime.timezone.utc
+        )
+        session.commit()
+    assert _status(manager, created) == db.JobStatus.FAILED
+    with pytest.raises(partitions.InvalidRequest, match="no partition"):
+        manager.put_port(PORT_ID, conftest.port(network_id=OTHER))
+
+
+def test_ports_waiting_on_a_dropped_network_fail(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    port = manager.put_port(PORT_ID, conftest.port(network_id=OTHER))
+    with manager.sessionmaker() as session:
+        session.get(db.Job, created).deadline = datetime.datetime(
+            2000, 1, 1, tzinfo=datetime.timezone.utc
+        )
+        session.commit()
+    manager.reconcile()
+    job = manager.get_job(port)
+    assert job.status == db.JobStatus.FAILED
+    assert "ended unapplied" in job.error
+
+
+def test_an_applied_wait_gets_a_new_deadline(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+    with manager.sessionmaker() as session:
+        session.get(db.Job, created).deadline = soon
+        session.commit()
+    manager.delete_network(NETWORK_ID)
+    manager.retry_deferred()
+    with manager.sessionmaker() as session:
+        deadline = session.get(db.Job, created).deadline
+    assert deadline.replace(tzinfo=datetime.timezone.utc) > soon + datetime.timedelta(
+        seconds=60
+    )
+
+
+def test_a_waiting_ports_effect_has_its_networks_pkey_when_applied(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.put_network(OTHER, conftest.network(OTHER, 100))
+    port = manager.put_port(PORT_ID, conftest.port(network_id=OTHER))
+    # The waiting network is sent again with another VLAN, before the
+    # holder of the first is deleted.
+    manager.put_network(OTHER, conftest.network(OTHER, 300))
+    manager.reconcile()
+    assert _status(manager, port) == db.JobStatus.COMPLETED
+    with manager.sessionmaker() as session:
+        assert effects.loads(session.get(db.Job, port).effect)["pkey"] == 300
+
+
+def test_jobs_wait_while_opensm_isnt_master(manager, fabric):
+    fabric.fabric_result = _fabric(sms=((OWN, 2), (0x1234, 1)))
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    with manager.sessionmaker() as session:
+        assert "isn't master" in session.get(db.Applied, 1).check_detail

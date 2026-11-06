@@ -166,6 +166,15 @@ class Manager:
         session.flush()
 
     @staticmethod
+    def _waiting(session, kind, object_id):
+        """An object's deferred request, if its job is still open"""
+        row = session.get(db.Deferred, (kind, object_id))
+        if row is None:
+            return None
+        job = session.get(db.Job, row.job_id)
+        return row if job is not None and job.status in OPEN else None
+
+    @staticmethod
     def _network_blocked(session, network_id, values):
         """Why a network's request must wait, if it must"""
         pkey = values["pkey"]
@@ -193,8 +202,16 @@ class Manager:
     @staticmethod
     def _port_blocked(session, port_id, values):
         """Why a port's request must wait, if it must"""
-        if session.get(db.Network, values["network_id"]) is None:
-            return f"network {values['network_id']} is waiting"
+        network_id = values["network_id"]
+        if session.get(db.Network, network_id) is None:
+            return f"network {network_id} is waiting"
+        quarantined = session.get(db.Quarantine, ("network", network_id))
+        if quarantined is not None:
+            # It would be left out of the file with its network. A network's
+            # next request releases it, and networking-mlnx resends each
+            # failed object on its own, so its ports may come first: wait,
+            # since a 400 would be final.
+            return f"network {network_id} is quarantined: {quarantined.reason}"
         other = session.scalar(
             sa.select(db.Port).where(
                 db.Port.guid == values["guid"], db.Port.id != port_id
@@ -307,20 +324,13 @@ class Manager:
         }
         with self._lock, self.sessionmaker() as session:
             network = session.get(db.Network, network_id)
-            waiting_network = session.get(db.Deferred, ("network", network_id))
+            waiting_network = self._waiting(session, "network", network_id)
             if network is None and waiting_network is None:
                 # The network was never sent, or its request failed. Fail
                 # rather than let the port become ACTIVE outside its
                 # partition.
                 raise partitions.InvalidRequest(
                     f"Port {port_id} is on network {network_id}, which has no partition"
-                )
-            quarantined = session.get(db.Quarantine, ("network", network_id))
-            if quarantined is not None:
-                # It would be left out of the file with its network.
-                raise partitions.InvalidRequest(
-                    f"Port {port_id} is on network {network_id}, which is "
-                    f"quarantined: {quarantined.reason}"
                 )
             if network is not None:
                 pkey = network.pkey
@@ -367,33 +377,69 @@ class Manager:
 
     def retry_deferred(self):
         """Apply the deferred requests that no longer have to wait, oldest
-        first; drop those whose jobs have ended"""
+        first, until none can be; drop those whose jobs have ended, and the
+        ports that waited on a dropped network"""
         with self._lock, self.sessionmaker() as session:
-            rows = list(
-                session.scalars(sa.select(db.Deferred).order_by(db.Deferred.job_id))
-            )
-            for row in rows:
-                job = session.get(db.Job, row.job_id)
-                if job is None or job.status not in OPEN:
-                    session.delete(row)
-                    continue
-                values = json.loads(row.data)
-                if row.kind == "network":
-                    blocked = self._network_blocked(session, row.object_id, values)
-                else:
-                    blocked = self._port_blocked(session, row.object_id, values)
-                if blocked:
-                    continue
-                LOG.info("Applying the waiting %s %s", job.operation, row.object_id)
-                job.generation = self._bump(session)
-                job.error = ""
-                if row.kind == "network":
-                    self._set_network(session, row.object_id, values)
-                else:
-                    self._set_port(session, row.object_id, values)
-                session.delete(row)
-                session.flush()
+            progress = True
+            while progress:
+                progress = False
+                rows = list(
+                    session.scalars(sa.select(db.Deferred).order_by(db.Deferred.job_id))
+                )
+                for row in rows:
+                    if self._retry(session, row):
+                        progress = True
             session.commit()
+
+    def _retry(self, session, row):
+        """Apply or drop one deferred request; return whether it changed"""
+        job = session.get(db.Job, row.job_id)
+        if job is not None:
+            self._time_out(job)
+        if job is None or job.status not in OPEN:
+            session.delete(row)
+            if row.kind == "network":
+                for other in list(session.scalars(sa.select(db.Deferred))):
+                    if (
+                        other.kind == "port"
+                        and json.loads(other.data)["network_id"] == row.object_id
+                    ):
+                        self._supersede(
+                            session,
+                            "port",
+                            other.object_id,
+                            f"Network {row.object_id}'s request ended unapplied",
+                        )
+            session.flush()
+            return True
+        values = json.loads(row.data)
+        if row.kind == "network":
+            blocked = self._network_blocked(session, row.object_id, values)
+        else:
+            blocked = self._port_blocked(session, row.object_id, values)
+        if blocked:
+            return False
+        LOG.info("Applying the waiting %s %s", job.operation, row.object_id)
+        job.generation = self._bump(session)
+        job.error = ""
+        # Its wait isn't OpenSM's time to apply it.
+        job.deadline = _now() + datetime.timedelta(seconds=self.config.job_timeout)
+        if row.kind == "network":
+            self._set_network(session, row.object_id, values)
+        else:
+            self._set_port(session, row.object_id, values)
+            # Its network's pkey is what it is now, not when the port waited.
+            pkey = session.get(db.Network, values["network_id"]).pkey
+            job.effect = effects.dumps(
+                effects.port_present(
+                    row.object_id,
+                    self.config.flat_pkey if pkey is None else pkey,
+                    values["guid"],
+                )
+            )
+        session.delete(row)
+        session.flush()
+        return True
 
     def get_job(self, job_id):
         with self._lock, self.sessionmaker() as session:
@@ -606,6 +652,7 @@ class Manager:
                     )
                     return content, generation, attribution
                 except partitions.InvalidPartitions as e:
+                    e.generation = generation
                     culprits = [
                         ("network", n.id) for n in networks if n.pkey in e.pkeys
                     ]
@@ -615,6 +662,7 @@ class Manager:
                     # Each round leaves out at least one more object, so
                     # this ends.
                     if not self._quarantine(session, culprits, str(e), generation):
+                        e.generation = generation
                         raise
                     session.commit()
 
@@ -768,7 +816,10 @@ class Manager:
         errors = set(json.loads(applied.pkey_errors or "[]")) if applied else set()
         if not errors:
             return False
+        waiting = set(session.scalars(sa.select(db.Deferred.job_id)))
         for job in session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN))):
+            if job.id in waiting:
+                continue
             if UNATTRIBUTED in errors:
                 return True
             if errors & set(effects.loads(job.effect).get("guids", [])):
@@ -793,7 +844,7 @@ class Manager:
             try:
                 content, generation, attribution = self._render()
             except partitions.InvalidPartitions as e:
-                self._unattributable(str(e), self._generation())
+                self._unattributable(str(e), getattr(e, "generation", None) or 0)
                 self._restore()
                 return
             stamped = self._stamp(content)
@@ -823,11 +874,6 @@ class Manager:
         # Leave the file as it is: OpenSM may have applied it, the next sync
         # tries again, and the jobs fail at their deadlines.
         LOG.error("Failed to apply the partitions: %s", error)
-
-    def _generation(self):
-        with self._lock, self.sessionmaker() as session:
-            state = session.get(db.State, GENERATION)
-            return state.value if state is not None else 0
 
     def _quarantine_line(self, error, attribution, generation):
         """Quarantine the objects of a line OpenSM couldn't parse that changed
@@ -935,6 +981,14 @@ class Manager:
         for guid, state in others:
             LOG.warning("Another subnet manager, 0x%016x, is in state %d", guid, state)
         masters = [guid for guid, state in others if state == 3]
+        ours = [state for guid, state in fabric.sms if guid in fabric.own_guids]
+        if 3 not in ours:
+            # Jobs mustn't complete on partitions that no master applied.
+            return False, (
+                "OpenSM isn't master"
+                if ours
+                else "The SA has no record of OpenSM's own subnet manager"
+            )
         missing = expected - fabric.switches
         if not expected:
             return False, "No expected switches: confirm them with --confirm-switches"
@@ -1000,8 +1054,12 @@ class Manager:
             attribution = json.loads(applied.attribution or "{}")
             pkey_errors = set(json.loads(applied.pkey_errors or "[]"))
             ready = UNATTRIBUTED not in pkey_errors
+        waiting = set(session.scalars(sa.select(db.Deferred.job_id)))
         for job in jobs:
-            if ready and self._holds(job, applied, attribution, pkey_errors):
+            if job.id in waiting:
+                # Not applied yet, whatever the file holds for its object
+                self._time_out(job)
+            elif ready and self._holds(job, applied, attribution, pkey_errors):
                 job.status = db.JobStatus.COMPLETED
                 job.finished_at = _now()
             else:

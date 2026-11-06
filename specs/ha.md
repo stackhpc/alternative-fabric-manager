@@ -73,7 +73,7 @@ checks this.
 | `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), and when leadership last moved |
-| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs and the switch ports they are cabled to (the static map), its fencing state and fence record, its fencing SSH settings, and its optional BMC settings |
+| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs and the switch ports they are cabled to (the static map), its fencing state and fence record, and its fencing SSH settings |
 | `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
@@ -84,7 +84,11 @@ deleted network's VLAN, or a port taking over a deleted port's GUID, can
 arrive before the deletion. Such a request is not refused, which
 networking-mlnx would take as final: its job is created at once, and the
 request is applied when the deletion arrives, or its job fails at its
-deadline. A later request for the same object supersedes it.
+deadline. A later request for the same object supersedes it. A port on a
+quarantined network waits in the same way, until the network's next request
+releases it. A genuine clash, such as one VLAN on two physical networks,
+therefore fails at the deadline rather than at once, and networking-mlnx
+retries it until an operator resolves it.
 
 A request's transaction starts by bumping the generation, with
 `UPDATE state SET generation = generation + 1`, which locks the row. Only
@@ -382,8 +386,7 @@ HA mode refuses to start unless:
 
 - M_Key protection is on, at protection level 1 or more, so that only the
   managers can disable switch ports;
-- every node has the container-runtime agent and its static map
-  configured, or `[ha] fencing = manual` is set, which makes every takeover
+- every node has the fencing SSH script and its static map configured, or `[ha] fencing = manual` is set, which makes every takeover
   wait for an operator.
 
 The keys are then in Galera and its backups, as well as in OpenSM's files
@@ -729,7 +732,13 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 
 ## Future improvements
 
-- Optional BMC power fencing, as step 4 of the ladder in Fencing.
+- Optional BMC power fencing, as step 4 of the ladder in Fencing. It also
+  needs: BMC settings in the `nodes` table; a check at startup that every
+  node with `power_fencing` has them; a re-check every `check_interval`
+  that a power-fenced node stays off, since a BMC's power-restore policy
+  can turn it on; and unfencing, in which the operator powers the node on,
+  its manager registers as in Unfencing, and the leader clears the fence
+  record once step 2's `status` shows no OpenSM, with no ports to enable.
 
 ## Open questions
 
