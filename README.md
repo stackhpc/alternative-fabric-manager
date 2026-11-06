@@ -141,8 +141,9 @@ uv run pytest
 
 ## Limitations
 
-- One OpenSM, on the same host. High availability is designed in
-  [specs/ha.md](specs/ha.md).
+- High availability, with `[ha] ha = true`, is described in
+  [specs/ha.md](specs/ha.md), with its known limitations, and deploying it
+  with Kayobe in [docs/kayobe.md](docs/kayobe.md).
 - A job that fails leaves its change in the recorded state, so the next
   change that applies also applies it.
 
@@ -151,7 +152,8 @@ uv run pytest
 GitHub Actions publishes multi-architecture images to
 `ghcr.io/stackhpc/alternative-fabric-manager`. Release images are published
 from immutable Git tags in the form `<major>.<minor>.<patch>`, for example
-`0.1.0`. Update the project version before publishing a new release.
+`0.1.0`. The **Release** workflow bumps the version, tags it, drafts the
+release and builds its image: see [docs/releasing.md](docs/releasing.md).
 
 Every build also receives an immutable `sha-<commit>` tag and a
 `build-<run-id>-<attempt>` tag. The latter distinguishes rebuilds of the
