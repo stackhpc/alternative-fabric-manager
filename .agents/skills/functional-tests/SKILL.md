@@ -16,9 +16,9 @@ the test if two fake SMs are ever master at once.
 
 ```sh
 cd /opt/stack/alternative-fabric-manager
-rm -rf "$CLAUDE_JOB_DIR/tmp/ft"   # or any scratch dir
+rm -rf "${SCRATCH:-/tmp/afm}/ft"   # SCRATCH: any scratch directory
 AFM_FUNCTIONAL=1 timeout 2400 uv run pytest -q tests/functional/test_failover.py \
-  --basetemp="$CLAUDE_JOB_DIR/tmp/ft"
+  --basetemp="${SCRATCH:-/tmp/afm}/ft"
 ```
 
 - Needs Docker; `AFM_DOCKER` (default `sudo docker`) is the command. The
@@ -35,7 +35,7 @@ registry), and `state-<n>/` (the watchdog's lease and requests). A merged
 timeline usually explains a failure:
 
 ```sh
-d=$(ls -d "$CLAUDE_JOB_DIR"/tmp/ft/<test-prefix>*/ | head -1)
+d=$(ls -d "${SCRATCH:-/tmp/afm}"/ft/<test-prefix>*/ | head -1)
 grep -h -E "WARNING|ERROR|watchdog" "$d"/instance-*.log \
   | grep -v "Deadlock\|alembic\|Duplicate" | sort | cut -c1-200
 ```

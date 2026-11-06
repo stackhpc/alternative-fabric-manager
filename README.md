@@ -57,7 +57,7 @@ stops.
 
 ```sh
 docker build -t alternative-fabric-manager .
-docker run -d --name alternative-fabric-manager --restart unless-stopped \
+docker run -d --init --name alternative-fabric-manager --restart unless-stopped \
   --network host \
   -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
   -v /etc/opensm:/etc/opensm \
@@ -66,11 +66,23 @@ docker run -d --name alternative-fabric-manager --restart unless-stopped \
   alternative-fabric-manager
 ```
 
-Stop any other OpenSM on the host first: the manager removes any container
-called as `[opensm] container` says, `opensm` by default, and starts its own.
-The manager's container must be called as `[opensm] manager_container` says,
-`alternative-fabric-manager` by default. The Docker socket lets the manager start OpenSM and read its log,
-so treat the manager as root on its host.
+Before you start it:
+
+- **Stop any other subnet manager** on the host, such as a distribution's
+  `opensm` service, and make sure none runs elsewhere on the fabric. The
+  manager runs its own OpenSM, in a container named by `[opensm] container`
+  (`opensm` by default), and replaces any existing container of that name.
+- **Name the manager's container** as `[opensm] manager_container` says
+  (`alternative-fabric-manager` by default): OpenSM's container joins its
+  PID namespace, which is what makes OpenSM stop with the manager.
+- **Treat the manager as root on its host.** It uses the Docker socket to
+  start OpenSM's container and read its log, and whatever can use that
+  socket can control the host.
+
+`--init` gives the container an init process, which reaps OpenSM's processes
+when OpenSM stops: they belong to the manager's PID namespace. For HA mode,
+which needs more mounts and a server database, see
+[docs/kayobe.md](docs/kayobe.md) and [specs/ha.md](specs/ha.md).
 
 Copy [etc/afm.conf.sample](etc/afm.conf.sample) to
 `/etc/alternative-fabric-manager/afm.conf` and set a token. OpenSM's options

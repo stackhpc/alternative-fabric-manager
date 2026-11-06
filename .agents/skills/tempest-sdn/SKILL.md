@@ -1,6 +1,6 @@
 ---
 name: tempest-sdn
-description: Run the networking-mlnx tempest plugin (API, InfiniBand port and pkey-isolation scenario tests) against DevStack with SDN sync to AFM, and read the results from Neutron's and AFM's side. Use to validate an AFM deployment on the infiniband-testing host end to end.
+description: Run the networking-mlnx tempest plugin (API, InfiniBand port and pkey-isolation scenario tests) against DevStack with SDN sync to AFM, and read the results from Neutron's and AFM's side. Use to validate an AFM deployment on a DevStack host end to end.
 ---
 
 # SDN tempest against AFM
@@ -13,8 +13,8 @@ one network communicate and guests on different networks can't.
 ## Run
 
 ```sh
-T="$CLAUDE_JOB_DIR/tmp/tempest"   # holds tempest-sdn.conf
-cd /opt/stack/tempest && source /home/cloud-user/devstack/openrc admin admin >/dev/null
+T="${SCRATCH:-/tmp/afm}/tempest"   # holds tempest-sdn.conf: tempest.conf with the plugin's [networking_mlnx] options
+cd /opt/stack/tempest && source <devstack>/openrc admin admin >/dev/null
 timeout 7200 .tox/tempest/bin/tempest run --serial --config-file "$T/tempest-sdn.conf" \
   --regex networking_mlnx_tempest_plugin > "$T/run.log" 2>&1
 grep -E "^(Totals| - Passed| - Skipped| - Failed)|\.\.\. FAILED" "$T/run.log"
@@ -24,9 +24,10 @@ It takes 10-20 minutes; run it in the background. After changing the
 plugin, reinstall it into tempest's venv first:
 `/opt/stack/tempest/.tox/tempest/bin/pip install -q --no-deps --force-reinstall <plugin checkout>`.
 
-Expected: 16 passed, 4 skipped. The skips are deliberate on this host: no
-unsynced physical network, `mlnx_infiniband` binds VLAN ports, SDN restricts
-client IDs, and live migration needs a second host.
+Expected on a single compute host with SDN sync: 16 passed, 4 skipped. The
+skips are deliberate: no unsynced physical network configured,
+`mlnx_infiniband` binds VLAN ports, SDN restricts client IDs, and live
+migration needs a second host.
 
 ## Read a failure
 
