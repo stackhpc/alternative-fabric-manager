@@ -47,6 +47,7 @@ class Role(str, enum.Enum):
     CANDIDATE = "candidate"
     TAKING_OVER = "taking over"
     LEADER = "leader"
+    STOPPING = "stopping"
     STOPPED = "stopped"
 
 
@@ -84,6 +85,7 @@ class Coordinator:
         self._takeover_started = None
         self._renewals_stopped = False
         self._opensm_gone = False
+        self._restarting = False
         manager.on_opensm_stopped = self._opensm_stopped
 
     # Lifecycle
@@ -137,15 +139,19 @@ class Coordinator:
     def shutdown(self):
         """At SIGTERM: step down within shutdown_timeout, then stop"""
         deadline = _now() + self.config.shutdown_timeout
+        previous = self.role
+        # /healthz fails from now, so that HAProxy stops sending requests.
+        self.role = Role.STOPPING
         self._stop.set()
         with self._lock:
-            if self.role in (Role.LEADER, Role.TAKING_OVER) and not self.frozen:
+            instance = self.uuid
+            if previous in (Role.LEADER, Role.TAKING_OVER) and not self.frozen:
                 self._step_down("shutting down", deadline=deadline)
             else:
-                self.manager.halt()
                 self.runner.stop()
+                self.manager.halt()
             try:
-                self.lease.mark_stopped(self.node, self.uuid)
+                self.lease.mark_stopped(self.node, instance)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("Can't mark this node stopped: %s", e)
             self.role = Role.STOPPED
@@ -165,6 +171,9 @@ class Coordinator:
             self._stop.wait(max(0.0, self.config.ha_period - (_now() - started)))
 
     def _tick(self):
+        # Before any database call, which may block for its timeout
+        if self.role in (Role.LEADER, Role.TAKING_OVER) and self._self_stop_due():
+            return
         try:
             self.lease.heartbeat(self.node, self.uuid, self._reach())
         except Exception as e:  # noqa: BLE001
@@ -208,7 +217,9 @@ class Coordinator:
             self.t0 + self.config.self_stop_timeout + self.config.watchdog_timeout,
         )
 
-    def _lead(self):
+    def _self_stop_due(self):
+        """Self-stop if no renewal has succeeded for T_self; return whether
+        it did"""
         now = _now()
         if (
             not self.held
@@ -219,6 +230,12 @@ class Coordinator:
                 "No renewal for %.1f s: stopping OpenSM (self-stop)", now - self.t0
             )
             self._step_down("self-stop", release=False)
+            return True
+        return False
+
+    def _lead(self):
+        now = _now()
+        if self._self_stop_due():
             return
         if not self._loops_alive():
             if not self.held:
@@ -264,14 +281,26 @@ class Coordinator:
             state.holder_uuid != self.uuid
             or state.term != self.term
             or state.freeze_state not in ("frozen", "ending")
+            or self._restarting
         ):
             return
         self._opensm_gone = False
+        self._restarting = True
         LOG.error("OpenSM stopped while frozen: starting it again here")
+        # The applier stops while OpenSM starts, so that it neither reports
+        # OpenSM gone again nor races the start; start() restarts it.
+        self.manager.halt()
         self.runner.prepare(self.uuid, self.term, None)
-        threading.Thread(
-            target=self.manager._start_opensm, name="restart", daemon=True
-        ).start()
+
+        def restart():
+            try:
+                self.manager.start()
+            except Exception:
+                LOG.exception("Restarting OpenSM while frozen failed")
+            finally:
+                self._restarting = False
+
+        threading.Thread(target=restart, name="restart", daemon=True).start()
 
     def _freeze_step(self):
         try:
@@ -280,21 +309,25 @@ class Coordinator:
             LOG.warning("Can't read the lease: %s", e)
             return
         self.frozen = state.freeze_state in ("frozen", "ending")
-        # Hold only once the acknowledgement reads back as committed.
-        if (
-            state.freeze_state == "requested"
-            and not self.held
-            and self.lease.acknowledge_freeze(self.uuid, self.term)
-        ):
-            if self.lease.read().freeze_state == "frozen":
-                LOG.warning("Frozen: holding OpenSM on this node")
-                self.held = True
-                self.frozen = True
-                if self.opensm_started:
-                    self.runner.write_lease(self.uuid, self.term, None)
-        elif state.freeze_state == "ending" and self.held:
-            # In this order: a deadline for the watchdog, self-stop timing,
-            # a renewal, then the acknowledgement (see Freeze).
+        ours = state.holder_uuid == self.uuid and state.term == self.term
+        if not ours:
+            return
+        if state.freeze_state == "requested" and not self.held:
+            # Hold only once a read shows the freeze committed, below.
+            self.lease.acknowledge_freeze(self.uuid, self.term)
+            state = self.lease.read()
+        if state.freeze_state == "frozen" and not self.held:
+            # Whoever's acknowledgement committed it, and whether or not ours
+            # read back at the time, a committed freeze of our lease holds.
+            LOG.warning("Frozen: holding OpenSM on this node")
+            self.held = True
+            self.frozen = True
+            if self.opensm_started:
+                self.runner.write_lease(self.uuid, self.term, None)
+        elif state.freeze_state == "ending":
+            # In this order, and again until it commits: a deadline for the
+            # watchdog, self-stop timing, a renewal, then the acknowledgement
+            # (see Freeze).
             now = _now()
             if self.opensm_started:
                 self.runner.write_lease(
@@ -315,6 +348,7 @@ class Coordinator:
         self.frozen = held
         self.role = Role.LEADER if held else Role.TAKING_OVER
         self._renewals_stopped = False
+        self._opensm_gone = False
 
     # Watching
 
@@ -339,9 +373,17 @@ class Coordinator:
         )
         if not expired or not self._eligible():
             return
-        term = self.lease.acquire(
-            self.node, self.uuid, state.term, state.counter, state.released
-        )
+        try:
+            term = self.lease.acquire(
+                self.node, self.uuid, state.term, state.counter, state.released
+            )
+        except Exception as e:  # noqa: BLE001
+            # The outcome is unknown, so it counts as taken: this instance may
+            # be in the target set. Make sure no OpenSM of ours runs, and come
+            # back as a new instance, whose verified stop covers the old one.
+            LOG.warning("Taking the lease had an unknown outcome: %s", e)
+            self._abandon()
+            return
         if term is None:
             return
         LOG.warning(
@@ -380,33 +422,13 @@ class Coordinator:
                 with self._lock:
                     if self.term != term or self.role != Role.TAKING_OVER:
                         return
-                others = [
-                    entry for entry in self.lease.targets() if entry[1] != self.uuid
-                ]
-                if not others:
-                    break
-                for node, instance, _entry_term in others:
-                    if self.lease.remove_target(
-                        self.uuid, term, node, instance, "verified"
-                    ):
-                        LOG.info("%s's OpenSM is verified stopped", node)
-                        continue
-                    if self.config.fence_ask and (node, instance) not in asked:
-                        asked.add((node, instance))
-                        self._ask(node)
-                    if _now() - taken_at < self.config.watchdog_timeout:
-                        continue
-                    if self.config.manual_takeover:
-                        state = self.lease.read()
-                        if (
-                            state.confirmed_term != term - 1
-                            and state.confirmed_term != term
-                        ):
-                            continue
-                    if self.lease.remove_target(
-                        self.uuid, term, node, instance, "unconfirmed"
-                    ):
-                        LOG.warning("%s leaves the target set unconfirmed", node)
+                try:
+                    if not self._take_over_step(term, taken_at, asked):
+                        break
+                except Exception as e:  # noqa: BLE001
+                    # A database blip: self-stop bounds safety, so retry
+                    # rather than give the lease up and start again.
+                    LOG.warning("Takeover step failed, retrying: %s", e)
                 self._takeover_started = _now()
                 self._stop.wait(self.config.ha_period)
             with self._lock:
@@ -429,6 +451,31 @@ class Coordinator:
                     self._step_down("the takeover failed")
         finally:
             self._takeover_started = None
+
+    def _take_over_step(self, term, taken_at, asked):
+        """One pass over the other targets; return whether any remain"""
+        others = [entry for entry in self.lease.targets() if entry[1] != self.uuid]
+        if not others:
+            return False
+        confirmed = None
+        for node, instance, entry_term in others:
+            if self.lease.remove_target(self.uuid, term, node, instance, "verified"):
+                LOG.info("%s's OpenSM is verified stopped", node)
+                continue
+            if self.config.fence_ask and (node, instance) not in asked:
+                asked.add((node, instance))
+                self._ask(node)
+            if _now() - taken_at < self.config.watchdog_timeout:
+                continue
+            if self.config.manual_takeover:
+                # Only an operator's confirmation for that entry's own term
+                if confirmed is None:
+                    confirmed = self.lease.read().confirmed_term
+                if confirmed != entry_term:
+                    continue
+            if self.lease.remove_target(self.uuid, term, node, instance, "unconfirmed"):
+                LOG.warning("%s leaves the target set unconfirmed", node)
+        return True
 
     def _ask(self, node):
         try:
@@ -460,19 +507,36 @@ class Coordinator:
         step-down waits for the applier to finish"""
         self._opensm_gone = True
 
+    def _abandon(self):
+        """Come back as a new instance, having made sure no OpenSM of ours
+        runs, without releasing anything"""
+        self.runner.stop()
+        if not self.runner.verify_stopped():
+            LOG.error("Can't verify that OpenSM stopped: not a candidate")
+            self._renewals_stopped = True
+            return
+        self.uuid = str(uuid.uuid4())
+        self._seen = None
+        self._seen_since = None
+        self.role = Role.STARTING
+        threading.Thread(target=self._rejoin, daemon=True).start()
+
     def _step_down(self, why, release=True, deadline=None):
-        """Stop OpenSM, verify it stopped, and release the lease if asked"""
+        """Stop OpenSM, verify it stopped, and release the lease if asked,
+        and if the deadline, at SIGTERM, allows"""
         LOG.warning("Stepping down: %s", why)
         term = self.term
-        self.manager.halt()
+        # OpenSM first: the applier may take up to its bound to finish.
         self.runner.stop()
+        self.manager.halt()
         self.opensm_started = False
+        self._opensm_gone = False
         verified = self.runner.verify_stopped()
         if not verified:
             LOG.error("Can't verify that OpenSM stopped: no more renewals")
             self._renewals_stopped = True
             return
-        if release and term is not None:
+        if release and term is not None and (deadline is None or _now() < deadline):
             try:
                 self.lease.release(self.node, self.uuid, term)
             except Exception as e:  # noqa: BLE001
@@ -484,6 +548,7 @@ class Coordinator:
         self.held = False
         self._seen = None
         self._seen_since = None
-        self.role = Role.STARTING if not self._stop.is_set() else Role.STOPPED
+        if not self._stop.is_set():
+            self.role = Role.STARTING
         if not self._stop.is_set():
             threading.Thread(target=self._rejoin, daemon=True).start()

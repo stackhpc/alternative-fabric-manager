@@ -203,14 +203,27 @@ class GaleraLease:
                         db.TargetEntry.instance_uuid == lease.holder_uuid,
                     )
                 )
+            ending = lease.freeze_state == "ending"
+            old_node, old_uuid = lease.holder_node, lease.holder_uuid
             lease.holder_node = node
             lease.holder_uuid = instance_uuid
             lease.term += 1
             lease.counter += 1
             lease.released = False
             lease.moved_at = now
+            if ending:
+                # Allowed by a verified stop or a confirmation of the frozen
+                # holder: its held entry leaves in this takeover.
+                session.execute(
+                    sa.delete(db.TargetEntry).where(
+                        db.TargetEntry.node == old_node,
+                        db.TargetEntry.instance_uuid == old_uuid,
+                    )
+                )
             lease.freeze_state = ""
             lease.freeze_request_deadline = None
+            # A confirmation is used up by the takeover that follows it.
+            lease.confirmed_term = 0
             term = lease.term
             stop_term = own.verified_stop_term if own is not None else -1
             stop_uuid = own.verified_stop_uuid if own is not None else ""
@@ -414,12 +427,15 @@ class GaleraLease:
             return True
 
     def withdraw_freeze(self):
+        """Withdraw a pending request; return the freeze's state after"""
         with self._session() as session:
             lease = self._row(session, lock=True)
             if lease.freeze_state == "requested":
                 lease.freeze_state = ""
                 lease.freeze_request_deadline = None
+            state = lease.freeze_state
             session.commit()
+            return state
 
     def request_unfreeze(self):
         with self._session() as session:
@@ -454,9 +470,17 @@ class GaleraLease:
         """An operator confirms that the holder of term's OpenSM can't act"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.term != term or lease.freeze_state in ("requested", "frozen"):
-                # Confirmations count for a manual takeover, or once a freeze
-                # is ending; never for a freeze still in force.
+            if lease.freeze_state in ("requested", "frozen"):
+                # Never for a freeze still in force
+                session.rollback()
+                return False
+            entry_terms = set(session.scalars(sa.select(db.TargetEntry.term)))
+            # The holder's own term, while a freeze ends, or the term of a
+            # target entry a takeover waits for, as with manual_takeover
+            if not (
+                (term == lease.term and lease.freeze_state == "ending")
+                or term in entry_terms
+            ):
                 session.rollback()
                 return False
             lease.confirmed_term = term

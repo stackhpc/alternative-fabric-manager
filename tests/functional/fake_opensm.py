@@ -18,7 +18,13 @@ def main():
     parser.add_argument("--fabric", required=True)
     parser.add_argument("--node", required=True)
     parser.add_argument("--guid", required=True)
+    # Like OpenSM's first sweep: master only after a while
+    parser.add_argument("--start-delay", type=float, default=0.0)
+    # Like a frozen SM, which can't honour DISABLE: so the tests' monitor
+    # sees any OpenSM that stays alive when it shouldn't
+    parser.add_argument("--ignore-ask", action="store_true")
     args = parser.parse_args()
+    time.sleep(args.start_delay)
     pid = os.getpid()
     registry = os.path.join(args.fabric, f"sm-{pid}.json")
     sweeps = os.path.join(args.fabric, f"sweeps-{pid}")
@@ -44,7 +50,7 @@ def main():
     write(sweeps, "0")
     try:
         while True:
-            if os.path.exists(asked):
+            if os.path.exists(asked) and not args.ignore_ask:
                 write(
                     registry,
                     json.dumps(

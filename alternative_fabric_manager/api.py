@@ -131,7 +131,7 @@ def create_app(config, manager, coordinator=None):
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():
-        if coordinator is not None and coordinator.role == "stopped":
+        if coordinator is not None and coordinator.role in ("stopping", "stopped"):
             # Shutting down: HAProxy stops sending requests here.
             raise fastapi.HTTPException(status_code=503, detail="Stopping")
         return {"status": "ok"}

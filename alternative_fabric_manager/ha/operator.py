@@ -43,7 +43,9 @@ def freeze(config, lease, sessionmaker):
         if lease.read().freeze_state == "frozen":
             return state.holder_node
         time.sleep(config.ha_period / 2)
-    lease.withdraw_freeze()
+    # The acknowledgement may have committed since the last read.
+    if lease.withdraw_freeze() == "frozen":
+        return state.holder_node
     raise OperatorError("The leader didn't acknowledge the freeze")
 
 

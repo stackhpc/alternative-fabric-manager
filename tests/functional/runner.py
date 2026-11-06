@@ -158,6 +158,13 @@ class ProcessRunner:
                 self.node,
                 "--guid",
                 str(self.guid),
+                "--start-delay",
+                os.environ.get("AFM_FAKE_START_DELAY", "1.5"),
+                *(
+                    ["--ignore-ask"]
+                    if os.environ.get("AFM_FAKE_HONOURS_ASK") != "1"
+                    else []
+                ),
             ],
             start_new_session=True,
         )

@@ -67,8 +67,9 @@ def main(argv=None):
         "--confirm-takeover",
         type=int,
         metavar="TERM",
-        help="HA: confirm that the leader of TERM's OpenSM can't act, for a "
-        "manual takeover or one while a freeze ends",
+        help="HA: confirm that the OpenSM of the leader that held TERM can't "
+        "act: for a manual takeover, the term of the leader being replaced; "
+        "while a freeze ends, the frozen term",
     )
     args = parser.parse_args(argv)
 
@@ -94,6 +95,15 @@ def main(argv=None):
         db.make_sessionmaker(config.database_url)
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+
+    if config.ha and not (
+        args.freeze or args.unfreeze or args.confirm_takeover is not None
+    ):
+        # Without the coordinator, each instance would run its own OpenSM.
+        sys.exit(
+            "alternative-fabric-manager: [ha] ha = true isn't supported by this "
+            "command yet: the HA service wiring isn't built"
+        )
 
     if args.freeze or args.unfreeze or args.confirm_takeover is not None:
         from alternative_fabric_manager.ha import lease as lease_mod
