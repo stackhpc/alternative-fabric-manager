@@ -373,10 +373,16 @@ generation G is **Completed** when, in `applied`:
    and the sweep started after a passing check that followed the last
    check to see another master or the leader's OpenSM not master, which
    `applied` records with the sweep, so that every instance, not only the
-   leader, can judge a job.
+   leader, can judge a job. A leader clears the last check before it stops
+   OpenSM; after a crash, other instances can still judge a job on the
+   last sweep for up to `2 × check_interval`, which is safe, since its
+   effect was swept and checked.
 
 Recording a sweep clears the last check, so that a sweep is judged only by
-a check taken after it. A check that sees another master, or the leader's
+a check taken after it. OpenSM's first sweep after it starts, a
+takeover's included, counts as a sweep, unless the last check, in this
+term or the previous one, was contested: then the leader waits for a
+passing check and sweeps again with SIGHUP. A check that sees another master, or the leader's
 OpenSM not master, invalidates the sweep, since the other SM may have set
 pkey tables meanwhile, and could undo a sweep made while it acts: the
 leader makes no sweep while the last check was contested, sweeps again
@@ -539,11 +545,16 @@ cgroup, so pausing the manager's container doesn't pause it.
   of the timeouts of the calls one iteration makes, plus a margin:
   - the **apply loop**, one apply attempt per iteration in HA mode, with
     retries in later iterations: a sweep, 30 s, a fabric check, 5 s, and
-    up to five database calls of 3 s, so `B` is 60 s;
+    up to five database transactions of 3 s, so `B` is 60 s. The HA apply
+    loop must be built to that: at most five transactions and one sweep
+    per iteration, so a re-render after a quarantine, or a rejected line,
+    waits for the next iteration;
   - the **takeover loop**, which runs a takeover and OpenSM's start
     separately from the apply loop: Ask, 5 s, the unconfirmed wait,
     `T_watchdog`, and `start_timeout`, 60 s in HA mode, so `B_takeover` is
-    120 s;
+    120 s. Waits with no bound, for an operator under `manual_takeover`
+    or an unacknowledged unfreeze, poll in iterations of a few seconds
+    each;
   - the lease renewal loop: a call timeout, 3 s.
 
   A call that fails or times out still finishes its iteration. `T_watchdog` must
@@ -593,13 +604,19 @@ moved, until the cluster is unfrozen.
   compare-and-set on the current term, on a Primary component, refused
   unless a leader holds the lease, has no other entry in the target set,
   has OpenSM running, and its last fabric check, in the current term,
-  passed. The cluster is frozen only once the leader acknowledges the
-  request, in the same row, which it does only while it is renewing
-  normally: it then holds (below). If no acknowledgement arrives within
-  `T_self`, the command withdraws the request with a compare-and-set, and
-  the freeze fails. While a request is pending, every takeover's
-  compare-and-set requires it to be absent or withdrawn, and once the
-  cluster is frozen, requires it not to be frozen, so no other instance
+  passed. The request carries a deadline, the database's
+  `UTC_TIMESTAMP()` + `T_self`. The cluster is frozen only once the leader
+  acknowledges the request, in the same row, with a compare-and-set that
+  requires the request to be before its deadline, judged by
+  `UTC_TIMESTAMP()` in that statement, which it does only while it is
+  renewing normally. If no acknowledgement arrives, the command withdraws
+  the request; and whether or not anyone withdraws it, a request past its
+  deadline unacknowledged counts as withdrawn, in the acknowledgement's
+  compare-and-set and in every takeover's alike, so a command that dies
+  can't leave a pending request blocking takeovers. While a request is
+  pending, every takeover's compare-and-set requires it to be withdrawn
+  or past its deadline, and once the cluster is frozen, requires it not
+  to be frozen, so no other instance
   can take over, whatever happens to Galera or the network meanwhile. A
   majority vote among the managers over another channel wouldn't do: a
   candidate outside that majority could still reach Galera's.
@@ -608,8 +625,11 @@ moved, until the cluster is unfrozen.
   leader can renew: a leader that can't reach a Primary component may be
   on the minority side of a partition, so it can't decide to keep its
   OpenSM by itself, and a leader that self-stops never acknowledges.
-- **The leader holds.** Once it has acknowledged, the frozen leader stops
-  timing self-stop, ignores every step-down trigger but SIGTERM, never
+- **The leader holds** only once it has read back, on a Primary component,
+  that its acknowledgement committed; an acknowledgement whose outcome is
+  unknown doesn't count until then, and the leader keeps timing self-stop
+  meanwhile, since the request may have passed its deadline. The frozen
+  leader then stops timing self-stop, ignores every step-down trigger but SIGTERM, never
   releases the lease, and gives its watchdog a held lease, whose deadline
   is the freeze's expiry, if it has one, on the host's monotonic clock,
   plus `T_self`. OpenSM so survives a Galera outage or a hung manager. The
@@ -626,27 +646,32 @@ moved, until the cluster is unfrozen.
   manager may start OpenSM again, after a restart or after OpenSM exits.
   A restarted manager has a new instance UUID: it adopts the frozen lease
   with a compare-and-set that matches the frozen node and term, replaces
-  the instance UUID, and adds its own target-set entry, and only then
-  starts OpenSM, with a start request for the frozen term that carries the
+  the instance UUID, replaces the old instance's target-set entry with
+  its own, and only then starts OpenSM, with a start request for the frozen term that carries the
   held deadline rather than `t0` + `T_self`. Rejoining's removal of the
   watchdog's files doesn't apply to the frozen node while it is frozen.
   With Galera down, it may restart OpenSM from the watchdog's held lease
   only before that lease's deadline, never after the freeze may have
-  ended. If the frozen node itself fails, the fabric has no subnet
+  ended, and it adopts the lease as soon as Galera returns. If the frozen node itself fails, the fabric has no subnet
   manager until an operator unfreezes the cluster: that is what a freeze
   trades.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
   freeze's expiry, read by any instance that reaches a Primary component,
-  marks the freeze as ending. The frozen leader acknowledges it: it renews,
-  gives its watchdog a lease with a deadline again, resumes timing
-  self-stop, and records that in the lease row. Only then is the cluster
+  marks the freeze as ending. The frozen leader acknowledges it, in this
+  order, which is required: it gives its watchdog a lease with a deadline
+  again, resumes timing self-stop, renews, and only then records the
+  acknowledgement in the lease row. Only then is the cluster
   unfrozen, and every candidate restarts its expiry timer from that
   acknowledgement, treating it as a renewal. Until the leader
   acknowledges, no candidate takes over on expiry: a leader that never
   acknowledges, because it is paused, hung, or cut off, leaves the lease
   only through a verified stop of its node, or an operator's confirmation
   that its OpenSM can't act, as with `manual_takeover`; its watchdog's
-  held deadline, if the freeze had an expiry, stops OpenSM meanwhile.
+  held deadline, if the freeze had an expiry, stops OpenSM meanwhile. A
+  takeover while the freeze is ending is a compare-and-set that requires
+  either an operator's confirmation recorded in the lease row, or the
+  frozen node's verified-stop term at least the frozen term, and it
+  clears the freeze in the same statement.
 - **SIGTERM while frozen** stops OpenSM, since the manager is PID 1 of its
   namespace, but doesn't release the lease; the node's manager starts it
   again when it comes back. Shutting the frozen node down for good needs an

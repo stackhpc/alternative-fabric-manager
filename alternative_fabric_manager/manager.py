@@ -592,7 +592,9 @@ class Manager:
                 return
             # A start that the driver saw sweep is a sweep, with its pkey
             # errors; otherwise the next sync sweeps and records it.
-            if report is not None:
+            # Not while another SM may have acted: a sweep then counts only
+            # after a passing check, so the next sync sweeps again.
+            if report is not None and not self._contested_fabric:
                 self._record(stamped, generation, attribution, report)
             return
 
@@ -989,7 +991,12 @@ class Manager:
             ok, detail = False, f"Can't query the fabric: {e}"
         else:
             ok, detail = self._judge(fabric)
-            self._contested_fabric = fabric is not None and self._contested(fabric)
+            # Only a passing check ends a contest; one that fails for another
+            # reason, such as a missing switch, which the other SM may sit
+            # behind, doesn't.
+            self._contested_fabric = (
+                fabric is not None and self._contested(fabric)
+            ) or (self._contested_fabric and not ok)
             if self._contested_fabric:
                 # Another master may have set pkey tables since the last
                 # sweep, so it is no evidence: sweep again, once the check

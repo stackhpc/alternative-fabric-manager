@@ -743,3 +743,39 @@ def test_no_job_completes_while_opensm_isnt_running(manager, fabric):
     manager.check_fabric()
     fabric.is_running = False
     assert _status(manager, job) == db.JobStatus.PENDING
+
+
+def test_a_restart_while_contested_doesnt_count(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    fabric.fabric_result = _fabric(sms=((OWN, 3), (0x1234, 3)))
+    manager.check_fabric()
+    # OpenSM restarts, and its start sweeps, while another SM may act.
+    fabric.start = lambda: SweepReport()
+    manager._start_opensm()
+    fabric.fabric_result = _fabric()
+    manager.check_fabric()
+    manager.evaluate_jobs()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    calls = fabric.calls
+    manager.reconcile()
+    assert fabric.calls == calls + 1
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_only_a_passing_check_ends_a_contest(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    fabric.fabric_result = _fabric(sms=((OWN, 3), (0x1234, 3)))
+    manager.check_fabric()
+    # No other master in view, but a switch is missing: still contested
+    fabric.fabric_result = _fabric(switches=())
+    calls = fabric.calls
+    manager.reconcile()
+    assert fabric.calls == calls
+    fabric.fabric_result = _fabric()
+    manager.reconcile()
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.COMPLETED

@@ -272,6 +272,8 @@ def test_a_pkey_error_with_a_port_guid_names_it():
     report = SweepReport()
     docker_driver._note_pkey_error(report, PKEY_BY_PORT)
     assert 0x0002C90300001235 in report.pkey_errors
+    # The virtual port's own GUID, which is its Neutron port's
+    assert 0x0002C90300005678 in report.pkey_errors
     assert not report.unattributed
 
 
@@ -347,7 +349,7 @@ def test_fabric_parses_the_tools_output():
 
 MAD_PKEY_FAILURES = (
     "sm_mad_ctrl_send_err_cb: ERR 3113: MAD completed in error (IB_TIMEOUT): "
-    "SubnSet(PKeyTable), attr_mod 0x0, TID 0x1234, dest_guid 0x0002c90300001234",
+    "SubnSet(P_KeyTable), attr_mod 0x0, TID 0x1234, dest_guid 0x0002c90300001234",
     "sm_mad_ctrl_rcv_callback: ERR 3119: Set method failed for attribute 0x16 "
     "(PKeyTable)",
 )

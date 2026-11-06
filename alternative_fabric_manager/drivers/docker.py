@@ -72,7 +72,8 @@ _ERR = re.compile(r"ERR ([0-9A-F]{4}):")
 # The port GUIDs some pkey errors name. Most name a port only by its node's
 # description, and 0509 by its node GUID and port number, which isn't the
 # port's GUID; those can't be traced to a port.
-_PORT_GUID = re.compile(r"(?:of port|guid \()\s*0x([0-9a-fA-F]{1,16})")
+# A virtual port's GUID is the one its Neutron port has, so both count.
+_PORT_GUID = re.compile(r"(?:of port|VPort|guid \()\s*0x([0-9a-fA-F]{1,16})")
 _SWITCH_PORT = re.compile(r"switch 0x([0-9a-fA-F]{1,16}) port (\d+)")
 _PARSE_LINE = re.compile(r"PARSE ERROR: line (\d+)")
 POLL_INTERVAL = 0.5
@@ -98,7 +99,8 @@ def _rejected(line):
 # The MAD layer's errors, which a PKeyTable set or get can fail with: they
 # name no port GUID, so they hold every job of the sweep
 MAD_ERROR_CODES = ("3113", "3119", "3120")
-_PKEY_TABLE_ATTR = re.compile(r"PKeyTable|attribute 0x16\b")
+# OpenSM names the attribute P_KeyTable, or V_PKeyTable for a virtual port.
+_PKEY_TABLE_ATTR = re.compile(r"P_?KeyTable|attribute 0x16\b")
 
 
 def _note_pkey_error(report, line):
