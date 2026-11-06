@@ -47,6 +47,8 @@ REACH_CACHE = 10.0
 _PORT_UP = re.compile(r"State:\s*(Initializing|Armed|Active)\b")
 _LINK_UP = re.compile(r"Physical state:\s*LinkUp\b")
 _INFINIBAND = re.compile(r"Link layer:\s*InfiniBand\b")
+# Each port's block of ibstat's output, which has "Port GUID:" lines too
+_PORT_BLOCK = re.compile(r"^\s*(?:CA '|Port \d+:)", re.M)
 # How long the probe may take
 REACH_TIMEOUT = 20
 _SWITCH = re.compile(r"^Switch\s*:\s*0x[0-9a-fA-F]+", re.M)
@@ -216,7 +218,7 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # An InfiniBand port with its link up, in Init or above
         if not any(
             _PORT_UP.search(port) and _LINK_UP.search(port) and _INFINIBAND.search(port)
-            for port in status.split("Port ")[1:]
+            for port in _PORT_BLOCK.split(status)[1:]
         ):
             return None
         return len(_SWITCH.findall(switches))

@@ -149,3 +149,39 @@ def test_the_watchdog_runs_on_the_images_python():
     with open(wd.__file__) as f:
         tree = ast.parse(f.read(), feature_version=(3, 9))
     assert tree
+
+
+# This host's own ibstat, which has a Port GUID line in each port's block
+REAL_IBSTAT = b"""CA 'mlx5_0'
+\tCA type: MT4123
+\tNumber of ports: 1
+\tPort 1:
+\t\tState: Active
+\t\tPhysical state: LinkUp
+\t\tRate: 200
+\t\tBase lid: 1
+\t\tLMC: 0
+\t\tSM lid: 1
+\t\tCapability mask: 0xa651e84a
+\t\tPort GUID: 0x040973ffffc75168
+\t\tLink layer: InfiniBand
+CA 'mlx5_1'
+\tCA type: MT4124
+\tNumber of ports: 1
+\tPort 1:
+\t\tState: Down
+\t\tPhysical state: LinkUp
+\t\tPort GUID: 0xffffffffffffffff
+\t\tLink layer: InfiniBand
+"""
+
+
+def test_reach_reads_a_real_ibstat(driver):
+    driver.client.probe = REAL_IBSTAT + b"===\n" + SWITCHES
+    assert driver.reach() == 1
+
+
+def test_reach_ignores_a_down_port_beside_an_up_one(driver):
+    down_only = REAL_IBSTAT.split(b"CA 'mlx5_1'")[1]
+    driver.client.probe = b"CA 'mlx5_1'" + down_only + b"===\n" + SWITCHES
+    assert driver.reach() is None
