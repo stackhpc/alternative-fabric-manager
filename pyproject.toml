@@ -39,7 +39,7 @@ target-version = "py310"
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106", "S603", "S607"]
+"tests/*" = ["S101", "S105", "S106", "S603", "S607", "SIM105", "S310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -86,13 +86,13 @@ def write_atomically(directory, name, data):
 
 
 def _alive(pid):
+    """Whether a process runs: a zombie, dead but not yet reaped, doesn't"""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
         return False
-    except PermissionError:
-        return True
-    return True
+    return state not in ("Z", "X")
 
 
 def lease_valid(lease, now=None):

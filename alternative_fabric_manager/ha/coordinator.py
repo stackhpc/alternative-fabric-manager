@@ -83,6 +83,7 @@ class Coordinator:
         self._takeover = None
         self._takeover_started = None
         self._renewals_stopped = False
+        self._opensm_gone = False
         manager.on_opensm_stopped = self._opensm_stopped
 
     # Lifecycle
@@ -223,6 +224,17 @@ class Coordinator:
             if not self.held:
                 self._step_down("a loop overran its bound")
             return
+        if self._opensm_gone:
+            self._opensm_gone = False
+            if self.held:
+                LOG.error("OpenSM stopped while frozen: starting it again here")
+                self.runner.prepare(self.uuid, self.term, None)
+                threading.Thread(
+                    target=self.manager._start_opensm, name="restart", daemon=True
+                ).start()
+            else:
+                self._step_down("OpenSM stopped")
+                return
         if self._renewals_stopped:
             return
         try:
@@ -385,7 +397,13 @@ class Coordinator:
                 if self.t0 is None or _now() - self.t0 > self.config.self_stop_timeout:
                     LOG.error("The last renewal is too old to start OpenSM")
                     return
-                self._start_opensm()
+                self._prepare_start()
+            # Outside the lock: the lease thread keeps renewing meanwhile.
+            self.manager.start()
+            with self._lock:
+                if self.term == term and self.role == Role.TAKING_OVER:
+                    self.role = Role.LEADER
+                    LOG.warning("Leading, term %d", term)
         except Exception:
             LOG.exception("Takeover failed")
             with self._lock:
@@ -400,13 +418,19 @@ class Coordinator:
         except Exception as e:  # noqa: BLE001 - best effort
             LOG.info("Asking %s's SM to stop failed: %s", node, e)
 
-    def _start_opensm(self):
+    def _prepare_start(self):
+        """The start request's lease and deadline, and the watchdog's lease,
+        before the manager starts OpenSM"""
         deadline = None if self.held else self.t0 + self.config.self_stop_timeout
         self.runner.prepare(self.uuid, self.term, deadline)
         self.opensm_started = True
         self.runner.write_lease(
             self.uuid, self.term, None if self.held else self._watchdog_deadline(_now())
         )
+
+    def _start_opensm(self):
+        """Start OpenSM as the frozen node, which holds"""
+        self._prepare_start()
         self.manager.start()
         self.role = Role.LEADER
         LOG.warning("Leading, term %d", self.term)
@@ -414,13 +438,9 @@ class Coordinator:
     # Stepping down
 
     def _opensm_stopped(self):
-        with self._lock:
-            if self.held:
-                LOG.error("OpenSM stopped while frozen: starting it again here")
-                self.runner.prepare(self.uuid, self.term, None)
-                self.manager._start_opensm()
-                return
-            self._step_down("OpenSM stopped")
+        """From the applier's thread: leave it to the lease thread, since a
+        step-down waits for the applier to finish"""
+        self._opensm_gone = True
 
     def _step_down(self, why, release=True, deadline=None):
         """Stop OpenSM, verify it stopped, and release the lease if asked"""

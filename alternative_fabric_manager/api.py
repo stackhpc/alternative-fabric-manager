@@ -41,7 +41,7 @@ JOB_PATH = "app/jobs/%d"
 JsonBody = Annotated[dict[str, Any], fastapi.Body()]
 
 
-def create_app(config, manager):
+def create_app(config, manager, coordinator=None):
     prefix = "/" + config.url_prefix.strip("/") if config.url_prefix else ""
     expected = (f"Basic {config.token}").encode()
 
@@ -53,6 +53,11 @@ def create_app(config, manager):
         if domain != config.domain:
             raise fastapi.HTTPException(
                 status_code=404, detail=f"Unknown domain {domain}"
+            )
+        if coordinator is not None and coordinator.frozen:
+            # networking-mlnx retries a 503, unlike a 400 (see Freeze).
+            raise fastapi.HTTPException(
+                status_code=503, detail="The fabric manager is frozen"
             )
 
     app = fastapi.FastAPI(title="Alternative fabric manager")
@@ -126,6 +131,9 @@ def create_app(config, manager):
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():
+        if coordinator is not None and coordinator.role == "stopped":
+            # Shutting down: HAProxy stops sending requests here.
+            raise fastapi.HTTPException(status_code=503, detail="Stopping")
         return {"status": "ok"}
 
     app.include_router(router)

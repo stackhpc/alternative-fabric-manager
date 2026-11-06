@@ -350,16 +350,17 @@ def _check_schema(engine):
         )
 
 
-def _make_server_engine(url):
+def _make_server_engine(url, call_timeout=CALL_TIMEOUT):
     """An engine for MariaDB or Galera"""
+    timeout = max(1, int(call_timeout))
     engine = sa.create_engine(
         url,
         pool_pre_ping=True,
         pool_recycle=3600,
         connect_args={
-            "connect_timeout": CALL_TIMEOUT,
-            "read_timeout": CALL_TIMEOUT,
-            "write_timeout": CALL_TIMEOUT,
+            "connect_timeout": timeout,
+            "read_timeout": timeout,
+            "write_timeout": timeout,
         },
     )
 
@@ -380,14 +381,14 @@ def _make_server_engine(url):
     return engine
 
 
-def make_sessionmaker(database):
+def make_sessionmaker(database, call_timeout=CALL_TIMEOUT):
     """Return a session factory for an SQLite file, or a database URL
 
     An SQLite file's schema is created, and upgraded in place; a server
     database's is managed with Alembic, at deploy time.
     """
     if "://" in database:
-        engine = _make_server_engine(database)
+        engine = _make_server_engine(database, call_timeout)
         _check_schema(engine)
         return orm.sessionmaker(engine, expire_on_commit=False)
     return _make_sqlite_sessionmaker(database)
