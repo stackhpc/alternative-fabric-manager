@@ -60,7 +60,7 @@ checks after every sweep that no other SM could master or set ports (see Job
 completion).
 
 The cluster's own control traffic, Galera, the management network and the
-fence agents' SSH, must not run over the InfiniBand ports of the nodes that
+fencing SSH, must not run over the InfiniBand ports of the nodes that
 can be fenced, since fencing disables those ports. The deployment role
 checks this.
 
@@ -73,7 +73,7 @@ checks this.
 | `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), and when leadership last moved |
-| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs and the switch ports they are cabled to (the static map), its fencing state and fence record, and its fence agents' settings |
+| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs and the switch ports they are cabled to (the static map), its fencing state and fence record, and its fencing SSH settings |
 | `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
@@ -315,7 +315,7 @@ cooperation: one may be paused, hung, or cut off from the management network
 while its OpenSM still runs. For each target, the new leader records its
 fence intent, the node, the step and the switch ports, with a term
 compare-and-set before it acts, so that a successor can finish or undo it.
-It then climbs a ladder, and the target leaves the set once step 2, 3 or 4
+It then climbs a ladder, and the target leaves the set once step 2 or 3
 confirms:
 
 1. **Ask.** Send the target's SM a SubnSet(SMInfo) with the DISABLE modifier
@@ -348,12 +348,14 @@ confirms:
      that its ports are still disabled every `check_interval`, and after
      every heavy sweep, since a switch reboot or its management can enable
      them again.
-4. **Power it off.** Optionally, through the target's BMC, with IPMI or
-   Redfish, as Pacemaker's `fence_ipmilan` and `fence_redfish` do. It must
-   power the node off, not reboot it, since a booting node could start an
-   OpenSM of its own.
+There is no power fencing. Step 3 already fences a node that is paused,
+hung or cut off from the management network, and it fences only the node's
+InfiniBand ports, not its other workloads; powering a node off would need
+BMC credentials on every manager, for no case that step 3 doesn't cover. A
+target that neither step 2 nor step 3 can fence, for example because the
+switch behind it can't be reached, is left to the operator, below.
 
-Steps 3 and 4 are never used against the fencer's own node: a new leader
+Step 3 is never used against the fencer's own node: a new leader
 that is also in the target set, for example because its manager restarted,
 counts its own old OpenSM as stopped only on step 2's check, run locally.
 
@@ -702,8 +704,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       single-use start requests on tmpfs, and the file hashes.
 - [ ] Fencing: the recorded intent, SMInfo DISABLE, the restricted SSH
       script, switch-port disabling with the fabric scan, the static map and
-      the neighbour checks, its re-assertion, optional BMC agents, retry by
-      the next leader, and unfencing.
+      the neighbour checks, its re-assertion, retry by the next leader, and
+      unfencing.
 - [ ] A CLI to confirm fences, unfence nodes, record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
@@ -725,6 +727,5 @@ leader's OpenSM has swept its membership with the whole fabric in view.
   every SM on the fabric?
 - What is the deployment's MariaDB failover time, and are 20 s for `T` and
   180 s for the job timeout right?
-- Do the OpenSM nodes have BMCs the manager may use?
 - Do the OpenSM nodes run the control plane, so they reach the database
   VIP, or are they separate hosts that need database access opened to them?
