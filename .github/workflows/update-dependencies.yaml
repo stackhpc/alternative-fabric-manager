@@ -1,0 +1,121 @@
+# This workflow proposes updates that Dependabot cannot make, including
+# the lock file and versions held in Dockerfile build arguments.
+name: Update dependencies
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions: {}
+
+concurrency:
+  group: update-dependencies
+  cancel-in-progress: false
+
+jobs:
+  propose_github_release_updates:
+    name: Update dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve updated container images
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv_version="$(gh api repos/astral-sh/uv/releases/latest --jq .tag_name)"
+          if [[ ! "$uv_version" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "Unexpected uv release tag: $uv_version" >&2
+            exit 1
+          fi
+          uv_digest="$(docker buildx imagetools inspect "ghcr.io/astral-sh/uv:$uv_version" |
+            awk '/^Digest:/ { print $2; exit }')"
+          if [[ ! "$uv_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Unexpected uv image digest: $uv_digest" >&2
+            exit 1
+          fi
+
+          python_version="$(sed -nE 's/^ARG PYTHON_VERSION=//p' Dockerfile)"
+          if [[ ! "$python_version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            echo "Unexpected Python version: $python_version" >&2
+            exit 1
+          fi
+          python_digest="$(docker buildx imagetools inspect "python:$python_version-slim" |
+            awk '/^Digest:/ { print $2; exit }')"
+          if [[ ! "$python_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Unexpected Python image digest: $python_digest" >&2
+            exit 1
+          fi
+
+          printf 'uv_version=%s\n' "$uv_version" >> "$GITHUB_OUTPUT"
+          printf 'uv_digest=%s\n' "$uv_digest" >> "$GITHUB_OUTPUT"
+          printf 'python_digest=%s\n' "$python_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Update container image versions and digests
+        run: |
+          test "$(wc -l < .uv-version)" -eq 1
+          test "$(grep -c '^ARG UV_DIGEST=' Dockerfile)" -eq 1
+          test "$(grep -c '^ARG PYTHON_DIGEST=' Dockerfile)" -eq 1
+          printf '%s\n' '${{ steps.next.outputs.uv_version }}' > .uv-version
+          sed -i -E \
+            -e 's/^ARG UV_DIGEST=.*/ARG UV_DIGEST=${{ steps.next.outputs.uv_digest }}/' \
+            -e 's/^ARG PYTHON_DIGEST=.*/ARG PYTHON_DIGEST=${{ steps.next.outputs.python_digest }}/' \
+            Dockerfile
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ steps.next.outputs.uv_version }}
+
+      - name: Update locked Python dependencies
+        run: uv lock --upgrade
+
+      - name: Check for dependency updates
+        id: updates
+        run: |
+          if git diff --quiet; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run full test suite
+        if: steps.updates.outputs.available == 'true'
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run pytest
+
+      - name: Close previous dependency update pull requests
+        if: steps.updates.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr list --state open --label dependency-update --json number --jq '.[].number' |
+            while read -r number; do
+              gh pr close "$number" --delete-branch
+            done
+
+      - name: Propose the update in a pull request
+        if: steps.updates.outputs.available == 'true'
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+        with:
+          token: ${{ github.token }}
+          commit-message: Update dependencies
+          branch: update-dependencies
+          delete-branch: true
+          title: Update dependencies
+          body: >-
+            This pull request was created automatically to update container
+            images and locked Python dependencies.
+          labels: |
+            automation
+            dependency-update
