@@ -236,6 +236,14 @@ the signal and the end of the sweep:
 | `ERR 1503`, `ERR 5703` | A virtual port's pkey table couldn't be read or set | A pkey error on that port |
 | `ERR 6B06` | A virtual port's partition item couldn't be allocated | A pkey error on that port |
 
+Most of these name the port only by its node's description (0502, 0505,
+0506, 0508, 0512), or by its node GUID and port number (0509), not by its
+port GUID, and 0F12 names nothing. Only 1503, 5703 and 6B06 give a port
+GUID. An error that can't be traced to a port GUID fails closed: it is
+recorded as unattributed, and no job of that sweep completes; the leader
+sweeps again while a job waits on it. So does a 0507 or 0513 that names no
+switch port.
+
 A pkey error on a port's GUID is recorded in `applied`, so jobs whose
 effects involve that GUID don't complete, and the leader retries at the next
 reconcile. It doesn't count towards stepping down: one bad adapter mustn't
@@ -663,13 +671,19 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 - [x] Single node: a DELETE of an unknown object creates a job rather than
       answering 404; the checks of rendered files; the managed driver; and
       reconciling the file with the database.
-- [ ] Single node: the pkey error codes, recorded per GUID; quarantine of
+- [x] Single node: the pkey error codes, recorded per GUID; quarantine of
       the objects that break a render or OpenSM's parse; the render's
       attribution of partitions and memberships to objects.
-- [ ] Single node: jobs record their effect and deadline, and complete only
+- [x] Single node: jobs record their effect and deadline, and complete only
       when the effect holds in the swept body.
-- [ ] Single node: the fabric checks, against expected switches and other
-      SMs.
+- [x] Single node: the fabric checks, against expected switches and other
+      SMs, by the SA's SMInfo records.
+- [ ] Single node: a PortInfo check that clears a switch port's recorded
+      enforcement error. Until then, cleared enforcement holds every job
+      until an operator runs `--clear-enforcement-errors`; and other SMs
+      are found only by the SA's SMInfo records, not OpenSM's log.
+- [ ] Single node: map a node GUID and port number, and a node
+      description, to a port GUID, so that fewer pkey errors hold every job.
 - [ ] Database: a `[database] connection` URL, Alembic migrations, schema
       version, configuration epochs and cluster settings,
       `wsrep_sync_wait`, UTC timestamps, deadlock retry, the generation bump

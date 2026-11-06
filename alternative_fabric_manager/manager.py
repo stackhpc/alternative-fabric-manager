@@ -33,7 +33,11 @@ import time
 import sqlalchemy as sa
 
 from alternative_fabric_manager import db, effects, opensm_conf, partitions
-from alternative_fabric_manager.drivers import PartitionsRejected, ReloadError
+from alternative_fabric_manager.drivers import (
+    UNATTRIBUTED,
+    PartitionsRejected,
+    ReloadError,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -41,8 +45,8 @@ GENERATION = "generation"
 APPLIES = "applies"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
-# Times to quarantine objects and render again, in one render
-MAX_QUARANTINES = 20
+# _needs_sync()'s reason for restoring the last swept file
+RESTORE = "the last swept partitions must be restored"
 OPEN = (db.JobStatus.PENDING, db.JobStatus.RUNNING)
 
 
@@ -226,6 +230,13 @@ class Manager:
                 raise partitions.InvalidRequest(
                     f"Port {port_id} is on network {network_id}, which has no partition"
                 )
+            quarantined = session.get(db.Quarantine, ("network", network_id))
+            if quarantined is not None:
+                # It would be left out of the file with its network.
+                raise partitions.InvalidRequest(
+                    f"Port {port_id} is on network {network_id}, which is "
+                    f"quarantined: {quarantined.reason}"
+                )
             generation = self._bump(session)
             port = session.get(db.Port, port_id)
             if port is None:
@@ -268,7 +279,8 @@ class Manager:
             job = session.get(db.Job, job_id)
             if job is None:
                 raise NotFound(f"Job {job_id}")
-            if self._time_out(job):
+            if job.status in OPEN:
+                self._evaluate(session, [job])
                 session.commit()
             return job
 
@@ -364,27 +376,42 @@ class Manager:
         than not at all, and the next sync deals with the state.
         """
         self._write_opensm_conf()
-        try:
-            content, generation, attribution = self._render()
-        except partitions.InvalidPartitions as e:
-            if not os.path.exists(self.config.partitions_file):
-                raise
-            LOG.error(
-                "Starting OpenSM with the last partitions file, since the "
-                "current state can't be rendered: %s",
-                e,
+        # What OpenSM starts with is never recorded as swept: its start
+        # reports no pkey errors, and a driver may not start OpenSM at all.
+        # The next sync sweeps and records it.
+        self._written = None
+        while True:
+            try:
+                content, generation, attribution = self._render()
+            except partitions.InvalidPartitions as e:
+                if not os.path.exists(self.config.partitions_file):
+                    raise
+                LOG.error(
+                    "Starting OpenSM with the last partitions file, since the "
+                    "current state can't be rendered: %s",
+                    e,
+                )
+                self.driver.start()
+                return
+            partitions.write_atomically(
+                self.config.partitions_file, self._stamp(content)
             )
-            self._written = None
-            self.driver.start()
-            return
-        content = self._stamp(content)
-        partitions.write_atomically(self.config.partitions_file, content)
-        self._written = None
-        self.driver.start()
-        # OpenSM read it when it started. Its start reports no pkey errors,
-        # so the jobs wait for the next sweep's, which the next sync forces.
-        self._record(content, generation, attribution, None)
-        self._written = None
+            try:
+                self.driver.start()
+                return
+            except PartitionsRejected as e:
+                if self._quarantine_line(e, attribution, generation):
+                    continue
+                body = self._last_swept()
+                if not body:
+                    raise
+                self._unattributable(str(e), generation)
+                LOG.error("Starting OpenSM with the last swept partitions")
+                partitions.write_atomically(
+                    self.config.partitions_file, self._stamp(_body(body))
+                )
+                self.driver.start()
+                return
 
     def _check_opensm(self):
         """Start OpenSM again if it has stopped, with the current state"""
@@ -445,7 +472,7 @@ class Manager:
         Raise InvalidPartitions if the state can't be rendered for a reason
         that no object accounts for, such as a broken template.
         """
-        for _ in range(MAX_QUARANTINES):
+        while True:
             with self._lock, self.sessionmaker() as session:
                 generation, networks, ports = self._state(session)
                 try:
@@ -460,17 +487,31 @@ class Manager:
                     culprits += [
                         ("port", p.id) for p in ports if int(p.guid, 16) in e.guids
                     ]
-                    if not culprits:
+                    # Each round leaves out at least one more object, so
+                    # this ends.
+                    if not self._quarantine(session, culprits, str(e), generation):
                         raise
-                    self._quarantine(session, culprits, str(e))
                     session.commit()
-        raise partitions.InvalidPartitions("Too many objects to quarantine")
 
     @staticmethod
-    def _quarantine(session, culprits, reason):
+    def _quarantine(session, culprits, reason, generation):
         """Leave objects out of the partitions file until they're sent again,
-        and fail their jobs, and those of a network's ports"""
+        and fail their jobs, and those of a network's ports, up to the
+        generation that was rendered; return how many were quarantined
+
+        An object sent again since that generation is left alone: what was
+        rendered isn't what it is now, and its new request releases it anyway.
+        """
+        count = 0
         for kind, object_id in culprits:
+            newer = session.scalar(
+                sa.select(db.Job.id).where(
+                    db.Job.object_id == object_id, db.Job.generation > generation
+                )
+            )
+            if newer is not None:
+                continue
+            count += 1
             LOG.error("Quarantining %s %s: %s", kind, object_id, reason)
             session.merge(db.Quarantine(kind=kind, object_id=object_id, reason=reason))
             if kind == "network":
@@ -488,6 +529,7 @@ class Manager:
                     db.Job.object_id.in_(ids),
                     db.Job.operation.in_(operations),
                     db.Job.status.in_(OPEN),
+                    db.Job.generation <= generation,
                 )
                 .values(
                     status=db.JobStatus.FAILED,
@@ -495,6 +537,7 @@ class Manager:
                     finished_at=_now(),
                 )
             )
+        return count
 
     def _stamp(self, content):
         """Add an apply counter, so that OpenSM sees a changed file on every
@@ -527,7 +570,10 @@ class Manager:
             applied.body = content
             applied.attribution = json.dumps(attribution, sort_keys=True)
             pkey_errors = report.pkey_errors if report else set()
-            applied.pkey_errors = json.dumps(sorted(f"{g:016x}" for g in pkey_errors))
+            recorded = sorted(f"{g:016x}" for g in pkey_errors)
+            if report and report.unattributed:
+                recorded.append(UNATTRIBUTED)
+            applied.pkey_errors = json.dumps(recorded)
             # Cleared enforcement stays recorded until an operator clears it,
             # since a later sweep needn't report it again.
             enforcement = set(json.loads(applied.enforcement_errors or "[]"))
@@ -536,7 +582,17 @@ class Manager:
             session.commit()
         for guid in sorted(pkey_errors):
             LOG.error("OpenSM couldn't set the pkey table of 0x%016x", guid)
+        if report and report.unattributed:
+            LOG.error(
+                "OpenSM couldn't set a pkey table it names no port GUID for, "
+                "so no job of this sweep completes"
+            )
         self._written = content
+
+    def _last_swept(self):
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            return applied.body if applied else None
 
     def _needs_sync(self):
         """Why OpenSM needs the partitions file applied, if it does
@@ -552,10 +608,12 @@ class Manager:
             state = session.get(db.State, GENERATION)
             generation = state.value if state is not None else 0
             applied = session.get(db.Applied, 1)
-            pkey_errors = json.loads(applied.pkey_errors or "[]") if applied else []
             applied_generation = applied.generation if applied else None
+            blocked = self._blocked_by_pkey_errors(session, applied)
         if generation == self._failed_generation:
-            return None
+            # Not this generation again, but OpenSM must be on the last
+            # swept file.
+            return RESTORE if self._written is None else None
         if self._written is None:
             return "the last apply wasn't confirmed"
         if generation != applied_generation:
@@ -573,9 +631,24 @@ class Manager:
             return "the recorded state can't be rendered"
         if _body(content) != _body(self._written):
             return "the recorded state renders differently"
-        if pkey_errors:
-            return "OpenSM couldn't set some ports' pkey tables"
+        if blocked:
+            # Only while a job waits on them, so that a port that keeps
+            # failing doesn't have the shared fabric swept forever
+            return "OpenSM couldn't set the pkey tables of ports with open jobs"
         return None
+
+    @staticmethod
+    def _blocked_by_pkey_errors(session, applied):
+        """Whether an open job waits on the last sweep's pkey errors"""
+        errors = set(json.loads(applied.pkey_errors or "[]")) if applied else set()
+        if not errors:
+            return False
+        for job in session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN))):
+            if UNATTRIBUTED in errors:
+                return True
+            if errors & set(effects.loads(job.effect).get("guids", [])):
+                return True
+        return False
 
     def sync(self):
         """Make OpenSM's partitions match the recorded state"""
@@ -583,6 +656,9 @@ class Manager:
             return
         reason = self._needs_sync()
         if reason is None:
+            return
+        if reason == RESTORE:
+            self._restore()
             return
         LOG.info("Applying the partitions: %s", reason)
         error = ""
@@ -592,7 +668,8 @@ class Manager:
             try:
                 content, generation, attribution = self._render()
             except partitions.InvalidPartitions as e:
-                self._unattributable(str(e))
+                self._unattributable(str(e), self._generation())
+                self._restore()
                 return
             stamped = self._stamp(content)
             try:
@@ -601,8 +678,9 @@ class Manager:
                 self._written = None
                 report = self.driver.reload()
             except PartitionsRejected as e:
-                if not self._quarantine_line(e, attribution):
-                    self._unattributable(str(e))
+                if not self._quarantine_line(e, attribution, generation):
+                    self._unattributable(str(e), generation)
+                    self._restore()
                     return
                 # Render again without them; that's not a failed attempt.
                 attempt -= 1
@@ -621,7 +699,12 @@ class Manager:
         # tries again, and the jobs fail at their deadlines.
         LOG.error("Failed to apply the partitions: %s", error)
 
-    def _quarantine_line(self, error, attribution):
+    def _generation(self):
+        with self._lock, self.sessionmaker() as session:
+            state = session.get(db.State, GENERATION)
+            return state.value if state is not None else 0
+
+    def _quarantine_line(self, error, attribution, generation):
         """Quarantine the objects of a line OpenSM couldn't parse that changed
         since the last sweep; return whether there were any"""
         if error.line is None:
@@ -651,32 +734,40 @@ class Manager:
                     then = before.get("members", {}).get(object_id)
                 if now != then:
                     changed.append((kind, object_id))
-            if not changed:
+            if not changed or not self._quarantine(
+                session, changed, str(error), generation
+            ):
                 return False
-            self._quarantine(session, changed, str(error))
             session.commit()
         return True
 
-    def _unattributable(self, reason):
-        """A failure that no object accounts for: keep OpenSM on the last
-        file it swept, fail the jobs of newer generations, and don't try
-        this generation again"""
-        LOG.error("The partitions can't be applied: %s", reason)
+    def _unattributable(self, reason, generation):
+        """A failure of a rendered generation that no object accounts for:
+        fail the jobs of the generations since the last sweep up to it, and
+        don't try it again; requests since then are tried when synced"""
+        LOG.error("Generation %d can't be applied: %s", generation, reason)
         with self._lock, self.sessionmaker() as session:
             applied = session.get(db.Applied, 1)
-            state = session.get(db.State, GENERATION)
-            generation = state.value if state is not None else 0
             applied_generation = applied.generation if applied else 0
             session.execute(
                 sa.update(db.Job)
-                .where(db.Job.generation > applied_generation, db.Job.status.in_(OPEN))
+                .where(
+                    db.Job.generation > applied_generation,
+                    db.Job.generation <= generation,
+                    db.Job.status.in_(OPEN),
+                )
                 .values(status=db.JobStatus.FAILED, error=reason, finished_at=_now())
             )
             session.commit()
-            body = applied.body if applied else None
         self._failed_generation = generation
+
+    def _restore(self):
+        """Put OpenSM back on the last file it swept; the next sync retries
+        if this fails"""
+        body = self._last_swept()
         if not body:
             return
+        LOG.warning("Restoring the last swept partitions")
         try:
             restored = self._stamp(_body(body))
             partitions.write_atomically(self.config.partitions_file, restored)
@@ -714,7 +805,7 @@ class Manager:
                 int(s.guid, 16) for s in session.scalars(sa.select(db.ExpectedSwitch))
             }
         others = [
-            (guid, state) for guid, state in fabric.sms if guid != fabric.own_guid
+            (guid, state) for guid, state in fabric.sms if guid not in fabric.own_guids
         ]
         for guid, state in others:
             LOG.warning("Another subnet manager, 0x%016x, is in state %d", guid, state)
@@ -760,34 +851,45 @@ class Manager:
         """Complete the jobs whose effects the last sweep has, and fail those
         past their deadline"""
         with self._lock, self.sessionmaker() as session:
-            applied = session.get(db.Applied, 1)
             jobs = list(
                 session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN)))
             )
-            fresh = datetime.timedelta(seconds=2 * self.config.check_interval)
-            ready = (
-                applied is not None
-                and self._written is not None
-                and applied.check_ok
-                and applied.check_time is not None
-                and _now() - _aware(applied.check_time) <= fresh
-                and not json.loads(applied.enforcement_errors or "[]")
-            )
-            if ready:
-                attribution = json.loads(applied.attribution or "{}")
-                pkey_errors = set(json.loads(applied.pkey_errors or "[]"))
-            for job in jobs:
-                if self._time_out(job) or not ready:
-                    continue
-                if (applied.generation or 0) < job.generation:
-                    continue
-                effect = effects.loads(job.effect)
-                if pkey_errors & set(effect.get("guids", [])):
-                    continue
-                if effects.holds(effect, attribution):
-                    job.status = db.JobStatus.COMPLETED
-                    job.finished_at = _now()
+            self._evaluate(session, jobs)
             session.commit()
+
+    def _evaluate(self, session, jobs):
+        """Complete what has its effect, then fail what is past its deadline,
+        in that order. Cleared enforcement holds every job until an operator
+        clears it; the spec's PortInfo check of it is still to come."""
+        applied = session.get(db.Applied, 1)
+        fresh = datetime.timedelta(seconds=2 * self.config.check_interval)
+        ready = (
+            applied is not None
+            and self._written is not None
+            and applied.check_ok
+            and applied.check_time is not None
+            and _now() - _aware(applied.check_time) <= fresh
+            and not json.loads(applied.enforcement_errors or "[]")
+        )
+        if ready:
+            attribution = json.loads(applied.attribution or "{}")
+            pkey_errors = set(json.loads(applied.pkey_errors or "[]"))
+            ready = UNATTRIBUTED not in pkey_errors
+        for job in jobs:
+            if ready and self._holds(job, applied, attribution, pkey_errors):
+                job.status = db.JobStatus.COMPLETED
+                job.finished_at = _now()
+            else:
+                self._time_out(job)
+
+    @staticmethod
+    def _holds(job, applied, attribution, pkey_errors):
+        if (applied.generation or 0) < job.generation:
+            return False
+        effect = effects.loads(job.effect)
+        if pkey_errors & set(effect.get("guids", [])):
+            return False
+        return effects.holds(effect, attribution)
 
     def reconcile(self):
         """Sync OpenSM, check the fabric, and complete the jobs it has

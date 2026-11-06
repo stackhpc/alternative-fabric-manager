@@ -29,6 +29,7 @@ import docker.errors
 
 from alternative_fabric_manager import opensm_conf
 from alternative_fabric_manager.drivers import (
+    UNATTRIBUTED,
     Fabric,
     PartitionsRejected,
     ReloadError,
@@ -65,7 +66,10 @@ PKEY_ERROR_CODES = (
 # A switch port with too few pkey entries: OpenSM clears its enforcement bit
 ENFORCEMENT_ERROR_CODES = ("0507", "0513")
 _ERR = re.compile(r"ERR ([0-9A-F]{4}):")
-_GUID = re.compile(r"0x([0-9a-fA-F]{1,16})\b")
+# The port GUIDs some pkey errors name. Most name a port only by its node's
+# description, and 0509 by its node GUID and port number, which isn't the
+# port's GUID; those can't be traced to a port.
+_PORT_GUID = re.compile(r"(?:of port|guid \()\s*0x([0-9a-fA-F]{1,16})")
 _SWITCH_PORT = re.compile(r"switch 0x([0-9a-fA-F]{1,16}) port (\d+)")
 _PARSE_LINE = re.compile(r"PARSE ERROR: line (\d+)")
 POLL_INTERVAL = 0.5
@@ -73,7 +77,10 @@ POLL_INTERVAL = 0.5
 
 def _is_partitions_error(line):
     # OpenSM skips a line of the partitions file that it can't parse, and
-    # still completes the sweep.
+    # still completes the sweep. The pkey errors are recorded, not raised.
+    match = _ERR.search(line)
+    if match and match.group(1) in PKEY_ERROR_CODES + ENFORCEMENT_ERROR_CODES:
+        return False
     return "PARSE ERROR" in line or ("prtn" in line and "ERR" in line)
 
 
@@ -91,13 +98,19 @@ def _note_pkey_error(report, line):
     if not match:
         return
     code = match.group(1)
+    # What can't be traced fails closed: it holds every job of the sweep.
     if code in ENFORCEMENT_ERROR_CODES:
-        for switch, port in _SWITCH_PORT.findall(line):
+        ports = _SWITCH_PORT.findall(line)
+        for switch, port in ports:
             report.enforcement_errors.add(f"{int(switch, 16):016x}:{port}")
+        if not ports:
+            report.enforcement_errors.add(UNATTRIBUTED)
         LOG.error("OpenSM cleared a switch port's enforcement: %s", line.strip())
     elif code in PKEY_ERROR_CODES:
-        guids = {int(g, 16) for g in _GUID.findall(line)}
+        guids = {int(g, 16) for g in _PORT_GUID.findall(line)}
         report.pkey_errors |= guids
+        if not guids:
+            report.unattributed = True
         LOG.warning("OpenSM couldn't set a pkey table: %s", line.strip())
 
 
@@ -169,8 +182,10 @@ class DockerReloader:
                 r"GUID\.+0x([0-9a-fA-F]+).*?SMState\.+(\d+)", sm_records, re.S
             )
         ]
-        own = [int(g, 16) for g in re.findall(r"0x([0-9a-fA-F]+)", ports)]
-        return Fabric(switch_guids, sms, own[0] if own else None)
+        # OpenSM binds to one of the host's ports, not necessarily the
+        # first: an SM on any of them is this one.
+        own = {int(g, 16) for g in re.findall(r"0x([0-9a-fA-F]+)", ports)}
+        return Fabric(switch_guids, sms, own)
 
     @staticmethod
     def _exec(container, command):

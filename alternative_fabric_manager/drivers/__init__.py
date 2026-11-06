@@ -35,27 +35,33 @@ class PartitionsRejected(ReloadError):
         self.line = line
 
 
+# An error that names no port it can be traced to
+UNATTRIBUTED = "unattributed"
+
+
 class SweepReport:
     """What OpenSM reported, while applying a partitions file, about ports
     whose pkey tables it couldn't set"""
 
-    def __init__(self, pkey_errors=(), enforcement_errors=()):
-        # GUIDs, as ints
+    def __init__(self, pkey_errors=(), enforcement_errors=(), unattributed=False):
+        # Port GUIDs, as ints
         self.pkey_errors = set(pkey_errors)
+        # Whether some pkey error named no port GUID
+        self.unattributed = unattributed
         # Switch ports whose partition enforcement OpenSM cleared, as
-        # "<switch GUID>:<port>"
+        # "<switch GUID>:<port>", or UNATTRIBUTED
         self.enforcement_errors = set(enforcement_errors)
 
 
 class Fabric:
     """What a fabric check sees: switch GUIDs, and the subnet managers the SA
-    knows, as (port GUID, state) pairs, state 3 being master; and the GUID
-    of OpenSM's own port"""
+    knows, as (port GUID, state) pairs, state 3 being master; and the GUIDs
+    of the ports of OpenSM's host, one of which it is bound to"""
 
-    def __init__(self, switches, sms, own_guid):
+    def __init__(self, switches, sms, own_guids):
         self.switches = set(switches)
         self.sms = list(sms)
-        self.own_guid = own_guid
+        self.own_guids = set(own_guids)
 
 
 class NoOpenSM:

@@ -174,24 +174,33 @@ def _upgrade(engine):
     and networking-mlnx sends their requests again.
     """
     inspector = sa.inspect(engine)
+    missing = {
+        table: [
+            name
+            for name in columns
+            if name not in {c["name"] for c in inspector.get_columns(table)}
+        ]
+        for table, columns in _ADDED_COLUMNS.items()
+    }
     with engine.begin() as connection:
-        for table, columns in _ADDED_COLUMNS.items():
-            present = {c["name"] for c in inspector.get_columns(table)}
-            missing = [name for name in columns if name not in present]
-            for name in missing:
+        for table, names in missing.items():
+            for name in names:
+                definition = _ADDED_COLUMNS[table][name]
                 connection.exec_driver_sql(
-                    f"ALTER TABLE {table} ADD COLUMN {name} {columns[name]}"
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
                 )
-            if table == "jobs" and "effect" in missing:
-                connection.execute(
-                    sa.update(Job.__table__)
-                    .where(
-                        Job.__table__.c.status.in_(
-                            [JobStatus.PENDING, JobStatus.RUNNING]
-                        )
-                    )
-                    .values(status=JobStatus.FAILED, error="Superseded by an upgrade")
+        # create_all() leaves existing tables' indexes alone.
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_generation ON jobs (generation)"
+        )
+        if "effect" in missing["jobs"]:
+            connection.execute(
+                sa.update(Job.__table__)
+                .where(
+                    Job.__table__.c.status.in_([JobStatus.PENDING, JobStatus.RUNNING])
                 )
+                .values(status=JobStatus.FAILED, error="Superseded by an upgrade")
+            )
 
 
 def make_sessionmaker(database):

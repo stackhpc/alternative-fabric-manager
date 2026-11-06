@@ -37,3 +37,6 @@ def test_an_old_database_is_upgraded_in_place(tmp_path):
         assert session.get(db.Applied, 1) is None
     # Upgrading again changes nothing.
     db.make_sessionmaker(str(path))
+    connection = sqlite3.connect(path)
+    indexes = {row[1] for row in connection.execute("PRAGMA index_list(jobs)")}
+    assert "ix_jobs_generation" in indexes

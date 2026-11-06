@@ -18,6 +18,8 @@ OTHER = "d13bba05-eb07-45ba-ace2-765706b2d701"
 OTHER_PORT = "e13bba05-eb07-45ba-ace2-765706b2d701"
 SWITCH = 0xEC0D9A0300B12560
 OWN = 0x040973FFFFC75168
+# The host's other port, which OpenSM may be bound to instead
+OWN_OTHER_PORT = 0x040973FFFFC75169
 
 
 def _status(manager, job_id):
@@ -25,7 +27,7 @@ def _status(manager, job_id):
 
 
 def _fabric(switches=(SWITCH,), sms=((OWN, 3),)):
-    return Fabric(switches, sms, OWN)
+    return Fabric(switches, sms, {OWN, OWN_OTHER_PORT})
 
 
 @pytest.fixture
@@ -243,3 +245,209 @@ def test_effects_hold_relative_to_their_object():
     assert not effects.holds({"kind": "unknown"}, attribution)
     effect = effects.port_present("port-a", 100, "1")
     assert effects.loads(effects.dumps(effect)) == effect
+
+
+def test_opensm_bound_to_another_local_port_is_not_another_master(manager, fabric):
+    fabric.fabric_result = _fabric(sms=((OWN_OTHER_PORT, 3),))
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_an_untraceable_pkey_error_holds_every_job(manager, fabric):
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    fabric.report = SweepReport(unattributed=True)
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    # It's swept again while a job waits on it.
+    calls = fabric.calls
+    fabric.report = None
+    manager.reconcile()
+    assert fabric.calls == calls + 1
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_pkey_errors_with_no_waiting_job_arent_swept_again(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    job = manager.put_port(PORT_ID, conftest.port())
+    fabric.report = SweepReport(pkey_errors={GUID})
+    manager.reconcile()
+    manager.get_job(job)
+    with manager.sessionmaker() as session:
+        session.get(db.Job, job).status = db.JobStatus.FAILED
+        session.commit()
+    calls = fabric.calls
+    manager.reconcile()
+    assert fabric.calls == calls
+
+
+def test_an_effect_swept_by_the_deadline_completes(manager, fabric, monkeypatch):
+    from alternative_fabric_manager import manager as manager_mod
+
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    manager.sync()
+    manager.check_fabric()
+    later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=manager.config.job_timeout + 1
+    )
+    real = manager_mod._now
+    # Past the deadline, with the fabric check still fresh
+    monkeypatch.setattr(manager_mod, "_now", lambda: later)
+    with manager.sessionmaker() as session:
+        session.get(db.Applied, 1).check_time = later
+        session.commit()
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+    monkeypatch.setattr(manager_mod, "_now", real)
+
+
+def test_a_port_on_a_quarantined_network_is_refused(manager, fabric, monkeypatch):
+    manager.put_network(NETWORK_ID, conftest.network())
+    real = partitions.validate
+
+    def validate(content, *args, **kwargs):
+        if f"net-{NETWORK_ID}" in content:
+            raise partitions.InvalidPartitions("bad network", pkeys={0x64})
+        return real(content, *args, **kwargs)
+
+    monkeypatch.setattr(partitions, "validate", validate)
+    manager.reconcile()
+    with pytest.raises(partitions.InvalidRequest, match="quarantined"):
+        manager.put_port(PORT_ID, conftest.port())
+
+
+def _reject_guid(manager, fabric, times=None):
+    """Have OpenSM reject the line with the port's GUID"""
+    real = fabric.reload
+    count = [0]
+
+    def reload():
+        with open(manager.config.partitions_file) as f:
+            content = f.read()
+        for number, line in enumerate(content.splitlines(), 1):
+            if f"0x{GUID:016x}" in line and (times is None or count[0] < times):
+                count[0] += 1
+                raise PartitionsRejected("PARSE ERROR", line=number)
+        return real()
+
+    fabric.reload = reload
+
+
+def test_a_rejected_start_quarantines_against_the_last_sweep(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_port(PORT_ID, conftest.port())
+    starts = []
+
+    def start():
+        with open(manager.config.partitions_file) as f:
+            content = f.read()
+        starts.append(content)
+        for number, line in enumerate(content.splitlines(), 1):
+            if f"0x{GUID:016x}" in line:
+                raise PartitionsRejected("PARSE ERROR", line=number)
+
+    fabric.start = start
+    manager._start_opensm()
+    assert len(starts) == 2
+    assert _status(manager, job) == db.JobStatus.FAILED
+    # And later requests aren't held up by it
+    other = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.reconcile()
+    assert _status(manager, other) == db.JobStatus.COMPLETED
+
+
+def test_a_restart_doesnt_make_a_bad_port_the_baseline(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_port(PORT_ID, conftest.port())
+    # A driver whose start doesn't start OpenSM
+    manager._start_opensm()
+    _reject_guid(manager, fabric)
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.FAILED
+    other = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.reconcile()
+    assert _status(manager, other) == db.JobStatus.COMPLETED
+
+
+def test_an_object_sent_again_during_the_sweep_isnt_quarantined(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    first = manager.put_port(PORT_ID, conftest.port())
+    again = []
+    _reject_guid(manager, fabric, times=1)
+    rejecting = fabric.reload
+
+    def reload():
+        if not again:
+            again.append(manager.put_port(PORT_ID, conftest.port()))
+        return rejecting()
+
+    fabric.reload = reload
+    manager.reconcile()
+    # The first rendered request is unattributable now, but the one OpenSM
+    # never saw is applied.
+    assert _status(manager, first) == db.JobStatus.FAILED
+    manager.reconcile()
+    assert _status(manager, again[0]) == db.JobStatus.COMPLETED
+
+
+def test_a_request_during_a_failed_sweep_is_tried(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    later = []
+
+    def reload():
+        if not later:
+            later.append(manager.delete_network(OTHER))
+            # The default partition's line, which no object changed
+            raise PartitionsRejected("PARSE ERROR", line=3)
+        return SweepReport()
+
+    fabric.reload = reload
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.FAILED
+    manager.reconcile()
+    assert _status(manager, later[0]) == db.JobStatus.COMPLETED
+
+
+def test_a_failed_restore_is_retried(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    manager.put_network(OTHER, conftest.network(OTHER, 200))
+    results = [PartitionsRejected("PARSE ERROR", line=3), ReloadError("down")]
+
+    def reload():
+        if results:
+            raise results.pop(0)
+        return SweepReport()
+
+    fabric.reload = reload
+    manager.reconcile()
+    calls = []
+    fabric.reload = lambda: calls.append(1) or SweepReport()
+    manager.reconcile()
+    assert calls == [1]
+    with open(manager.config.partitions_file) as f:
+        assert f"net-{OTHER}" not in f.read()
+    manager.reconcile()
+    assert calls == [1]
+
+
+def test_many_culprits_are_all_quarantined(manager, fabric, monkeypatch):
+    ids = [f"{i:08x}-eb07-45ba-ace2-765706b2d701" for i in range(30)]
+    for i, network_id in enumerate(ids):
+        manager.put_network(network_id, conftest.network(network_id, 100 + i))
+    real = partitions.validate
+
+    def validate(content, *args, **kwargs):
+        for i, network_id in enumerate(ids):
+            if f"net-{network_id}" in content:
+                raise partitions.InvalidPartitions("bad", pkeys={100 + i})
+        return real(content, *args, **kwargs)
+
+    monkeypatch.setattr(partitions, "validate", validate)
+    manager.reconcile()
+    with manager.sessionmaker() as session:
+        assert session.query(db.Quarantine).count() == 30

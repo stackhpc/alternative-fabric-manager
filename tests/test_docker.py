@@ -1,6 +1,6 @@
 import pytest
 
-from alternative_fabric_manager.drivers import ReloadError
+from alternative_fabric_manager.drivers import UNATTRIBUTED, ReloadError, SweepReport
 from alternative_fabric_manager.drivers import docker as docker_driver
 
 BEFORE = "Nov 05 16:59:14 0x04 -> do_sweep:\n" + "*" * 10 + " SUBNET UP " + "*" * 10
@@ -236,3 +236,53 @@ def test_heavy_sweep_ends_with_subnet_up():
         _reloader(FakeContainer(after=partial), timeout=0.05).reload()
     clean = "\n".join(line for line in HEAVY.splitlines() if "PARSE" not in line)
     _reloader(FakeContainer(after=clean)).reload()
+
+
+# OpenSM 5.17's own messages, from its binary
+PKEY_BY_DESCRIPTION = (
+    "pkey_mgr_update_port: ERR 0505: Failed to set PKey 0x8064 in block 0 idx 2 "
+    "for compute-0 mlx5_0"
+)
+PKEY_BY_NODE = (
+    "pkey_mgr_update_port: ERR 0509: pkey_mgr_update_pkey_entry() failed to update "
+    "pkey table block 0 for node 0x0002c90300001234 port 1 (compute-0 mlx5_0)"
+)
+PKEY_BY_PORT = (
+    "osm_vm: ERR 5703: Failure initiating PKeyTable set request to VPort "
+    "0x0002c90300005678, VPort index 1 of port 0x0002c90300001235 (compute-0)"
+)
+ENFORCEMENT = (
+    "pkey_mgr_update_peer_port: ERR 0507: Not enough pkey entries (32 <= 33) on "
+    "switch 0xec0d9a0300b12560 port 7 (SwitchIB). Clearing Enforcement bit"
+)
+
+
+def test_a_pkey_error_without_a_port_guid_fails_closed():
+    for line in (PKEY_BY_DESCRIPTION, PKEY_BY_NODE):
+        report = SweepReport()
+        docker_driver._note_pkey_error(report, line)
+        # A node GUID isn't the port's, so it mustn't count as one.
+        assert report.pkey_errors == set()
+        assert report.unattributed
+
+
+def test_a_pkey_error_with_a_port_guid_names_it():
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, PKEY_BY_PORT)
+    assert 0x0002C90300001235 in report.pkey_errors
+    assert not report.unattributed
+
+
+def test_cleared_enforcement_names_the_switch_port():
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, ENFORCEMENT)
+    assert report.enforcement_errors == {"ec0d9a0300b12560:7"}
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, "x: ERR 0513: something else")
+    assert report.enforcement_errors == {UNATTRIBUTED}
+
+
+def test_pkey_errors_are_not_partitions_errors():
+    for line in (PKEY_BY_DESCRIPTION, PKEY_BY_PORT, ENFORCEMENT):
+        assert not docker_driver._is_partitions_error(line.replace("osm_vm", "prtn"))
+    assert docker_driver._is_partitions_error("osm_prtn_make_new: ERR 0A01: x")
