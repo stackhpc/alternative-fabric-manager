@@ -487,20 +487,12 @@ class GaleraLease:
             return True
 
     def confirm(self, term):
-        """An operator confirms that the holder of term's OpenSM can't act"""
+        """An operator confirms that the frozen holder of term's OpenSM can't
+        act, so that a takeover may end a freeze it never acknowledged"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.freeze_state in ("requested", "frozen"):
-                # Never for a freeze still in force
-                session.rollback()
-                return False
-            entry_terms = set(session.scalars(sa.select(db.TargetEntry.term)))
-            # The holder's own term, while a freeze ends, or the term of a
-            # target entry a takeover waits for, as with manual_takeover
-            if not (
-                (term == lease.term and lease.freeze_state == "ending")
-                or term in entry_terms
-            ):
+            if lease.freeze_state != "ending" or term != lease.term:
+                # Only while a freeze ends: never for one still in force
                 session.rollback()
                 return False
             lease.confirmed_term = term
@@ -518,7 +510,10 @@ class GaleraLease:
                 session.commit()
                 return True
             session.commit()
-            return row.value == settings
+            # Only the settings both versions know: a setting a newer version
+            # removed mustn't keep its instances from leading.
+            stored, ours = json.loads(row.value), json.loads(settings)
+            return all(stored[key] == ours[key] for key in stored.keys() & ours.keys())
 
     def adopt_frozen(self, node, instance_uuid, frozen_term):
         """A restarted manager on the frozen node takes the frozen lease

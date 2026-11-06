@@ -139,8 +139,6 @@ class Config:
     call_timeout: float = 3.0
     # Ask the old leader's SM to disable itself, at a takeover
     fence_ask: bool = True
-    # Wait for an operator's confirmation at every takeover
-    manual_takeover: bool = False
     # How long a step-down at SIGTERM may take
     shutdown_timeout: float = 20.0
     # The manager's container's stop timeout, which the deployment sets: 30 s
@@ -316,7 +314,6 @@ def ha_settings(config):
                 "ha_period",
                 "call_timeout",
                 "fence_ask",
-                "manual_takeover",
                 "job_timeout",
                 "step_down_cooldown",
             )
@@ -421,7 +418,6 @@ OPTIONS = (
             "ha_period",
             "call_timeout",
             "fence_ask",
-            "manual_takeover",
             "shutdown_timeout",
             "container_stop_timeout",
             "step_down_cooldown",

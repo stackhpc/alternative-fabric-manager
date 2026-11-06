@@ -67,9 +67,9 @@ def main(argv=None):
         "--confirm-takeover",
         type=int,
         metavar="TERM",
-        help="HA: confirm that the OpenSM of the leader that held TERM can't "
-        "act: for a manual takeover, the term of the leader being replaced; "
-        "while a freeze ends, the frozen term",
+        help="HA: while a freeze ends and its frozen leader can't acknowledge "
+        "it, confirm that that leader's OpenSM, of the frozen TERM, can't act, "
+        "so that another instance may take over",
     )
     args = parser.parse_args(argv)
 

@@ -214,9 +214,10 @@ def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
     assert ("a", "ua", term) not in lease.targets()
 
 
-def test_an_earlier_confirmation_doesnt_end_a_later_freeze(lease):
+def test_confirmations_count_only_while_a_freeze_ends(lease):
     term = _take(lease, "a", "ua")
-    assert lease.confirm(term)
+    # No confirmation outside a freeze that is ending
+    assert not lease.confirm(term)
     lease.request_freeze(term, "operator", 30)
     lease.acknowledge_freeze("ua", term)
     # No confirmation while frozen
@@ -261,5 +262,11 @@ def test_adoption_voids_a_confirmation_and_a_stale_view(lease):
 
 def test_every_instance_agrees_on_the_settings(lease):
     assert lease.agree_settings('{"t": 30}')
+    assert lease.agree_settings('{"t": 30}')
+    assert not lease.agree_settings('{"t": 10}')
+
+
+def test_settings_a_newer_version_removed_dont_block_it(lease):
+    assert lease.agree_settings('{"t": 30, "removed": false}')
     assert lease.agree_settings('{"t": 30}')
     assert not lease.agree_settings('{"t": 10}')

@@ -62,8 +62,10 @@ def unfreeze(config, lease, wait):
 
 
 def confirm_takeover(lease, term):
-    """Confirm that the holder of term's OpenSM can't act"""
+    """Confirm that the frozen leader of term's OpenSM can't act, while a
+    freeze it never acknowledged ends"""
     if not lease.confirm(term):
         raise OperatorError(
-            f"Term {term} isn't current, or the cluster is frozen: unfreeze first"
+            f"Only while a freeze ends, for its frozen term: term {term} isn't "
+            "frozen, or the cluster isn't unfreezing: run --unfreeze first"
         )

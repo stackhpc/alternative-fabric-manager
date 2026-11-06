@@ -457,10 +457,10 @@ Instead, a target leaves the set, with a term compare-and-set, once:
    or that has no route, as for a crashed or powered-off target, counts as
    asked.
 
-`[ha] manual_takeover = true`, a cluster setting, makes every takeover wait
-for an operator to confirm with the CLI that the old leader's OpenSM can't
-act, instead of the unconfirmed wait. A clean release and a verified stop
-still count without an operator.
+There is no option to make every takeover wait for an operator instead of
+the unconfirmed wait: it would trade the paused-node limitation for a fabric
+without a subnet manager until someone acts, and confirmed fencing, a future
+improvement, removes the limitation without that cost.
 
 ### Why the unconfirmed wait is enough
 
@@ -557,9 +557,8 @@ cgroup, so pausing the manager's container doesn't pause it.
   - the **takeover loop**, which runs a takeover and OpenSM's start
     separately from the apply loop: Ask, 5 s, the unconfirmed wait,
     `T_watchdog`, and `start_timeout`, 60 s in HA mode, so `B_takeover` is
-    120 s. Waits with no bound, for an operator under `manual_takeover`
-    or an unacknowledged unfreeze, poll in iterations of a few seconds
-    each;
+    120 s. A wait with no bound, for an unacknowledged unfreeze, polls in
+    iterations of a few seconds each;
   - the lease renewal loop: a call timeout, 3 s.
 
   A call that fails or times out still finishes its iteration. `T_watchdog` must
@@ -679,8 +678,8 @@ moved, until the cluster is unfrozen.
   acknowledgement, treating it as a renewal. Until the leader
   acknowledges, no candidate takes over on expiry: a leader that never
   acknowledges, because it is paused, hung, or cut off, leaves the lease
-  only through a verified stop of its node, or an operator's confirmation
-  that its OpenSM can't act, as with `manual_takeover`; its watchdog's
+  only through a verified stop of its node, or an operator's confirmation,
+  with `--confirm-takeover`, that its OpenSM can't act; its watchdog's
   held deadline, if the freeze had an expiry, stops OpenSM meanwhile. A
   takeover while the freeze is ending is a compare-and-set that requires
   either an operator's confirmation recorded in the lease row while the
@@ -917,7 +916,6 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | The leader cut off from Galera only, or in a minority partition | Its renewals fail, so it stops its OpenSM within `T_self`. The majority side's candidates see the lease unrenewed for `T`, elect a leader, and take over after the unconfirmed wait | Jobs wait through the takeover. No two masters |
 | The leader shut down cleanly | It fails `/healthz`, stops and verifies its OpenSM, and releases the lease | A candidate takes over at once, without waiting |
 | A takeover's winner dies before starting OpenSM | Its targets, and itself, stay in the target set. The next candidate waits for them all | Jobs wait longer |
-| `manual_takeover` set | A candidate takes the lease, asks the old SM to stop, and waits for an operator to confirm | The fabric runs without a subnet manager until then |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
@@ -991,14 +989,13 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       single-use start requests on tmpfs, the file hashes, `T_watchdog` from
       the cluster setting, and SIGKILL of OpenSM on SIGTERM.
 - [ ] Takeovers: SMInfo DISABLE behind `fence_ask`, the unconfirmed wait,
-      `manual_takeover`, rejoining with a verified stop, and the required
-      keys check.
+      rejoining with a verified stop, and the required keys check.
 - [ ] Freeze: `--freeze` (with `--drain` and `--for`) and `--unfreeze`,
       the takeover compare-and-set requiring not frozen, 503 for new
       requests, the leader's hold and the watchdog's held lease, restarting
       OpenSM only on the frozen node, and candidates' timers restarted at
       the unfreeze.
-- [ ] A CLI to confirm a manual takeover, record configuration epochs,
+- [ ] A CLI to confirm a takeover that ends a freeze, record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
       in containers, with faults injected: the leader killed, paused, cut

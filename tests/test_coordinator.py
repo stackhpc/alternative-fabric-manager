@@ -159,25 +159,6 @@ def _takeover(lease, clock, node, **overrides):
     return coordinator, term
 
 
-def test_manual_takeover_needs_a_confirmation_every_time(lease, clock):
-    # A cluster setting, so every instance has it
-    a = make(lease, "a", manual_takeover=True)
-    lead(a)
-    b, term_b = _takeover(lease, clock, "b", manual_takeover=True)
-    long_ago = clock.now - 100
-    # Past the unconfirmed wait, but not confirmed: a stays.
-    assert b._take_over_step(term_b, long_ago, set())
-    assert ("a", a.uuid, 1) in lease.targets()
-    # The operator confirms a's term: a leaves.
-    assert lease.confirm(1)
-    b._take_over_step(term_b, long_ago, set())
-    assert ("a", a.uuid, 1) not in lease.targets()
-    # The next takeover needs a confirmation of its own.
-    c, term_c = _takeover(lease, clock, "c", manual_takeover=True)
-    assert c._take_over_step(term_c, long_ago, set())
-    assert ("b", b.uuid, term_b) in lease.targets()
-
-
 def test_a_committed_freeze_holds_even_if_its_read_back_failed(lease, clock):
     a = make(lease, "a")
     lead(a)
