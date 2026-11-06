@@ -77,6 +77,14 @@ checks this.
 | `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
+| `deferred` | A request whose pkey or GUID another object still holds, its values and its job |
+
+networking-mlnx orders requests per object only, so a network reusing a
+deleted network's VLAN, or a port taking over a deleted port's GUID, can
+arrive before the deletion. Such a request is not refused, which
+networking-mlnx would take as final: its job is created at once, and the
+request is applied when the deletion arrives, or its job fails at its
+deadline. A later request for the same object supersedes it.
 
 A request's transaction starts by bumping the generation, with
 `UPDATE state SET generation = generation + 1`, which locks the row. Only

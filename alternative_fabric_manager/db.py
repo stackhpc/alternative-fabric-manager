@@ -107,6 +107,24 @@ class Quarantine(Base):
     reason: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
 
 
+class Deferred(Base):
+    """A request that waits for another object to give up its pkey or GUID
+
+    networking-mlnx orders requests per object only, so a network that
+    reuses a deleted network's VLAN, or a port that takes over a deleted
+    port's GUID, can arrive before the deletion. The request waits, with
+    its job, until the deletion arrives or the job's deadline passes.
+    """
+
+    __tablename__ = "deferred"
+
+    kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    job_id: orm.Mapped[int] = orm.mapped_column(sa.ForeignKey("jobs.id"))
+    # The request's values, as JSON
+    data: orm.Mapped[str] = orm.mapped_column(sa.Text)
+
+
 class Applied(Base):
     """What OpenSM last swept: one row"""
 

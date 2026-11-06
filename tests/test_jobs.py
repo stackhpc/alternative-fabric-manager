@@ -451,3 +451,79 @@ def test_many_culprits_are_all_quarantined(manager, fabric, monkeypatch):
     manager.reconcile()
     with manager.sessionmaker() as session:
         assert session.query(db.Quarantine).count() == 30
+
+
+def test_a_reused_vlan_waits_for_the_old_networks_deletion(manager, fabric):
+    # networking-mlnx orders requests per object only: a network reusing a
+    # deleted network's VLAN can arrive before the deletion.
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    manager.reconcile()
+    assert _status(manager, created) == db.JobStatus.PENDING
+    assert "waiting" in manager.get_job(created).error
+    # A port on the waiting network waits with it.
+    port = manager.put_port(PORT_ID, conftest.port(network_id=OTHER))
+    deleted = manager.delete_network(NETWORK_ID)
+    manager.reconcile()
+    assert _status(manager, deleted) == db.JobStatus.COMPLETED
+    assert _status(manager, created) == db.JobStatus.COMPLETED
+    assert manager.get_job(created).error == ""
+    assert _status(manager, port) == db.JobStatus.COMPLETED
+    with manager.sessionmaker() as session:
+        assert session.query(db.Deferred).count() == 0
+
+
+def test_a_guid_waits_for_its_old_ports_deletion(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.put_port(PORT_ID, conftest.port())
+    manager.reconcile()
+    created = manager.put_port(OTHER_PORT, conftest.port(port_id=OTHER_PORT))
+    manager.reconcile()
+    assert _status(manager, created) == db.JobStatus.PENDING
+    manager.delete_port(PORT_ID)
+    manager.reconcile()
+    assert _status(manager, created) == db.JobStatus.COMPLETED
+
+
+def test_a_later_request_supersedes_a_waiting_one(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    first = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    second = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.reconcile()
+    assert manager.get_job(first).status == db.JobStatus.FAILED
+    assert "Superseded" in manager.get_job(first).error
+    assert _status(manager, second) == db.JobStatus.COMPLETED
+
+
+def test_deleting_a_waiting_network_drops_it_and_its_ports(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    port = manager.put_port(PORT_ID, conftest.port(network_id=OTHER))
+    deleted = manager.delete_network(OTHER)
+    manager.reconcile()
+    assert _status(manager, created) == db.JobStatus.FAILED
+    assert _status(manager, port) == db.JobStatus.FAILED
+    assert _status(manager, deleted) == db.JobStatus.COMPLETED
+    manager.delete_network(NETWORK_ID)
+    manager.reconcile()
+    with manager.sessionmaker() as session:
+        assert session.query(db.Network).count() == 0
+        assert session.query(db.Deferred).count() == 0
+
+
+def test_a_timed_out_wait_is_dropped(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
+    with manager.sessionmaker() as session:
+        session.get(db.Job, created).deadline = datetime.datetime(
+            2000, 1, 1, tzinfo=datetime.timezone.utc
+        )
+        session.commit()
+    manager.reconcile()
+    assert _status(manager, created) == db.JobStatus.FAILED
+    # The deletion, now, doesn't bring it back.
+    manager.delete_network(NETWORK_ID)
+    manager.reconcile()
+    with manager.sessionmaker() as session:
+        assert session.get(db.Network, OTHER) is None

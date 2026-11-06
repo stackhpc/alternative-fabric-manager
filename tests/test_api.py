@@ -159,14 +159,18 @@ def test_network_needs_a_partition_key(client, segmentation_id):
     assert response.status_code == 400
 
 
-def test_partition_key_can_only_be_used_once(client):
+def test_a_partition_key_in_use_waits_for_its_network(client, manager, config):
     _post(client, "Network", conftest.network())
-    response = _post(
-        client,
-        "Network",
-        conftest.network(network_id="d13bba05-eb07-45ba-ace2-765706b2d701"),
-    )
-    assert response.status_code == 400
+    response = _post(client, "Network", conftest.network(network_id=OTHER))
+    manager.apply_pending()
+    # One partition key, one network: the second waits, and fails at its
+    # deadline if the first is never deleted.
+    assert _job(client, response)["Status"] == "Pending"
+    assert f"net-{OTHER}" not in _file(config)
+    _expire(manager)
+    job = _job(client, response)
+    assert job["Status"] == "Failed"
+    assert "Timed out waiting: partition key 0x0064" in job["Error"]
 
 
 def test_body_needs_an_id(client):
@@ -478,22 +482,23 @@ def test_opensm_conf_only_for_the_managed_driver(manager, config):
     assert not pathlib.Path(config.opensm_conf_file).exists()
 
 
-def test_a_guid_belongs_to_one_port(client):
+def test_a_guid_belongs_to_one_port(client, manager, config):
     # A port whose deletion never arrived, or two ports with one client ID,
     # would otherwise be in two networks' partitions.
-    other = "d13bba05-eb07-45ba-ace2-765706b2d701"
     _post(client, "Network", conftest.network())
-    _post(client, "Network", conftest.network(network_id=other, segmentation_id=200))
+    _post(client, "Network", conftest.network(network_id=OTHER, segmentation_id=200))
     assert _post(client, "Port", conftest.port()).status_code == 202
     response = _post(
         client,
         "Port",
-        conftest.port(port_id="e13bba05-eb07-45ba-ace2-765706b2d701", network_id=other),
+        conftest.port(port_id="e13bba05-eb07-45ba-ace2-765706b2d701", network_id=OTHER),
     )
-    assert response.status_code == 400
+    manager.apply_pending()
+    assert _job(client, response)["Status"] == "Pending"
+    assert _members(config)[0xC8] == {}
     # The same port moving is fine.
     response = client.put(
-        f"{URL}/Port/{PORT_ID}", json=conftest.port(network_id=other), headers=AUTH
+        f"{URL}/Port/{PORT_ID}", json=conftest.port(network_id=OTHER), headers=AUTH
     )
     assert response.status_code == 202
 

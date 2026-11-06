@@ -120,7 +120,11 @@ class Manager:
             )
         )
 
-    def _commit_job(self, session, generation, operation, object_id, effect):
+    def _commit_job(
+        self, session, generation, operation, object_id, effect, waiting=None
+    ):
+        """Create a request's job and commit; a request that must wait is
+        recorded as deferred, waiting = (kind, values, reason)"""
         job = db.Job(
             operation=operation,
             object_id=object_id,
@@ -128,11 +132,91 @@ class Manager:
             effect=effects.dumps(effect),
             deadline=_now() + datetime.timedelta(seconds=self.config.job_timeout),
         )
+        if waiting is not None:
+            kind, values, reason = waiting
+            job.error = f"waiting: {reason}"
+            LOG.info("%s of %s %s waits: %s", operation, kind, object_id, reason)
         session.add(job)
         session.flush()
+        if waiting is not None:
+            session.add(
+                db.Deferred(
+                    kind=kind,
+                    object_id=object_id,
+                    job_id=job.id,
+                    data=json.dumps(values),
+                )
+            )
         session.commit()
         self._wakeup.set()
         return job.id
+
+    @staticmethod
+    def _supersede(session, kind, object_id, reason="Superseded by a later request"):
+        """Drop an object's deferred request, failing its job"""
+        row = session.get(db.Deferred, (kind, object_id))
+        if row is None:
+            return
+        job = session.get(db.Job, row.job_id)
+        if job is not None and job.status in OPEN:
+            job.status = db.JobStatus.FAILED
+            job.error = reason
+            job.finished_at = _now()
+        session.delete(row)
+        session.flush()
+
+    @staticmethod
+    def _network_blocked(session, network_id, values):
+        """Why a network's request must wait, if it must"""
+        pkey = values["pkey"]
+        if pkey is None:
+            return None
+        other = session.scalar(
+            sa.select(db.Network).where(
+                db.Network.pkey == pkey, db.Network.id != network_id
+            )
+        )
+        if other is None:
+            return None
+        return f"partition key 0x{pkey:04x} is still network {other.id}'s"
+
+    @staticmethod
+    def _set_network(session, network_id, values):
+        network = session.get(db.Network, network_id)
+        if network is None:
+            network = db.Network(id=network_id)
+            session.add(network)
+        network.pkey = values["pkey"]
+        network.name = values["name"]
+        session.flush()
+
+    @staticmethod
+    def _port_blocked(session, port_id, values):
+        """Why a port's request must wait, if it must"""
+        if session.get(db.Network, values["network_id"]) is None:
+            return f"network {values['network_id']} is waiting"
+        other = session.scalar(
+            sa.select(db.Port).where(
+                db.Port.guid == values["guid"], db.Port.id != port_id
+            )
+        )
+        if other is None:
+            return None
+        # A GUID can be in only one network's partition. networking-mlnx
+        # deletes a GUID's old port before it sends a new one, but the
+        # deletion can arrive later; if it never does, the job fails.
+        return f"GUID 0x{values['guid']} is still port {other.id}'s"
+
+    @staticmethod
+    def _set_port(session, port_id, values):
+        port = session.get(db.Port, port_id)
+        if port is None:
+            port = db.Port(id=port_id)
+            session.add(port)
+        port.network_id = values["network_id"]
+        port.guid = values["guid"]
+        port.host = values["host"]
+        session.flush()
 
     def put_network(self, network_id, data):
         """Create or update a network's partition"""
@@ -142,37 +226,45 @@ class Manager:
             raise partitions.InvalidRequest(
                 f"Partition key 0x{pkey:04x} of network {network_id} is reserved"
             )
+        values = {"pkey": pkey, "name": str(data.get("name") or "")[:255]}
         with self._lock, self.sessionmaker() as session:
-            if pkey is not None:
-                other = session.scalar(
-                    sa.select(db.Network).where(
-                        db.Network.pkey == pkey, db.Network.id != network_id
-                    )
-                )
-                if other is not None:
-                    raise partitions.InvalidRequest(
-                        f"Partition key 0x{pkey:04x} is already network {other.id}'s"
-                    )
             generation = self._bump(session)
-            network = session.get(db.Network, network_id)
-            if network is None:
-                network = db.Network(id=network_id)
-                session.add(network)
-            network.pkey = pkey
-            network.name = str(data.get("name") or "")[:255]
+            self._supersede(session, "network", network_id)
             self._release(session, "network", network_id)
+            effect = effects.network_present(network_id, pkey)
+            reason = self._network_blocked(session, network_id, values)
+            if reason:
+                return self._commit_job(
+                    session,
+                    generation,
+                    "put_network",
+                    network_id,
+                    effect,
+                    ("network", values, reason),
+                )
+            self._set_network(session, network_id, values)
             return self._commit_job(
-                session,
-                generation,
-                "put_network",
-                network_id,
-                effects.network_present(network_id, pkey),
+                session, generation, "put_network", network_id, effect
             )
 
     def delete_network(self, network_id):
         partitions.check_id(network_id)
         with self._lock, self.sessionmaker() as session:
             generation = self._bump(session)
+            self._supersede(
+                session, "network", network_id, "Superseded by its deletion"
+            )
+            for row in list(session.scalars(sa.select(db.Deferred))):
+                if (
+                    row.kind == "port"
+                    and json.loads(row.data)["network_id"] == network_id
+                ):
+                    self._supersede(
+                        session,
+                        "port",
+                        row.object_id,
+                        f"Network {network_id} was deleted",
+                    )
             ports = list(
                 session.scalars(
                     sa.select(db.Port).where(db.Port.network_id == network_id)
@@ -208,22 +300,15 @@ class Manager:
         partitions.check_id(port_id)
         guid = partitions.guid_from_port(data)
         network_id = data.get("network_id")
+        values = {
+            "network_id": network_id,
+            "guid": f"{guid:016x}",
+            "host": str(data.get("binding:host_id") or "")[:255],
+        }
         with self._lock, self.sessionmaker() as session:
-            other = session.scalar(
-                sa.select(db.Port).where(
-                    db.Port.guid == f"{guid:016x}", db.Port.id != port_id
-                )
-            )
-            if other is not None:
-                # A GUID can be in only one network's partition. networking-mlnx
-                # deletes a GUID's old port before it sends a new one, so this is
-                # a port whose deletion never arrived, or two ports with one
-                # client ID.
-                raise partitions.InvalidRequest(
-                    f"Port {port_id} has the GUID of port {other.id}"
-                )
             network = session.get(db.Network, network_id)
-            if network is None:
+            waiting_network = session.get(db.Deferred, ("network", network_id))
+            if network is None and waiting_network is None:
                 # The network was never sent, or its request failed. Fail
                 # rather than let the port become ACTIVE outside its
                 # partition.
@@ -237,28 +322,34 @@ class Manager:
                     f"Port {port_id} is on network {network_id}, which is "
                     f"quarantined: {quarantined.reason}"
                 )
+            if network is not None:
+                pkey = network.pkey
+            else:
+                pkey = json.loads(waiting_network.data)["pkey"]
             generation = self._bump(session)
-            port = session.get(db.Port, port_id)
-            if port is None:
-                port = db.Port(id=port_id)
-                session.add(port)
-            port.network_id = network_id
-            port.guid = f"{guid:016x}"
-            port.host = str(data.get("binding:host_id") or "")[:255]
+            self._supersede(session, "port", port_id)
             self._release(session, "port", port_id)
-            pkey = network.pkey if network.pkey is not None else self.config.flat_pkey
-            return self._commit_job(
-                session,
-                generation,
-                "put_port",
-                port_id,
-                effects.port_present(port_id, pkey, port.guid),
+            effect = effects.port_present(
+                port_id, self.config.flat_pkey if pkey is None else pkey, values["guid"]
             )
+            reason = self._port_blocked(session, port_id, values)
+            if reason:
+                return self._commit_job(
+                    session,
+                    generation,
+                    "put_port",
+                    port_id,
+                    effect,
+                    ("port", values, reason),
+                )
+            self._set_port(session, port_id, values)
+            return self._commit_job(session, generation, "put_port", port_id, effect)
 
     def delete_port(self, port_id):
         partitions.check_id(port_id)
         with self._lock, self.sessionmaker() as session:
             generation = self._bump(session)
+            self._supersede(session, "port", port_id, "Superseded by its deletion")
             port = session.get(db.Port, port_id)
             guid = port.guid if port is not None else None
             if port is not None:
@@ -273,6 +364,36 @@ class Manager:
                 port_id,
                 effects.port_absent(port_id, guid),
             )
+
+    def retry_deferred(self):
+        """Apply the deferred requests that no longer have to wait, oldest
+        first; drop those whose jobs have ended"""
+        with self._lock, self.sessionmaker() as session:
+            rows = list(
+                session.scalars(sa.select(db.Deferred).order_by(db.Deferred.job_id))
+            )
+            for row in rows:
+                job = session.get(db.Job, row.job_id)
+                if job is None or job.status not in OPEN:
+                    session.delete(row)
+                    continue
+                values = json.loads(row.data)
+                if row.kind == "network":
+                    blocked = self._network_blocked(session, row.object_id, values)
+                else:
+                    blocked = self._port_blocked(session, row.object_id, values)
+                if blocked:
+                    continue
+                LOG.info("Applying the waiting %s %s", job.operation, row.object_id)
+                job.generation = self._bump(session)
+                job.error = ""
+                if row.kind == "network":
+                    self._set_network(session, row.object_id, values)
+                else:
+                    self._set_port(session, row.object_id, values)
+                session.delete(row)
+                session.flush()
+            session.commit()
 
     def get_job(self, job_id):
         with self._lock, self.sessionmaker() as session:
@@ -292,7 +413,11 @@ class Manager:
         if _now() <= _aware(job.deadline):
             return False
         job.status = db.JobStatus.FAILED
-        job.error = job.error or "Timed out waiting for OpenSM to apply it"
+        if job.error.startswith("waiting: "):
+            # A deferred request, whose wait never ended
+            job.error = "Timed out " + job.error
+        else:
+            job.error = job.error or "Timed out waiting for OpenSM to apply it"
         job.finished_at = _now()
         return True
 
@@ -892,8 +1017,9 @@ class Manager:
         return effects.holds(effect, attribution)
 
     def reconcile(self):
-        """Sync OpenSM, check the fabric, and complete the jobs it has
-        applied"""
+        """Apply the requests that no longer wait, sync OpenSM, check the
+        fabric, and complete the jobs it has applied"""
+        self.retry_deferred()
         self.sync()
         self.check_fabric()
         self.evaluate_jobs()
