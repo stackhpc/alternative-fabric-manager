@@ -23,7 +23,9 @@ The deployment must:
 - mount the host's /proc read-only at [ha] host_proc, /host/proc, so that the
   manager can verify that no OpenSM runs on the host, in any container;
 - create the manager's container with a stop timeout above
-  [ha] shutdown_timeout, 30 s.
+  [ha] shutdown_timeout, 30 s, and with an init process (docker run
+  --init), which reaps the OpenSM processes that the shared PID namespace
+  reparents to it.
 """
 
 import contextlib
@@ -81,7 +83,9 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             self.state_dir,
             "--",
         ]
-        kwargs["command"] = ["/usr/sbin/opensm", "-F", conf]
+        # The image's own start script, which loads the kernel modules and
+        # runs OpenSM logging to stdout, where the driver reads its markers
+        kwargs["command"] = [self.config.opensm_start, "-F", conf]
         kwargs["volumes"] = [*kwargs["volumes"], f"{self.state_dir}:{self.state_dir}"]
         return kwargs
 
@@ -170,10 +174,15 @@ class HAManagedDocker(docker_driver.ManagedDocker):
                 continue
             try:
                 with open(os.path.join(proc, pid, "comm")) as f:
-                    if f.read().strip() == "opensm":
-                        pids.append(int(pid))
-            except OSError:
+                    if f.read().strip() != "opensm":
+                        continue
+                with open(os.path.join(proc, pid, "stat")) as f:
+                    state = f.read().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
                 continue
+            # A zombie has exited, and can't act, whoever has yet to reap it.
+            if state not in ("Z", "X"):
+                pids.append(int(pid))
         return pids
 
     def verify_stopped(self):

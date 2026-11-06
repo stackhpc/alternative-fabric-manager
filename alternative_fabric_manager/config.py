@@ -150,6 +150,8 @@ class Config:
     ha_state_dir: str = "/run/alternative-fabric-manager"
     # The host's /proc, mounted read-only, to verify no OpenSM runs
     host_proc: str = "/host/proc"
+    # OpenSM's image's start script, which the watchdog runs
+    opensm_start: str = "/start.sh"
     # The rule for the default partition. All flat networks share it. Keep
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
@@ -424,6 +426,7 @@ OPTIONS = (
             "step_down_cooldown",
             "ha_state_dir",
             "host_proc",
+            "opensm_start",
         ),
     ),
 )

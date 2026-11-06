@@ -69,7 +69,7 @@ def test_opensm_runs_under_the_watchdog_with_a_start_request(driver, config):
     driver.start()
     run = driver.client.runs[-1]
     assert run["entrypoint"][:2] == ["python3", f"{config.ha_state_dir}/watchdog.py"]
-    assert run["command"][0] == "/usr/sbin/opensm"
+    assert run["command"][0] == "/start.sh"
     assert f"{config.ha_state_dir}:{config.ha_state_dir}" in run["volumes"]
     assert os.path.exists(os.path.join(config.ha_state_dir, "watchdog.py"))
     with open(os.path.join(config.ha_state_dir, wd.START)) as f:
@@ -102,6 +102,8 @@ def test_verify_stopped_looks_at_every_process_on_the_host(driver, config):
     os.makedirs(os.path.join(config.host_proc, "4242"))
     with open(os.path.join(config.host_proc, "4242", "comm"), "w") as f:
         f.write("opensm\n")
+    with open(os.path.join(config.host_proc, "4242", "stat"), "w") as f:
+        f.write("4242 (opensm) S 1 0 0")
     assert not driver.verify_stopped()
 
 
@@ -185,3 +187,12 @@ def test_reach_ignores_a_down_port_beside_an_up_one(driver):
     down_only = REAL_IBSTAT.split(b"CA 'mlx5_1'")[1]
     driver.client.probe = b"CA 'mlx5_1'" + down_only + b"===\n" + SWITCHES
     assert driver.reach() is None
+
+
+def test_a_zombie_opensm_counts_as_stopped(driver, config):
+    os.makedirs(os.path.join(config.host_proc, "4243"))
+    with open(os.path.join(config.host_proc, "4243", "comm"), "w") as f:
+        f.write("opensm\n")
+    with open(os.path.join(config.host_proc, "4243", "stat"), "w") as f:
+        f.write("4243 (opensm) Z 1 0 0")
+    assert driver.verify_stopped()
