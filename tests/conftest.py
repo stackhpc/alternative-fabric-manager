@@ -1,9 +1,12 @@
+import os
+
 import pytest
 from fastapi import testclient
 
 from alternative_fabric_manager import api, db
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
+from alternative_fabric_manager.drivers import SweepReport
 
 TOKEN = "dGVzdDp0ZXN0"
 AUTH = {"Authorization": f"Basic {TOKEN}"}
@@ -25,6 +28,11 @@ class FakeReloader:
         self.starts = 0
         self.is_running = True
         self.stopped = False
+        # What reload() reports, and what fabric() returns: None for no
+        # fabric to check, a Fabric, or an exception to raise
+        self.report = None
+        self.fabric_result = None
+        self.fabric_calls = []
 
     def start(self):
         self.starts += 1
@@ -42,6 +50,32 @@ class FakeReloader:
             self.during()
         if self.error:
             raise self.error
+        return self.report or SweepReport()
+
+    def fabric(self, m_key=None, sa_key=None):
+        self.fabric_calls.append((m_key, sa_key))
+        if isinstance(self.fabric_result, Exception):
+            raise self.fabric_result
+        return self.fabric_result
+
+
+# AFM_TEST_DATABASE_URL runs the tests against a server, such as
+# mysql+pymysql://root:<password>@127.0.0.1:3399/afm_test: its database is
+# dropped and created again for each test.
+SERVER_URL = os.environ.get("AFM_TEST_DATABASE_URL")
+
+
+def _fresh_server_database(url):
+    import sqlalchemy as sa
+
+    parsed = sa.engine.make_url(url)
+    engine = sa.create_engine(parsed.set(database=""))
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f"DROP DATABASE IF EXISTS `{parsed.database}`")
+        connection.exec_driver_sql(f"CREATE DATABASE `{parsed.database}`")
+    engine.dispose()
+    db.upgrade(url)
+    return url
 
 
 @pytest.fixture
@@ -50,6 +84,7 @@ def config(tmp_path):
         token=TOKEN,
         driver="none",
         database=":memory:",
+        connection=_fresh_server_database(SERVER_URL) if SERVER_URL else "",
         config_dir=str(tmp_path),
     )
 
@@ -62,7 +97,9 @@ def reloader():
 @pytest.fixture
 def manager(config, reloader, monkeypatch):
     monkeypatch.setattr(manager_mod, "RETRY_DELAY", 0)
-    return manager_mod.Manager(config, db.make_sessionmaker(config.database), reloader)
+    return manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), reloader
+    )
 
 
 @pytest.fixture

@@ -18,6 +18,18 @@ import os
 
 import sqlalchemy as sa
 from sqlalchemy import orm
+from sqlalchemy.dialects import mysql
+
+# UTC timestamps, to the microsecond on MariaDB too, whose DATETIME has
+# whole seconds unless asked otherwise
+Timestamp = sa.DateTime(timezone=True).with_variant(
+    mysql.DATETIME(fsp=6), "mysql", "mariadb"
+)
+# Each database call's timeout, in seconds: a call blocked on an
+# unreachable database must not hold up its loop (see specs/ha.md)
+CALL_TIMEOUT = 3
+# MariaDB's error for a variable the server doesn't have
+UNKNOWN_SYSTEM_VARIABLE = 1193
 
 
 class Base(orm.DeclarativeBase):
@@ -79,13 +91,154 @@ class Job(Base):
     )
     operation: orm.Mapped[str] = orm.mapped_column(sa.String(64))
     object_id: orm.Mapped[str] = orm.mapped_column(sa.String(36))
+    # The first generation of the state that includes the change
+    generation: orm.Mapped[int] = orm.mapped_column(default=0, index=True)
+    # What must hold in a swept partitions file for the job to complete, as
+    # JSON (see effects.py)
+    effect: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
+    deadline: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
     error: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
     created_at: orm.Mapped[datetime.datetime] = orm.mapped_column(
-        sa.DateTime(timezone=True), default=_now
+        Timestamp, default=_now
     )
     finished_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
-        sa.DateTime(timezone=True), nullable=True
+        Timestamp, nullable=True
     )
+
+
+class Quarantine(Base):
+    """A network or port left out of the partitions file, because it broke
+    a render or OpenSM's parse of it, until its next change"""
+
+    __tablename__ = "quarantine"
+
+    kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    reason: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+
+
+class Deferred(Base):
+    """A request that waits for another object to give up its pkey or GUID
+
+    networking-mlnx orders requests per object only, so a network that
+    reuses a deleted network's VLAN, or a port that takes over a deleted
+    port's GUID, can arrive before the deletion. The request waits, with
+    its job, until the deletion arrives or the job's deadline passes.
+    """
+
+    __tablename__ = "deferred"
+
+    kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    job_id: orm.Mapped[int] = orm.mapped_column(sa.ForeignKey("jobs.id"))
+    # The request's values, as JSON
+    data: orm.Mapped[str] = orm.mapped_column(sa.Text)
+
+
+class Applied(Base):
+    """What OpenSM last swept: one row"""
+
+    __tablename__ = "applied"
+
+    id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
+    generation: orm.Mapped[int] = orm.mapped_column(default=0)
+    # The leader's term when it swept, and whether a check since saw another
+    # master, so that every instance can judge jobs (see specs/ha.md)
+    term: orm.Mapped[int] = orm.mapped_column(default=0)
+    contested: orm.Mapped[bool] = orm.mapped_column(default=False)
+    body: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+    # Which network each partition, and which port each membership, of the
+    # body comes from, as JSON (see partitions.attribute())
+    attribution: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
+    # GUIDs whose pkey tables OpenSM couldn't set in that sweep, and switch
+    # ports whose partition enforcement it cleared, as JSON lists
+    pkey_errors: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    enforcement_errors: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # The last fabric check
+    check_ok: orm.Mapped[bool] = orm.mapped_column(default=False)
+    check_time: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+
+
+class ExpectedSwitch(Base):
+    """A switch that a complete fabric has, as an operator confirmed"""
+
+    __tablename__ = "expected_switches"
+
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+
+
+class Lease(Base):
+    """Which instance leads, and runs OpenSM: one row (see specs/ha.md)"""
+
+    __tablename__ = "lease"
+
+    id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
+    holder_node: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    holder_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    # Only goes up; every leader's write to the database is a compare-and-set
+    # on it
+    term: orm.Mapped[int] = orm.mapped_column(default=0)
+    # The holder bumps it to renew; others watch it for expiry.
+    counter: orm.Mapped[int] = orm.mapped_column(sa.BigInteger, default=0)
+    released: orm.Mapped[bool] = orm.mapped_column(default=True)
+    moved_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # The freeze: "", "requested", "frozen" or "ending"
+    freeze_state: orm.Mapped[str] = orm.mapped_column(sa.String(16), default="")
+    freeze_term: orm.Mapped[int] = orm.mapped_column(default=0)
+    freeze_by: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    freeze_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # A request's deadline for the leader's acknowledgement
+    freeze_request_deadline: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    freeze_expires: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+    # An operator's confirmation that the holder's OpenSM can't act, for a
+    # manual takeover, or one while a freeze is ending: the term it's for
+    confirmed_term: orm.Mapped[int] = orm.mapped_column(default=0)
+
+
+class TargetEntry(Base):
+    """An instance that may have run OpenSM since the last verified stop"""
+
+    __tablename__ = "target_entries"
+
+    node: orm.Mapped[str] = orm.mapped_column(sa.String(255), primary_key=True)
+    instance_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), primary_key=True)
+    term: orm.Mapped[int] = orm.mapped_column()
+    # A frozen leader's entry: its watchdog lease is held, so the unconfirmed
+    # wait doesn't stop its OpenSM, and it leaves only verified or confirmed
+    held: orm.Mapped[bool] = orm.mapped_column(default=False)
+
+
+class Node(Base):
+    """A manager instance's node, as it registers and heartbeats"""
+
+    __tablename__ = "nodes"
+
+    name: orm.Mapped[str] = orm.mapped_column(sa.String(255), primary_key=True)
+    instance_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    heartbeat: orm.Mapped[int] = orm.mapped_column(sa.BigInteger, default=0)
+    config_hash: orm.Mapped[str] = orm.mapped_column(sa.String(64), default="")
+    # Expected switches it reaches from its own port
+    reach: orm.Mapped[int] = orm.mapped_column(default=0)
+    # Its adapters' node GUIDs, as a JSON list of hex strings
+    adapters: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # Its OpenSM verified stopped: by which instance, at which lease term
+    verified_stop_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
+    verified_stop_term: orm.Mapped[int] = orm.mapped_column(default=-1)
+    # Stopped cleanly, so not a live candidate
+    stopped: orm.Mapped[bool] = orm.mapped_column(default=False)
 
 
 class Secret(Base):
@@ -106,7 +259,142 @@ class State(Base):
     value: orm.Mapped[int] = orm.mapped_column(default=0)
 
 
-def make_sessionmaker(database):
+# Columns added to existing tables since the first release, until the
+# schema is managed by Alembic
+_ADDED_COLUMNS = {
+    "applied": {
+        "term": "INTEGER NOT NULL DEFAULT 0",
+        "contested": "BOOLEAN NOT NULL DEFAULT 0",
+    },
+    "jobs": {
+        "generation": "INTEGER NOT NULL DEFAULT 0",
+        "effect": "TEXT NOT NULL DEFAULT '{}'",
+        "deadline": "DATETIME",
+    },
+}
+
+
+def _upgrade(engine):
+    """Add the columns an older database lacks
+
+    Jobs from before effects existed can't be judged, so the open ones fail,
+    and networking-mlnx sends their requests again.
+    """
+    inspector = sa.inspect(engine)
+    missing = {
+        table: [
+            name
+            for name in columns
+            if name not in {c["name"] for c in inspector.get_columns(table)}
+        ]
+        for table, columns in _ADDED_COLUMNS.items()
+    }
+    with engine.begin() as connection:
+        for table, names in missing.items():
+            for name in names:
+                definition = _ADDED_COLUMNS[table][name]
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
+        # create_all() leaves existing tables' indexes alone.
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_generation ON jobs (generation)"
+        )
+        if "effect" in missing["jobs"]:
+            connection.execute(
+                sa.update(Job.__table__)
+                .where(
+                    Job.__table__.c.status.in_([JobStatus.PENDING, JobStatus.RUNNING])
+                )
+                .values(status=JobStatus.FAILED, error="Superseded by an upgrade")
+            )
+
+
+class SchemaError(Exception):
+    """The database's schema isn't the one this version needs"""
+
+
+def _alembic_config(url):
+    from alembic.config import Config
+
+    config = Config()
+    config.set_main_option(
+        "script_location", os.path.join(os.path.dirname(__file__), "migrations")
+    )
+    # Alembic's options are interpolated, so a literal % must be doubled.
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    return config
+
+
+def upgrade(url):
+    """Bring a server database's schema up to date, at deploy time"""
+    from alembic import command
+
+    command.upgrade(_alembic_config(url), "head")
+
+
+def _check_schema(engine):
+    """Refuse a server database whose schema isn't this version's"""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(
+        _alembic_config(engine.url.render_as_string(hide_password=False))
+    ).get_current_head()
+    with engine.connect() as connection:
+        current = MigrationContext.configure(connection).get_current_revision()
+    if current != head:
+        raise SchemaError(
+            f"The database's schema is at {current or 'nothing'}, not {head}: "
+            "run alternative-fabric-manager --db-upgrade"
+        )
+
+
+def _make_server_engine(url, call_timeout=CALL_TIMEOUT):
+    """An engine for MariaDB or Galera"""
+    timeout = max(1, int(call_timeout))
+    engine = sa.create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        connect_args={
+            "connect_timeout": timeout,
+            "read_timeout": timeout,
+            "write_timeout": timeout,
+        },
+    )
+
+    @sa.event.listens_for(engine, "connect")
+    def _session_settings(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET SESSION time_zone = '+00:00'")
+        # Read what other Galera nodes have committed (see specs/ha.md). A
+        # server without wsrep has no such variable, but any other failure
+        # must not be hidden.
+        try:
+            cursor.execute("SET SESSION wsrep_sync_wait = 1")
+        except Exception as e:
+            if UNKNOWN_SYSTEM_VARIABLE not in getattr(e, "args", ())[:1]:
+                raise
+        cursor.close()
+
+    return engine
+
+
+def make_sessionmaker(database, call_timeout=CALL_TIMEOUT):
+    """Return a session factory for an SQLite file, or a database URL
+
+    An SQLite file's schema is created, and upgraded in place; a server
+    database's is managed with Alembic, at deploy time.
+    """
+    if "://" in database:
+        engine = _make_server_engine(database, call_timeout)
+        _check_schema(engine)
+        return orm.sessionmaker(engine, expire_on_commit=False)
+    return _make_sqlite_sessionmaker(database)
+
+
+def _make_sqlite_sessionmaker(database):
     """Return a session factory for an SQLite file, creating the schema"""
     if database != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(database)), exist_ok=True)
@@ -125,6 +413,7 @@ def make_sessionmaker(database):
         cursor.close()
 
     Base.metadata.create_all(engine)
+    _upgrade(engine)
     if database != ":memory:":
         # It holds the fabric's OpenSM keys.
         os.chmod(database, 0o600)

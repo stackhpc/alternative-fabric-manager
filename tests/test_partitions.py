@@ -223,3 +223,20 @@ def test_default_template_with_flat_ports_in_the_default(config):
     content = _render(config, [(flat, [GUID])])
     assert "flat=" not in content
     partitions.validate(content, {}, {GUID}, flat_pkey=0x7FFF)
+
+
+def test_attribute_maps_line_numbers_to_objects():
+    content = (
+        "# header\n"
+        "Default=0x7fff, ipoib : ALL=limited, SELF=full ;\n"
+        "net-a=0x0064, indx0 : 0x1=full ;\n"
+        "net-a=0x0064, indx0 :\n  0x2=full ;\n"
+    )
+    result = partitions.attribute(content, {0x64: "a"}, {1: "p1", 2: "p2"})
+    assert result["partitions"] == {"100": "a"}
+    assert result["members"] == {"p1": [[100, "full"]], "p2": [[100, "full"]]}
+    assert result["lines"] == {
+        "2": [],
+        "3": [["network", "a"], ["port", "p1"]],
+        "4": [["network", "a"], ["port", "p2"]],
+    }

@@ -14,9 +14,12 @@
 
 A driver has:
 - start(): start OpenSM, once its partitions file is written, and return
-  once it is running;
+  once it is running: a SweepReport if it saw OpenSM's first sweep, which
+  read that file, or None if it can't tell;
 - running(): whether OpenSM is still running;
-- reload(): make OpenSM apply the partitions file, and return once it has;
+- reload(): make OpenSM apply the partitions file, and return a SweepReport
+  once it has; raise PartitionsRejected if it couldn't parse it;
+- fabric(): return a Fabric, or None if there is no fabric to check;
 - stop(): stop OpenSM, if the driver started it.
 """
 
@@ -25,17 +28,57 @@ class ReloadError(Exception):
     """OpenSM didn't confirm that it applied the partitions file"""
 
 
+class PartitionsRejected(ReloadError):
+    """OpenSM couldn't parse a line of the partitions file"""
+
+    def __init__(self, message, line=None):
+        super().__init__(message)
+        self.line = line
+
+
+# An error that names no port it can be traced to
+UNATTRIBUTED = "unattributed"
+
+
+class SweepReport:
+    """What OpenSM reported, while applying a partitions file, about ports
+    whose pkey tables it couldn't set"""
+
+    def __init__(self, pkey_errors=(), enforcement_errors=(), unattributed=False):
+        # Port GUIDs, as ints
+        self.pkey_errors = set(pkey_errors)
+        # Whether some pkey error named no port GUID
+        self.unattributed = unattributed
+        # Switch ports whose partition enforcement OpenSM cleared, as
+        # "<switch GUID>:<port>", or UNATTRIBUTED
+        self.enforcement_errors = set(enforcement_errors)
+
+
+class Fabric:
+    """What a fabric check sees: switch GUIDs, and the subnet managers the SA
+    knows, as (port GUID, state) pairs, state 3 being master; and the GUIDs
+    of the ports of OpenSM's host, one of which it is bound to"""
+
+    def __init__(self, switches, sms, own_guids):
+        self.switches = set(switches)
+        self.sms = list(sms)
+        self.own_guids = set(own_guids)
+
+
 class NoOpenSM:
     """Only write the files, for tests and for reloading by other means"""
 
     def start(self):
-        pass
+        return None
 
     def running(self):
         return True
 
     def reload(self):
-        pass
+        return SweepReport()
+
+    def fabric(self, m_key=None, sa_key=None):
+        return None
 
     def stop(self):
         pass

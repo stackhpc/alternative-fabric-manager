@@ -7,15 +7,18 @@ license = "Apache-2.0"
 authors = [{ name = "StackHPC" }]
 requires-python = ">=3.10"
 dependencies = [
+    "alembic>=1.13",
     "docker>=7.0",
     "fastapi>=0.115",
     "jinja2>=3.1.6",
+    "pymysql>=1.1",
     "sqlalchemy>=2.0",
     "uvicorn>=0.30",
 ]
 
 [project.scripts]
 alternative-fabric-manager = "alternative_fabric_manager.cli:main"
+alternative-fabric-manager-watchdog = "alternative_fabric_manager.ha.watchdog:main"
 
 [dependency-groups]
 dev = [
@@ -36,7 +39,7 @@ target-version = "py310"
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106"]
+"tests/*" = ["S101", "S105", "S106", "S603", "S607", "SIM105", "S310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -15,6 +15,7 @@
 import configparser
 import dataclasses
 import os
+import socket
 
 # Every port is only a limited member of the default partition, so that ports
 # can't reach each other there; flat networks' ports are added as full
@@ -70,7 +71,17 @@ class Config:
     token: str = ""
 
     # [database]
+    # An SQLite file, for a single instance
     database: str = "/var/lib/alternative-fabric-manager/afm.sqlite"
+    # Or a database URL, mysql+pymysql://user:password@host/afm for MariaDB
+    # or Galera, which overrides it. The schema is then managed with
+    # alternative-fabric-manager --db-upgrade.
+    connection: str = ""
+
+    @property
+    def database_url(self):
+        """The database to use: the connection URL, or the SQLite file"""
+        return self.connection or self.database
 
     # [opensm]
     # managed: the manager runs OpenSM in a container of its own, in the
@@ -102,8 +113,49 @@ class Config:
     sweep_timeout: float = 30.0
     # Seconds between checks that OpenSM is running (managed).
     check_interval: float = 5.0
-    # Times to try applying a change before its jobs fail.
+    # Times to try applying a change in a row, before the manager waits for
+    # the next check_interval.
     apply_attempts: int = 3
+    # Seconds after which a job that hasn't completed fails. networking-mlnx
+    # sets a port whose job failed to ERROR, so this must be longer than the
+    # longest the manager can take to apply a change.
+    job_timeout: float = 180.0
+
+    # [ha] (see specs/ha.md). Times are in seconds.
+    ha: bool = False
+    # This instance's node, unique in the cluster
+    node: str = dataclasses.field(default_factory=socket.gethostname)
+    # T: how long a lease goes unrenewed before candidates take it
+    lease_timeout: float = 30.0
+    # T_self: how long a leader goes without renewing before it stops OpenSM
+    self_stop_timeout: float = 20.0
+    # T_watchdog: the watchdog's lease, and the unconfirmed wait
+    watchdog_timeout: float = 45.0
+    # T_reach: how long candidates wait for one that reaches every switch
+    reach_timeout: float = 30.0
+    # How often leases are renewed and read
+    ha_period: float = 2.0
+    # Every database call's timeout
+    call_timeout: float = 3.0
+    # Ask the old leader's SM to disable itself, at a takeover
+    fence_ask: bool = True
+    # Wait for an operator's confirmation at every takeover
+    manual_takeover: bool = False
+    # How long a step-down at SIGTERM may take
+    shutdown_timeout: float = 20.0
+    # The manager's container's stop timeout, which the deployment sets: 30 s
+    # with docker run --stop-timeout, Docker's default of 10 s otherwise, as
+    # with Kayobe's controller_containers
+    container_stop_timeout: float = 30.0
+    # How long after leadership moves its discretionary triggers wait, so
+    # that a fault every node shares can't bounce it between them
+    step_down_cooldown: float = 300.0
+    # The tmpfs that the manager and OpenSM's watchdog share
+    ha_state_dir: str = "/run/alternative-fabric-manager"
+    # The host's /proc, mounted read-only, to verify no OpenSM runs
+    host_proc: str = "/host/proc"
+    # OpenSM's image's start script, which the watchdog runs
+    opensm_start: str = "/start.sh"
     # The rule for the default partition. All flat networks share it. Keep
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
@@ -184,9 +236,16 @@ class Config:
         config.validate()
         return config
 
+    def _validate_ha(self):
+        problems = _ha_problems(self)
+        if problems:
+            raise ConfigError("[ha] " + "; ".join(problems))
+
     def validate(self):
         if not self.token:
             raise ConfigError("[api] token must be set")
+        if self.ha:
+            self._validate_ha()
         if self.driver not in DRIVERS:
             raise ConfigError(f"[opensm] driver must be one of {', '.join(DRIVERS)}")
         if not self.default_partition.strip().endswith(";"):
@@ -203,7 +262,7 @@ class Config:
             raise ConfigError(
                 "[opensm] hardening is either all, none, or a list of groups"
             )
-        for name in ("start_timeout", "sweep_timeout", "check_interval"):
+        for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
         for name, low, high in (
@@ -242,9 +301,89 @@ class Config:
                 raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
 
 
+def ha_settings(config):
+    """The settings every instance of a cluster must share, as stored"""
+    import json
+
+    return json.dumps(
+        {
+            name: getattr(config, name)
+            for name in (
+                "lease_timeout",
+                "self_stop_timeout",
+                "watchdog_timeout",
+                "reach_timeout",
+                "ha_period",
+                "call_timeout",
+                "fence_ask",
+                "manual_takeover",
+                "job_timeout",
+                "step_down_cooldown",
+            )
+        },
+        sort_keys=True,
+    )
+
+
+def _ha_problems(config):
+    """The timing inequalities of specs/ha.md that a configuration breaks"""
+    problems = []
+    if not config.connection:
+        problems.append("[database] connection must name a server database")
+    if (
+        config.self_stop_timeout + config.ha_period + config.call_timeout
+        >= config.lease_timeout
+    ):
+        problems.append(
+            "self_stop_timeout + ha_period + call_timeout must be less than "
+            "lease_timeout"
+        )
+    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    takeover = (
+        apply_bound
+        + config.lease_timeout
+        + config.ha_period
+        + config.reach_timeout
+        + 5
+        + config.watchdog_timeout
+        + config.start_timeout
+        + 5
+    )
+    if config.job_timeout <= takeover:
+        problems.append(
+            f"[opensm] job_timeout must exceed {takeover:.0f} s, a takeover's "
+            "longest, so that no job times out during one; HA deployments use "
+            "300 s, with Nova's vif_plugging_timeout at 420 s"
+        )
+    if config.shutdown_timeout >= config.container_stop_timeout:
+        problems.append(
+            "shutdown_timeout must be less than container_stop_timeout, the "
+            "manager's container's stop timeout"
+        )
+    if config.watchdog_timeout <= config.ha_period + config.call_timeout:
+        problems.append("watchdog_timeout must exceed ha_period + call_timeout")
+    if config.driver != "managed":
+        problems.append("[opensm] driver must be managed: the manager starts OpenSM")
+    if not config.manager_container:
+        problems.append(
+            "[opensm] manager_container must name the manager's container, "
+            "whose PID namespace OpenSM joins, so that it dies with the manager"
+        )
+    # Without them, a tenant's SM could set ports or win a handover, and Ask
+    # has no key (see Fencing, Required keys).
+    missing = {"m_key", "sm_key"} - config.hardening_groups
+    if missing:
+        problems.append(
+            "[opensm] hardening must include " + " and ".join(sorted(missing))
+        )
+    if str(config.opensm_conf.get("m_key_protection_level", "1")) == "0":
+        problems.append("M_Key protection level must be 1 or more")
+    return problems
+
+
 OPTIONS = (
     ("api", ("host", "port", "url_prefix", "domain", "token")),
-    ("database", ("database",)),
+    ("database", ("database", "connection")),
     (
         "opensm",
         (
@@ -261,12 +400,34 @@ OPTIONS = (
             "sweep_timeout",
             "check_interval",
             "apply_attempts",
+            "job_timeout",
             "default_partition",
             "flat_pkey",
             "shared_default_partition",
             "ipoib_rate",
             "ipoib_mtu",
             "ipoib_sl",
+        ),
+    ),
+    (
+        "ha",
+        (
+            "ha",
+            "node",
+            "lease_timeout",
+            "self_stop_timeout",
+            "watchdog_timeout",
+            "reach_timeout",
+            "ha_period",
+            "call_timeout",
+            "fence_ask",
+            "manual_takeover",
+            "shutdown_timeout",
+            "container_stop_timeout",
+            "step_down_cooldown",
+            "ha_state_dir",
+            "host_proc",
+            "opensm_start",
         ),
     ),
 )

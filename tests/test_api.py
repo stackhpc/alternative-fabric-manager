@@ -6,6 +6,8 @@ from alternative_fabric_manager import db
 from tests import conftest
 from tests.conftest import AUTH, GUID, NETWORK_ID, PORT_ID, URL
 
+OTHER = "d13bba05-eb07-45ba-ace2-765706b2d701"
+
 
 def _post(client, kind, body):
     return client.post(f"{URL}/{kind}", json=body, headers=AUTH)
@@ -22,12 +24,22 @@ def _file(config):
     return pathlib.Path(config.partitions_file).read_text()
 
 
+def _expire(manager):
+    """Put every open job past its deadline"""
+    import datetime
+
+    with manager.sessionmaker() as session:
+        for job in session.query(db.Job):
+            job.deadline = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+        session.commit()
+
+
 def _members(config):
     """The partitions file's members, by pkey"""
     from alternative_fabric_manager import partitions
 
     found = {}
-    for pkey, members in partitions._parse(_file(config)):
+    for pkey, members, _line in partitions._parse(_file(config)):
         found.setdefault(pkey, {}).update(members)
     return found
 
@@ -147,14 +159,18 @@ def test_network_needs_a_partition_key(client, segmentation_id):
     assert response.status_code == 400
 
 
-def test_partition_key_can_only_be_used_once(client):
+def test_a_partition_key_in_use_waits_for_its_network(client, manager, config):
     _post(client, "Network", conftest.network())
-    response = _post(
-        client,
-        "Network",
-        conftest.network(network_id="d13bba05-eb07-45ba-ace2-765706b2d701"),
-    )
-    assert response.status_code == 400
+    response = _post(client, "Network", conftest.network(network_id=OTHER))
+    manager.apply_pending()
+    # One partition key, one network: the second waits, and fails at its
+    # deadline if the first is never deleted.
+    assert _job(client, response)["Status"] == "Pending"
+    assert f"net-{OTHER}" not in _file(config)
+    _expire(manager)
+    job = _job(client, response)
+    assert job["Status"] == "Failed"
+    assert "Timed out waiting: partition key 0x0064" in job["Error"]
 
 
 def test_body_needs_an_id(client):
@@ -219,6 +235,8 @@ def test_delete_after_a_failed_job_is_applied(client, manager, config, reloader)
     reloader.error = ReloadError("OpenSM is down")
     first = client.delete(f"{URL}/Port/{PORT_ID}", headers=AUTH)
     manager.apply_pending()
+    assert _job(client, first)["Status"] == "Pending"
+    _expire(manager)
     assert _job(client, first)["Status"] == "Failed"
 
     reloader.error = None
@@ -244,18 +262,33 @@ def test_delete_network_removes_its_ports(client, manager, config):
     )
 
 
-def test_failed_reload_fails_jobs(client, manager, config, reloader):
+def test_failed_reload_fails_jobs_at_their_deadline(client, manager, config, reloader):
     from alternative_fabric_manager.drivers import ReloadError
 
     config.apply_attempts = 2
     reloader.error = ReloadError("OpenSM is down")
     response = _post(client, "Network", conftest.network())
     manager.apply_pending()
+    assert reloader.calls == 2
+    # The next sync may still apply it in time.
+    assert _job(client, response)["Status"] == "Pending"
 
+    _expire(manager)
     job = _job(client, response)
     assert job["Status"] == "Failed"
-    assert job["Error"] == "OpenSM is down"
-    assert reloader.calls == 2
+    assert "Timed out" in job["Error"]
+
+
+def test_jobs_past_their_deadline_fail_in_the_loop(client, manager, reloader):
+    from alternative_fabric_manager.drivers import ReloadError
+
+    reloader.error = ReloadError("OpenSM is down")
+    response = _post(client, "Network", conftest.network())
+    _expire(manager)
+    manager.evaluate_jobs()
+    with manager.sessionmaker() as session:
+        assert session.query(db.Job).one().status == db.JobStatus.FAILED
+    assert _job(client, response)["Status"] == "Failed"
 
 
 def test_change_during_apply_waits_for_the_next(client, manager, reloader):
@@ -282,9 +315,12 @@ def test_file_changes_on_every_apply(client, manager, config):
     assert _file(config) != before
 
 
-def test_nothing_pending_does_nothing(manager, reloader):
+def test_first_sync_applies_then_settles(manager, reloader):
+    # A new manager can't know what OpenSM has, so it applies once.
     manager.apply_pending()
-    assert reloader.calls == 0
+    assert reloader.calls == 1
+    manager.apply_pending()
+    assert reloader.calls == 1
 
 
 def test_running_jobs_are_applied_after_a_restart(tmp_path, config, reloader):
@@ -293,8 +329,6 @@ def test_running_jobs_are_applied_after_a_restart(tmp_path, config, reloader):
     config.database = str(tmp_path / "afm.sqlite")
     first = manager_mod.Manager(config, db.make_sessionmaker(config.database), reloader)
     job_id = first.put_network(NETWORK_ID, conftest.network())
-    # Stopped while applying
-    first._snapshot()
 
     second = manager_mod.Manager(
         config, db.make_sessionmaker(config.database), reloader
@@ -311,8 +345,7 @@ def test_start_writes_the_state_before_opensm(manager, config, reloader):
     seen = []
     reloader.start = lambda: seen.append(_file(config))
     manager.put_network(NETWORK_ID, conftest.network())
-    manager._write_current()
-    manager.driver.start()
+    manager._start_opensm()
     assert f"net-{NETWORK_ID}=0x0064" in seen[0]
 
 
@@ -325,22 +358,47 @@ def test_stopped_opensm_is_started_again(manager, config, reloader):
     assert reloader.starts == 0
 
 
-def test_invalid_template_fails_jobs_without_writing(
+def test_a_network_clashing_with_the_template_is_quarantined(
     client, manager, config, reloader, tmp_path
 ):
     from alternative_fabric_manager import partitions
 
     path = tmp_path / "bad.j2"
-    path.write_text("{{ default_partition }}\nstorage=0x0064 : ALL=full ;\n")
+    path.write_text("{{ default_partition }}\nstorage=0x0064 : ALL_SWITCHES=full ;\n")
     manager.template = partitions.load_template(str(path))
     response = _post(client, "Network", conftest.network())
     manager.apply_pending()
 
     job = _job(client, response)
     assert job["Status"] == "Failed"
-    assert "0x0064" in job["Error"]
-    assert reloader.calls == 0
-    assert not pathlib.Path(config.partitions_file).exists()
+    assert "Quarantined" in job["Error"] and "0x0064" in job["Error"]
+    # The rest is still applied.
+    assert reloader.calls == 1
+    assert f"net-{NETWORK_ID}" not in _file(config)
+
+
+def test_an_unattributable_failure_keeps_the_last_file(
+    client, manager, config, reloader
+):
+    _applied(client, manager)
+    good = _file(config)
+    calls = reloader.calls
+    manager.template = type(
+        "Broken", (), {"render": lambda self, context: "nonsense\n"}
+    )()
+    response = _post(
+        client, "Network", conftest.network(network_id=OTHER, segmentation_id=200)
+    )
+    manager.apply_pending()
+
+    job = _job(client, response)
+    assert job["Status"] == "Failed"
+    # OpenSM is made to sweep the last good partitions again, not the new ones.
+    assert reloader.calls == calls + 1
+    assert _file(config).split("# Apply ")[0] == good.split("# Apply ")[0]
+    # And not again until the state changes
+    manager.apply_pending()
+    assert reloader.calls == calls + 1
 
 
 def test_guid_with_the_top_bit_set(client, manager, config):
@@ -405,7 +463,7 @@ def test_opensm_conf_is_written_with_shared_keys(manager, config, tmp_path):
 
     config.driver = "managed"
     config.opensm_conf = {"sm_priority": "15"}
-    manager._write_current()
+    manager._start_opensm()
     with open(config.opensm_conf_file) as f:
         lines = f.read().splitlines()
     assert "sm_priority 15" in lines
@@ -414,32 +472,33 @@ def test_opensm_conf_is_written_with_shared_keys(manager, config, tmp_path):
     assert os.stat(config.opensm_conf_file).st_mode & 0o777 == 0o600
     # The same keys after a restart, and for every OpenSM of the fabric
     assert manager.keys() == manager.keys()
-    manager._write_current()
+    manager._start_opensm()
     with open(config.opensm_conf_file) as f:
         assert m_key in f.read().splitlines()
 
 
 def test_opensm_conf_only_for_the_managed_driver(manager, config):
-    manager._write_current()
+    manager._start_opensm()
     assert not pathlib.Path(config.opensm_conf_file).exists()
 
 
-def test_a_guid_belongs_to_one_port(client):
+def test_a_guid_belongs_to_one_port(client, manager, config):
     # A port whose deletion never arrived, or two ports with one client ID,
     # would otherwise be in two networks' partitions.
-    other = "d13bba05-eb07-45ba-ace2-765706b2d701"
     _post(client, "Network", conftest.network())
-    _post(client, "Network", conftest.network(network_id=other, segmentation_id=200))
+    _post(client, "Network", conftest.network(network_id=OTHER, segmentation_id=200))
     assert _post(client, "Port", conftest.port()).status_code == 202
     response = _post(
         client,
         "Port",
-        conftest.port(port_id="e13bba05-eb07-45ba-ace2-765706b2d701", network_id=other),
+        conftest.port(port_id="e13bba05-eb07-45ba-ace2-765706b2d701", network_id=OTHER),
     )
-    assert response.status_code == 400
+    manager.apply_pending()
+    assert _job(client, response)["Status"] == "Pending"
+    assert _members(config)[0xC8] == {}
     # The same port moving is fine.
     response = client.put(
-        f"{URL}/Port/{PORT_ID}", json=conftest.port(network_id=other), headers=AUTH
+        f"{URL}/Port/{PORT_ID}", json=conftest.port(network_id=OTHER), headers=AUTH
     )
     assert response.status_code == 202
 
@@ -474,14 +533,14 @@ def test_ids_must_be_safe(client, object_id):
 
 def test_opensm_starts_with_the_last_good_file(manager, config, reloader):
     manager.put_network(NETWORK_ID, conftest.network())
-    manager._write_current()
+    manager._start_opensm()
     good = _file(config)
     # Something that can no longer be rendered, for example a template
     # changed since
     manager.template = type(
         "Broken", (), {"render": lambda self, context: "nonsense\n"}
     )()
-    manager._write_current()
+    manager._start_opensm()
     assert _file(config) == good
 
 
@@ -492,7 +551,7 @@ def test_first_start_needs_a_good_file(manager, config):
     from alternative_fabric_manager import partitions
 
     with pytest.raises(partitions.InvalidPartitions):
-        manager._write_current()
+        manager._start_opensm()
 
 
 def test_database_and_opensm_conf_are_private(tmp_path, config, reloader):
@@ -504,7 +563,7 @@ def test_database_and_opensm_conf_are_private(tmp_path, config, reloader):
     config.driver = "managed"
     database = str(tmp_path / "afm.sqlite")
     manager = manager_mod.Manager(config, db.make_sessionmaker(database), reloader)
-    manager._write_current()
+    manager._start_opensm()
     assert os.stat(database).st_mode & 0o777 == 0o600
     assert os.stat(config.opensm_conf_file).st_mode & 0o777 == 0o600
 
@@ -591,4 +650,4 @@ def test_retries_change_the_file(client, manager, config, reloader):
     config.apply_attempts = 2
     _applied(client, manager)
     assert len(seen) == 2 and seen[0] != seen[1]
-    assert "# Attempt 2" in seen[1]
+    assert "# Apply " in seen[1]

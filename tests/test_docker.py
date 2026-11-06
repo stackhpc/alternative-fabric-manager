@@ -1,6 +1,8 @@
+import types
+
 import pytest
 
-from alternative_fabric_manager.drivers import ReloadError
+from alternative_fabric_manager.drivers import UNATTRIBUTED, ReloadError, SweepReport
 from alternative_fabric_manager.drivers import docker as docker_driver
 
 BEFORE = "Nov 05 16:59:14 0x04 -> do_sweep:\n" + "*" * 10 + " SUBNET UP " + "*" * 10
@@ -165,9 +167,12 @@ def test_managed_start_times_out(managed_config):
         docker_driver.ManagedDocker(managed_config, client=client).start()
 
 
-def test_managed_start_as_standby(managed_config):
+def test_managed_start_as_standby_fails(managed_config):
+    # Another subnet manager is master: this one must not count as applying
+    # anything.
     client = FakeManagedClient(log="0x02 -> Entering STANDBY state")
-    docker_driver.ManagedDocker(managed_config, client=client).start()
+    with pytest.raises(ReloadError):
+        docker_driver.ManagedDocker(managed_config, client=client).start()
 
 
 def test_managed_running(managed_config):
@@ -233,3 +238,156 @@ def test_heavy_sweep_ends_with_subnet_up():
         _reloader(FakeContainer(after=partial), timeout=0.05).reload()
     clean = "\n".join(line for line in HEAVY.splitlines() if "PARSE" not in line)
     _reloader(FakeContainer(after=clean)).reload()
+
+
+# OpenSM 5.17's own messages, from its binary
+PKEY_BY_DESCRIPTION = (
+    "pkey_mgr_update_port: ERR 0505: Failed to set PKey 0x8064 in block 0 idx 2 "
+    "for compute-0 mlx5_0"
+)
+PKEY_BY_NODE = (
+    "pkey_mgr_update_port: ERR 0509: pkey_mgr_update_pkey_entry() failed to update "
+    "pkey table block 0 for node 0x0002c90300001234 port 1 (compute-0 mlx5_0)"
+)
+PKEY_BY_PORT = (
+    "osm_vm: ERR 5703: Failure initiating PKeyTable set request to VPort "
+    "0x0002c90300005678, VPort index 1 of port 0x0002c90300001235 (compute-0)"
+)
+ENFORCEMENT = (
+    "pkey_mgr_update_peer_port: ERR 0507: Not enough pkey entries (32 <= 33) on "
+    "switch 0xec0d9a0300b12560 port 7 (SwitchIB). Clearing Enforcement bit"
+)
+
+
+def test_a_pkey_error_without_a_port_guid_fails_closed():
+    for line in (PKEY_BY_DESCRIPTION, PKEY_BY_NODE):
+        report = SweepReport()
+        docker_driver._note_pkey_error(report, line)
+        # A node GUID isn't the port's, so it mustn't count as one.
+        assert report.pkey_errors == set()
+        assert report.unattributed
+
+
+def test_a_pkey_error_with_a_port_guid_names_it():
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, PKEY_BY_PORT)
+    assert 0x0002C90300001235 in report.pkey_errors
+    # The virtual port's own GUID, which is its Neutron port's
+    assert 0x0002C90300005678 in report.pkey_errors
+    assert not report.unattributed
+
+
+def test_cleared_enforcement_names_the_switch_port():
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, ENFORCEMENT)
+    assert report.enforcement_errors == {"ec0d9a0300b12560:7"}
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, "x: ERR 0513: something else")
+    assert report.enforcement_errors == {UNATTRIBUTED}
+
+
+def test_pkey_errors_are_not_partitions_errors():
+    for line in (PKEY_BY_DESCRIPTION, PKEY_BY_PORT, ENFORCEMENT):
+        assert not docker_driver._is_partitions_error(line.replace("osm_vm", "prtn"))
+    assert docker_driver._is_partitions_error("osm_prtn_make_new: ERR 0A01: x")
+
+
+IBSWITCHES = (
+    'Switch\t: 0xec0d9a0300b12560 ports 41 "SwitchIB Mellanox Technologies" '
+    "base port 0 lid 2 lmc 0\n"
+)
+SMIR = """SMInfoRecord dump:
+\t\tRID
+\t\tLID.....................1
+\t\tSMInfo dump:
+\t\tGUID....................0x040973ffffc75168
+\t\tSM_Key..................0x0000000000000000
+\t\tActCount................1234
+\t\tPriority................15
+\t\tSMState.................3
+SMInfoRecord dump:
+\t\tRID
+\t\tLID.....................9
+\t\tSMInfo dump:
+\t\tGUID....................0x0002c90300001235
+\t\tSM_Key..................0x0000000000000000
+\t\tActCount................5
+\t\tPriority................0
+\t\tSMState.................2
+"""
+IBSTAT_P = (
+    "0x040973ffffc75168\n0xffffffffffffffff\n0xffffffffffffffff\n0x0000000000000000\n"
+)
+
+
+class FakeExecContainer:
+    status = "running"
+
+    def __init__(self):
+        self.commands = []
+
+    def exec_run(self, command):
+        self.commands.append(command)
+        outputs = {"ibswitches": IBSWITCHES, "saquery": SMIR, "ibstat": IBSTAT_P}
+        return 0, outputs[command[0]].encode()
+
+
+def test_fabric_parses_the_tools_output():
+    container = FakeExecContainer()
+    client = types.SimpleNamespace(
+        containers=types.SimpleNamespace(get=lambda name: container)
+    )
+    driver = docker_driver.DockerReloader("opensm", 30, client=client)
+    fabric = driver.fabric(m_key="0x11", sa_key="0x22")
+    assert fabric.switches == {0xEC0D9A0300B12560}
+    assert fabric.sms == [(0x040973FFFFC75168, 3), (0x0002C90300001235, 2)]
+    # Placeholder GUIDs of unassigned virtual functions aren't ours.
+    assert fabric.own_guids == {0x040973FFFFC75168}
+    assert ["ibswitches", "-y", "0x11"] in container.commands
+    assert ["saquery", "--smkey", "0x22", "SMIR"] in container.commands
+
+
+MAD_PKEY_FAILURES = (
+    "sm_mad_ctrl_send_err_cb: ERR 3113: MAD completed in error (IB_TIMEOUT): "
+    "SubnSet(P_KeyTable), attr_mod 0x0, TID 0x1234, dest_guid 0x0002c90300001234",
+    "sm_mad_ctrl_rcv_callback: ERR 3119: Set method failed for attribute 0x16 "
+    "(PKeyTable)",
+)
+
+
+def test_mad_failures_setting_pkey_tables_fail_closed():
+    for line in MAD_PKEY_FAILURES:
+        report = SweepReport()
+        docker_driver._note_pkey_error(report, line)
+        assert report.unattributed, line
+    # Other attributes' failures aren't pkey errors.
+    report = SweepReport()
+    docker_driver._note_pkey_error(
+        report,
+        "x: ERR 3113: MAD completed in error (IB_TIMEOUT): SubnGet(NodeInfo), "
+        "attr_mod 0x0, TID 0x1, dest_guid 0x1",
+    )
+    assert not report.unattributed
+
+
+def test_managed_start_reports_its_first_sweep(managed_config):
+    client = FakeManagedClient(log=MAD_PKEY_FAILURES[1] + "\n" + STARTED)
+    report = docker_driver.ManagedDocker(managed_config, client=client).start()
+    assert report is not None and report.unattributed
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pkey_mgr_process_partition_table: ERR 0503: Failed to obtain P_Key "
+        "0x8064 block and index for compute-0 mlx5_0",
+        "pkey_mgr_update_port: ERR 0511: Failed to set PortInfo for node "
+        "0xec0d9a0300b12560 port 7 (SwitchIB)",
+        "pkey_mgr_update_port: ERR 0514: Failed to allocate backup blocks",
+    ],
+)
+def test_more_pkey_manager_errors_fail_closed(line):
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, line)
+    assert report.unattributed
+    assert not docker_driver._is_partitions_error(line)

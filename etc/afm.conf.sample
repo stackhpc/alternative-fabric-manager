@@ -15,7 +15,11 @@ domain = cloudx
 token =
 
 [database]
+# An SQLite file, for a single instance
 database = /var/lib/alternative-fabric-manager/afm.sqlite
+# Or a database URL, for MariaDB or Galera, which HA needs; it overrides
+# database. Run alternative-fabric-manager --db-upgrade after each upgrade.
+#connection = mysql+pymysql://afm:<password>@<vip>/afm
 
 [opensm]
 # managed: the manager runs OpenSM in its own container, in the manager's
