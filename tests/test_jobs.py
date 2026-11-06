@@ -586,20 +586,34 @@ def test_ports_waiting_on_a_dropped_network_fail(manager, fabric):
     assert "ended unapplied" in job.error
 
 
-def test_an_applied_wait_gets_a_new_deadline(manager, fabric):
+def test_an_applied_wait_keeps_its_deadline_and_leaves_quarantine(
+    manager, fabric, monkeypatch
+):
     manager.put_network(NETWORK_ID, conftest.network())
-    created = manager.put_network(OTHER, conftest.network(OTHER, 100))
-    soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+    manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.reconcile()
+    update = manager.put_network(OTHER, conftest.network(OTHER, 100))
     with manager.sessionmaker() as session:
-        session.get(db.Job, created).deadline = soon
-        session.commit()
+        before = session.get(db.Job, update).deadline
+    # The network's current state is quarantined while its update waits.
+    real = partitions.validate
+    broken = [True]
+
+    def validate(content, *args, **kwargs):
+        if broken[0] and f"net-{OTHER}=0x00c8" in content:
+            raise partitions.InvalidPartitions("bad network", pkeys={200})
+        return real(content, *args, **kwargs)
+
+    monkeypatch.setattr(partitions, "validate", validate)
+    manager.reconcile()
+    assert _status(manager, update) == db.JobStatus.PENDING
+    broken[0] = False
     manager.delete_network(NETWORK_ID)
-    manager.retry_deferred()
+    manager.reconcile()
+    assert _status(manager, update) == db.JobStatus.COMPLETED
     with manager.sessionmaker() as session:
-        deadline = session.get(db.Job, created).deadline
-    assert deadline.replace(tzinfo=datetime.timezone.utc) > soon + datetime.timedelta(
-        seconds=60
-    )
+        assert session.get(db.Job, update).deadline == before
+        assert session.get(db.Quarantine, ("network", OTHER)) is None
 
 
 def test_a_waiting_ports_effect_has_its_networks_pkey_when_applied(manager, fabric):

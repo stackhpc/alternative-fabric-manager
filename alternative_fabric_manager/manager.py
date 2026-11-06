@@ -427,8 +427,10 @@ class Manager:
         LOG.info("Applying the waiting %s %s", job.operation, row.object_id)
         job.generation = self._bump(session)
         job.error = ""
-        # Its wait isn't OpenSM's time to apply it.
-        job.deadline = _now() + datetime.timedelta(seconds=self.config.job_timeout)
+        # It keeps its deadline: a request that waited too long fails, and
+        # networking-mlnx sends it again, rather than outlast Nova's wait.
+        # Its change releases it from quarantine, as a request does.
+        self._release(session, row.kind, row.object_id)
         if row.kind == "network":
             self._set_network(session, row.object_id, values)
         else:

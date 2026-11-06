@@ -135,13 +135,20 @@ body, so its create times out and fails, while its delete completes.
 ## The lease
 
 The lease row names the leader and its **term**, a counter that only goes
-up. Every action of a leader on OpenSM or the fabric, and every record of
-what it swept or which targets left the set, is a compare-and-set on its term, so a deposed
-leader's late writes are refused.
+up. Every write a leader makes to Galera, such as a record of what it
+swept or which targets left the set, is a compare-and-set on its term, so a
+deposed leader's late writes are refused. The term fences only Galera: a
+running OpenSM sweeps without asking anyone, so OpenSM itself is fenced by
+the target set, self-stop and the waits in Fencing.
 
 - **Renewal:** the leader increments the lease's renewal counter every few
   seconds, matching its instance UUID and term, on a thread of its own that
-  runs through applies and takeovers alike. A renewal that matches no row
+  runs through applies and takeovers alike. It renews only under the same
+  progress condition as the watchdog's liveness thread (see The watchdog):
+  if the apply loop hangs, the Galera lease lapses with the watchdog's, so
+  a candidate takes over, rather than the fabric being left without a
+  subnet manager under a lease that is still renewed; the renewal thread
+  also asks the watchdog to stop OpenSM. A renewal that matches no row
   means it lost the lease: it stops OpenSM at once (see Stepping down).
 - **Only a Primary component counts.** Every lease read and write runs in
   a transaction that first checks `wsrep_cluster_status = 'Primary'` and
@@ -168,12 +175,14 @@ leader's late writes are refused.
   includes the counter it saw, so it matches no row, or Galera's
   certification aborts it. Lease reads use `wsrep_sync_wait = 1`, as every
   session does, so false expiries are rare.
-- **The target set** holds every node that may have run OpenSM since the
-  last stop that was released or confirmed. A takeover never removes a node
-  from it, except with a term compare-and-set that records that the node
-  released the lease, verified its own stop, or left it unconfirmed (see
-  Fencing). So a takeover whose winner dies midway leaves its targets, and
-  itself, for the next.
+- **The target set** holds an entry for every instance that may have run
+  OpenSM since the last stop that was released or verified: its node, its
+  instance UUID, and the term in which it was added. A takeover never
+  removes an entry, except with a term compare-and-set that records that
+  the instance released the lease, that its node verified its stop after
+  the entry was added, or that it left unconfirmed (see Fencing). So a
+  takeover whose winner dies midway leaves its targets, and itself, for the
+  next.
 - **Taking the lease:** a candidate first checks that its own fabric port's
   physical link is up, its logical state Init or above (Active is not
   required, since only a subnet manager makes a port Active, which would
@@ -183,14 +192,21 @@ leader's late writes are refused.
   every expected switch may take the lease, or, once no candidate has for
   `T_reach`, the one that reaches most. It then takes the lease with a
   compare-and-set that includes the counter it saw unchanged, setting itself
-  as leader with the term incremented, and adding itself to the target
-  set. Only the winner
+  as leader with the term incremented, adding an entry for itself to the
+  target set, and clearing its node's verified-stop mark, all in the same
+  compare-and-set, so that no earlier mark can let it leave the set later.
+  Only the winner
   proceeds. It waits for every other node to leave the target set (see
   Fencing), and only once none is left but itself starts OpenSM.
 - **Releasing the lease:** a leader that stops cleanly steps down: it stops
   OpenSM, verifies through the host's process table that no OpenSM runs,
-  removes itself from the target set and marks the lease released, with a
-  term compare-and-set. A successor can take it at once, without waiting.
+  removes its own entry from the target set and marks the lease released,
+  with a term compare-and-set. A successor can take it at once, and starts
+  OpenSM at once if no other entry is left. A release removes only the
+  releaser's entry: if others remain, for example because the releaser was
+  itself waiting on an unconfirmed target, the successor treats the
+  release as the expiry, so it asks them again and waits `T_watchdog` from
+  when it took the lease.
   - **On SIGTERM**, as from `docker stop` or a host shutdown, the manager
     fails `/healthz` at once, so HAProxy stops sending it requests, steps
     down without waiting for that, and exits; it serves requests until it
@@ -219,12 +235,20 @@ waits for it as for any target.
 A candidate's configuration hash must be one the current configuration
 epoch allows, and its OpenSM must be verified stopped.
 
-The lease sits behind a small coordination driver interface: take the
-lease with a term, renew it, release it, watch it for expiry, and record
-targets leaving the set, each as a compare-and-set on the term. Galera is
-the first driver, since every Kolla deployment has it; others are a future
-improvement (see Coordination drivers). Jobs, objects and the applied
-state stay in Galera whatever the driver.
+The lease's exclusion sits behind a small coordination driver interface:
+acquire it, renew it, release it, and watch it for expiry. Every driver
+must guarantee that no other instance can acquire the lease, or see it
+expire, before `t0` + `T`, where `t0` is when the holder sent its last
+renewal that was acknowledged, and that only a quorum of the driver's
+store can grant or renew it. Self-stop is timed on the holder's monotonic
+clock from `t0`, whatever the driver. The term, the target set, and the
+outcome-unknown rule stay in Galera whatever the driver: a takeover first
+acquires the lease from the driver, then, in one Galera compare-and-set,
+bumps the term and adds its target-set entry, before it does anything
+else, so that the term never repeats and Galera refuses a lower term's
+writes. Galera is the first driver, since every Kolla deployment has it;
+others are a future improvement (see Coordination drivers). Jobs, objects
+and the applied state stay in Galera too.
 
 ## Requests and applying
 
@@ -372,17 +396,23 @@ Instead, a target leaves the set, with a term compare-and-set, once:
   OpenSM stopped (see Stepping down);
 - **it verified its own stop:** after a self-stop or a restart, its manager
   stopped OpenSM through its watchdog, verified through the host's process
-  table that no OpenSM runs, and recorded that in its node row, with a new
-  instance UUID (see Rejoining);
+  table that no OpenSM runs, and recorded that in its node row, as an
+  instance UUID other than the entry's and a time after the entry was
+  added (see Rejoining);
 - **or, unconfirmed:** the new leader has asked it to stop, step 1 below,
-  and `T_watchdog` has passed since the lease expired, by when the target's
+  if `fence_ask` is on, and `T_watchdog` has passed since the lease expired,
+  or since the successor took a released lease, by when the target's
   self-stop or watchdog has killed its OpenSM, if either can run at all.
 
 1. **Ask.** Send the target's SM a SubnSet(SMInfo) with the DISABLE modifier
    and the SM_Key, which a live OpenSM honours by going to NOT-ACTIVE. It
    can't be confirmed, since a frozen SM neither honours nor answers it, so
    it never counts on its own. `[ha] fence_ask`, a cluster setting, is on by
-   default.
+   default. It is best effort: the new leader sends it by directed route,
+   from its reachability scan, to every port of the target's adapters, by
+   their node GUIDs in the target's node row, and a send that times out,
+   or that has no route, as for a crashed or powered-off target, counts as
+   asked.
 
 `[ha] manual_takeover = true`, a cluster setting, makes every takeover wait
 for an operator to confirm with the CLI that the old leader's OpenSM can't
@@ -433,6 +463,14 @@ its OpenSM is known stopped and unable to start by itself:
    watchdog only starts OpenSM on a single-use start request for a term the
    node holds, so OpenSM can't come back by itself.
 3. If its configuration's hash is allowed, it becomes a candidate again.
+
+### Seeing the host's processes
+
+The manager is PID 1 of its own PID namespace, which OpenSM's container
+joins, so its own `/proc` shows only OpenSM's container. It verifies that
+no OpenSM runs on the host, in any container or none, through the host's
+`/proc`, mounted read-only into its container at `/host/proc`, looking for
+any process whose executable is `opensm`.
 
 ### Required keys
 
@@ -487,8 +525,9 @@ frozen OpenSM can resume before the watchdog does. That is the first
 release's known limitation (see Fencing).
 
 The single-node manager starts OpenSM again whenever it stops. In HA mode it
-doesn't: an OpenSM that stops makes its leader step down, and a new
-takeover, possibly by the same node, starts it.
+doesn't by itself: an OpenSM that stops makes its leader step down, and a
+new takeover, possibly by the same node, starts it, except for the shared
+failure in Stepping down, when the leader starts it again itself.
 
 ### Stepping down
 
@@ -534,22 +573,25 @@ an unconfirmed target, plus starting OpenSM and its first sweep. A job in flight
 not time out, or networking-mlnx sets its port to ERROR. So, with every
 value a cluster setting in Galera, so that all instances agree:
 
-- job timeout > `T` + `T_reach` + `T_watchdog` + OpenSM's start and first
-  sweep;
+- job timeout > the time a job can spend before the leader fails, a poll
+  interval and a sweep (`sweep_timeout`) and a fabric check, + `T` + the
+  expiry poll's interval + `T_reach` + `T_watchdog` + OpenSM's start and
+  first sweep + a fabric check;
 - `T_self` + the liveness thread's period + a lease call's timeout < `T`;
 - `T_self` > the deployment's MariaDB failover time, so that losing one
   Galera node, or the VIP moving, doesn't stop OpenSM;
 - Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
   sync interval + its retry backoff + the job timeout.
 
-With `T` 30 s, `T_reach` 30 s, `T_watchdog` 45 s, and 60 s for OpenSM's
-start and first sweep, the job timeout must exceed 165 s; the default is
-180 s, which leaves only 15 s, less the expiry poll's interval, so a deployment whose OpenSM takes longer to
-sweep must raise it. Nova's
-default `vif_plugging_timeout` is 300 s, which leaves 120 s for the journal's
-sync interval of 10 s and its backoff, so it holds, but only just: a
-deployment that raises the job timeout must raise Nova's and Ironic's waits
-too. `T_watchdog` must exceed `sweep_timeout`, 30 s, and the call timeouts;
+With a 2 s poll, `sweep_timeout` 30 s, 5 s for a fabric check, `T` 30 s,
+`T_reach` 30 s, `T_watchdog` 45 s, and 60 s for OpenSM's start and first
+sweep, the job timeout must exceed 2 + 30 + 5 + 30 + 2 + 30 + 45 + 60 + 5 =
+209 s. HA mode's default job timeout is therefore 240 s; the single-node
+default stays 180 s, since it has no takeover. Nova's
+`vif_plugging_timeout` must then exceed 240 s plus the journal's sync
+interval of 10 s and its backoff, so HA deployments set it to 360 s, and
+Ironic's wait for ports likewise; the deployment role does both. A
+deployment whose OpenSM takes longer to sweep must raise all three. `T_watchdog` must exceed `sweep_timeout`, 30 s, and the call timeouts;
 the default is 45 s. `T_reach`, how long candidates wait for one that
 reaches every switch, is 30 s. `T_self` is 20 s, with renewals and the
 liveness thread every 2 s, and every lease call timing out within 3 s, so
@@ -690,6 +732,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | Failure | What happens | Outcome |
 | --- | --- | --- |
 | The leader's manager crashes | Its OpenSM dies with it, through the PID namespace. After `T` a candidate takes the lease, asks the old SM to stop, waits `T_watchdog`, and starts OpenSM | Jobs wait through the takeover |
+| The leader's apply loop hung, its renewal thread still running | Its renewal thread stops renewing the Galera lease and asks the watchdog to stop OpenSM, whose lease also lapses. A candidate takes over as above | As above |
 | The leader's manager paused or hung | Its liveness thread stops renewing the watchdog's lease, and OpenSM stops before the unconfirmed wait ends (see Fencing). A candidate takes over as above | As above |
 | The leader's node, or OpenSM's container, paused | Nothing on the node runs. A candidate takes over as above, unconfirmed | **The known limitation:** a resumed OpenSM can act as a stale master until its watchdog kills it, and can undo a completed job meanwhile; the fabric check finds it, so no job completes, and an alarm is raised |
 | The leader cut off from the management network, OpenSM still running | Galera runs on the management network, so its renewals fail and it stops its OpenSM within `T_self`, as below | As below |
@@ -700,7 +743,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
-| A MariaDB failover | Failed reads reset the candidates' timers, and the leader's renewals fail meanwhile | Within `T_self`, nothing happens. Longer, the leader stops its OpenSM, and a leader is elected once a Primary component is back, so the SA is down meanwhile |
+| A MariaDB failover | Failed reads reset the candidates' timers, and the leader's renewals fail meanwhile | Within `T_self`, nothing happens. Longer, the leader stops its OpenSM, and a leader is elected once a Primary component is back, so the SA is down meanwhile, and jobs in flight can time out and are resent |
 | A managed node's SM appears | The fabric checks find it; the leader asks it to stop | No job completes until it is gone; alarm |
 | A tenant runs an SM | It has no keys, so it can't master or set ports | An alarm; jobs carry on unless it is master |
 | Galera unavailable, or no Primary component | Requests and `/healthz` fail; no takeover is possible, and the leader stops its OpenSM within `T_self` | The fabric runs without a subnet manager: forwarding carries on with the switches' tables, but SA queries, multicast joins and link changes go unhandled until the database is back. networking-mlnx retries its requests |
@@ -718,7 +761,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | Raft among the manager instances | Galera already gives replicated state with quorum. Raft would add a second consensus that can disagree with it, and a Raft leader is still a lease that a paused process can outlive, so fencing is needed anyway |
 | tooz's MySQL backend for the lease | It uses `GET_LOCK`, which Galera doesn't replicate. tooz with etcd would do, where a deployment runs etcd |
 | Keeping a leader's OpenSM running while it can't reach Galera | A MariaDB outage would then not stop the subnet manager, but a leader in a minority partition would run alongside the majority's new leader, with nothing to confirm it stopped. Self-stop makes a partition safe without confirmed fencing, at the cost of no subnet manager during a total database outage |
-| Taking over unfenced, at a boosted priority, so a stale master steps down | A resumed stale master sweeps until it notices the other master, and can undo a completed job, such as put back a deleted port, before it steps down |
+| Taking over at once, at a boosted priority, without self-stop or the unconfirmed wait, so a stale master steps down | Every failure, not only a paused node, would leave a stale master sweeping until it notices the other one, and it can undo a completed job, such as put back a deleted port, before it steps down |
 | Fencing by M_Key rotation | OpenSM has no supported online key rotation; revisit with key rotation |
 | Answering 503 without a leader | networking-mlnx backs off on it, and resends a job poll answered with it; recording requests whenever Galera is up is simpler and loses nothing |
 
@@ -752,9 +795,16 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       `wsrep_sync_wait`, UTC timestamps, deadlock retry, the generation bump
       first in every request, constraint errors as 400.
 - [ ] The lease, behind a coordination driver interface with Galera as
-      its first driver: taking on a Primary component only, renewing, self-stop
+      its first driver: target-set entries of node, instance UUID and term;
+      the verified-stop mark cleared on taking the lease; taking on a
+      Primary component only, renewing, self-stop
       after `T_self`, releasing on step-down and SIGTERM, expiry on the
       monotonic clock, terms in every compare-and-set, and the target set.
+- [ ] The manager's liveness thread, with each loop's progress bound,
+      gating both the watchdog's lease and the Galera renewal; the host's
+      `/proc` mounted read-only for verified stops.
+- [ ] Cluster settings refused when they break the inequalities in
+      Timeouts.
 - [ ] The watchdog: an entrypoint for OpenSM's container, with the lease and
       single-use start requests on tmpfs, the file hashes, `T_watchdog` from
       the cluster setting, and SIGKILL of OpenSM on SIGTERM.
@@ -783,6 +833,20 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       healthcheck, database credentials, the containers' stop timeout,
       expected switches, and the check that control traffic doesn't run over
       the InfiniBand fabric.
+
+## Open questions
+
+- Does OpenSM 5.17 honour SMInfo DISABLE, and how quickly?
+- Can the switches' ports be disabled reliably with the M_Key, and does a
+  disabled port stay disabled whatever its neighbour does?
+- How does OpenSM 5.17 log another SM, and do its SA's SMInfo records show
+  every SM on the fabric?
+- Which sites need confirmed fencing, and which steps: SSH to the OpenSM
+  hosts, M_Key-protected switch ports, or BMCs?
+- What is the deployment's MariaDB failover time, and are 30 s for `T`,
+  20 s for `T_self` and 180 s for the job timeout right?
+- Do the OpenSM nodes run the control plane, so they reach the database
+  VIP, or are they separate hosts that need database access opened to them?
 
 ## Future improvements
 
@@ -989,37 +1053,34 @@ unfences the node with the CLI.
 
 ### Coordination drivers
 
-Other coordination drivers for the lease, where a site runs the service:
+Other drivers for the lease's exclusion, where a site runs the service;
+each must meet the guarantee in The lease:
 
 - **etcd:** a lease with a TTL that etcd expires itself, kept alive by the
-  leader, and the leader key written in a transaction conditional on its
-  revision, which serves as the term. Expiry no longer needs the
-  candidates' counter-watching, and self-stop follows the keep-alive's
-  failure. etcd is a Raft cluster, so a minority can't renew or take it.
-  tooz's etcd3 driver, used by OpenStack services, is a possible base.
-- **Redis:** only with care. Redis, with Sentinel or Cluster, replicates
-  asynchronously, so a failover can lose a lease just granted, and two
-  instances can both believe they lead; Redlock doesn't remove that. A
-  Redis driver is safe only if every action is fenced by the term in the
-  store that holds the effect, Galera here, which the design does already,
-  and if the paused-leader cases are covered as for Galera.
+  leader, and the leader key created in a transaction conditional on its
+  absence. Expiry no longer needs the candidates' counter-watching. The
+  holder times self-stop on its own clock from when it sent the last
+  keep-alive that etcd acknowledged, with `T_self` against the TTL as
+  against `T`, since a client may report a failed keep-alive late. etcd
+  must be a version whose lease renewal is linearizable, so that a leader
+  cut off in an etcd minority can't renew; which versions those are must be
+  checked. The `etcd3` client may be used directly: tooz's lock API may not
+  expose what this needs.
+- **Redis:** not suitable as it stands. With Sentinel or Cluster, Redis
+  replicates asynchronously, so a failover can lose the lease key, and a
+  successor acquire it at once, before the old leader's self-stop or
+  watchdog has stopped its OpenSM: two masters, whatever the term in
+  Galera, since Galera doesn't fence OpenSM. Redlock doesn't remove that,
+  and a single Redis without failover is a single point of failure.
 
-With a driver other than Galera, the state in Galera and the lease are in
-different systems, so a leader can hold the lease while it can't reach
-Galera, or the reverse. Self-stop must then trigger on either: a leader
-that can't renew its lease, or can't write to Galera, for `T_self`, stops
-its OpenSM.
+With a driver other than Galera, the lease and the state are in different
+systems:
 
-## Open questions
-
-- Does OpenSM 5.17 honour SMInfo DISABLE, and how quickly?
-- Can the switches' ports be disabled reliably with the M_Key, and does a
-  disabled port stay disabled whatever its neighbour does?
-- How does OpenSM 5.17 log another SM, and do its SA's SMInfo records show
-  every SM on the fabric?
-- Which sites need confirmed fencing, and which steps: SSH to the OpenSM
-  hosts, M_Key-protected switch ports, or BMCs?
-- What is the deployment's MariaDB failover time, and are 30 s for `T`,
-  20 s for `T_self` and 180 s for the job timeout right?
-- Do the OpenSM nodes run the control plane, so they reach the database
-  VIP, or are they separate hosts that need database access opened to them?
+- **Losing the lease store is the safety rule:** a holder that hasn't
+  renewed for `T_self` stops its OpenSM, as with Galera. `T_self` must
+  then also exceed the lease store's own failover time, and the failure
+  table needs rows for its outages.
+- **Losing Galera is a liveness rule:** while the leader holds the lease,
+  nobody else can take over, but no job can complete. A leader that can't
+  write to Galera for `T_self` stops and verifies its OpenSM, then releases
+  the lease, so that a candidate that reaches Galera can lead.
