@@ -243,3 +243,23 @@ def test_release_withdraws_a_pending_freeze_request(lease):
     lease.request_freeze(term, "operator", 30)
     assert lease.release("a", "ua", term)
     assert lease.read().freeze_state == ""
+
+
+def test_adoption_voids_a_confirmation_and_a_stale_view(lease):
+    term = _frozen(lease)
+    lease.request_unfreeze()
+    # The frozen node is down; an operator confirms; then it comes back.
+    stale = lease.read()
+    assert lease.confirm(term)
+    lease.register("a", "ua2", "hash", [])
+    assert lease.adopt_frozen("a", "ua2", term) == term
+    # A candidate on the view from before the adoption loses.
+    assert lease.acquire("b", "ub", stale.term, stale.counter, False) is None
+    fresh = lease.read()
+    assert lease.acquire("b", "ub", fresh.term, fresh.counter, False) is None
+
+
+def test_every_instance_agrees_on_the_settings(lease):
+    assert lease.agree_settings('{"t": 30}')
+    assert lease.agree_settings('{"t": 30}')
+    assert not lease.agree_settings('{"t": 10}')

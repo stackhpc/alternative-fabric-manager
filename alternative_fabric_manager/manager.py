@@ -117,6 +117,11 @@ class Manager:
         self._thread = None
         # The partitions file last written and swept
         self._written = None
+        # In HA mode, called when OpenSM stops, instead of starting it again
+        self.on_opensm_stopped = None
+        # The leader's term, recorded with each sweep (see specs/ha.md)
+        self.term = 0
+        self._iteration_started = None
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
         self._contested_fabric = False
@@ -537,6 +542,7 @@ class Manager:
 
     def start(self):
         """Write the current state, start OpenSM, then keep it in sync"""
+        self._stop.clear()
         LOG.info(
             "OpenSM hardening: %s",
             ", ".join(sorted(self.config.hardening_groups)) or "none",
@@ -547,11 +553,23 @@ class Manager:
         self._wakeup.set()
 
     def stop(self):
+        self.halt()
+        self.driver.stop()
+
+    def halt(self):
+        """Stop the applier, leaving OpenSM to whoever stops it: in HA mode,
+        the coordinator, which verifies that it stopped"""
         self._stop.set()
         self._wakeup.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join()
-        self.driver.stop()
+        self._thread = None
+
+    def iteration_age(self):
+        """How long the applier's current iteration has run, or 0 between
+        iterations: the coordinator's liveness check (see specs/ha.md)"""
+        started = self._iteration_started
+        return 0.0 if started is None else time.monotonic() - started
 
     def _run(self):
         while not self._stop.is_set():
@@ -559,6 +577,7 @@ class Manager:
             self._wakeup.clear()
             if self._stop.is_set():
                 return
+            self._iteration_started = time.monotonic()
             try:
                 self._check_opensm()
                 self.reconcile()
@@ -566,6 +585,8 @@ class Manager:
                 LOG.exception("Failed to sync OpenSM")
                 time.sleep(RETRY_DELAY)
                 self._wakeup.set()
+            finally:
+                self._iteration_started = None
 
     def _start_opensm(self):
         """Write the current state's files and start OpenSM with them
@@ -617,8 +638,13 @@ class Manager:
             return
 
     def _check_opensm(self):
-        """Start OpenSM again if it has stopped, with the current state"""
+        """Start OpenSM again if it has stopped, with the current state, or,
+        in HA mode, tell the coordinator, which steps down"""
         if self.driver.running():
+            return
+        if self.on_opensm_stopped is not None:
+            self._written = None
+            self.on_opensm_stopped()
             return
         LOG.error("OpenSM isn't running; starting it again")
         try:
@@ -769,6 +795,7 @@ class Manager:
         with self._lock, self.sessionmaker() as session:
             applied = self._applied(session)
             applied.generation = generation
+            applied.term = self.term
             applied.body = content
             applied.attribution = json.dumps(attribution, sort_keys=True)
             # A sweep is judged only by a fabric check taken after it.

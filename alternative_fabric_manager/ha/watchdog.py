@@ -25,11 +25,15 @@ The manager and the watchdog share a directory on a tmpfs:
   single-use request, consumed when read, with the SHA-256 of each file
   OpenSM reads;
 - stop: present when the manager asks it to stop OpenSM.
-Every file is written atomically by the manager. The watchdog needs no
-database: it acts on its lease alone.
+Every file is written atomically by the manager, which removes a stop
+file before it writes a start request, since the watchdog refuses to start
+while one is present. A lease with no deadline must say "held": true; a
+start request must name a deadline, unless the lease is held, and the files'
+hashes. The watchdog needs no database: it acts on its lease alone.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -81,14 +85,27 @@ def write_atomically(directory, name, data):
     os.replace(tmp, path)
 
 
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def lease_valid(lease, now=None):
     """Whether a lease lets OpenSM run now"""
     if not lease or lease.get("boot_id") != boot_id():
         return False
-    deadline = lease.get("deadline")
-    if deadline is None:
+    if lease.get("held") is True:
         # Held while frozen, with no expiry
         return True
+    deadline = lease.get("deadline")
+    if not isinstance(deadline, (int, float)):
+        # A missing deadline is no permission.
+        return False
     return (now if now is not None else time.monotonic()) < deadline
 
 
@@ -105,12 +122,15 @@ def start_allowed(lease, request, now=None):
     ):
         return False, "a request for another lease"
     deadline = request.get("deadline")
-    if (
-        deadline is not None
-        and (now if now is not None else time.monotonic()) >= deadline
-    ):
+    if not isinstance(deadline, (int, float)):
+        if lease.get("held") is not True:
+            return False, "a request without a deadline"
+    elif (now if now is not None else time.monotonic()) >= deadline:
         return False, "a request past its deadline"
-    for path, digest in (request.get("hashes") or {}).items():
+    hashes = request.get("hashes")
+    if not hashes:
+        return False, "a request that names no files"
+    for path, digest in hashes.items():
         try:
             if sha256(path) != digest:
                 return False, f"{path} isn't the file the request names"
@@ -120,9 +140,12 @@ def start_allowed(lease, request, now=None):
 
 
 class Watchdog:
-    def __init__(self, directory, command):
+    def __init__(self, directory, command, die_with=None):
         self.directory = directory
         self.command = command
+        # Outside a container, the manager's PID: OpenSM dies with it, as
+        # the PID namespace makes it in a container
+        self.die_with = die_with
         self.process = None
         self.stopping = False
 
@@ -138,7 +161,8 @@ class Watchdog:
     def _kill(self, why):
         if self.process is not None and self.process.poll() is None:
             LOG.warning("Killing OpenSM: %s", why)
-            self.process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait()
 
     def run(self, wait_for_start=30.0):
@@ -155,7 +179,11 @@ class Watchdog:
                     LOG.error("Refusing a start request: %s", why)
                     return 1
                 LOG.info("Starting OpenSM for term %s", request.get("term"))
-                self.process = subprocess.Popen(self.command)  # noqa: S603
+                # Its own process group, so that a kill reaches a wrapper's
+                # children too.
+                self.process = subprocess.Popen(  # noqa: S603
+                    self.command, start_new_session=True
+                )
                 break
             if time.monotonic() > give_up:
                 LOG.error("No start request arrived")
@@ -167,6 +195,9 @@ class Watchdog:
                 return self.process.returncode
             if self.stopping:
                 self._kill("SIGTERM")
+                return 0
+            if self.die_with is not None and not _alive(self.die_with):
+                self._kill("the manager exited")
                 return 0
             if os.path.exists(os.path.join(self.directory, STOP)):
                 self._kill("the manager asked")
@@ -180,11 +211,16 @@ class Watchdog:
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run OpenSM under a lease")
     parser.add_argument("--state-dir", default="/run/alternative-fabric-manager")
+    parser.add_argument(
+        "--die-with",
+        type=int,
+        help="Outside a container: the manager's PID, which OpenSM dies with",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s watchdog: %(message)s")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    dog = Watchdog(args.state_dir, command or ["opensm"])
+    dog = Watchdog(args.state_dir, command or ["opensm"], args.die_with)
     signal.signal(signal.SIGTERM, lambda *_: setattr(dog, "stopping", True))
     sys.exit(dog.run())
 

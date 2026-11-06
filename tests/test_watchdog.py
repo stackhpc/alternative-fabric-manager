@@ -11,7 +11,13 @@ def _lease(directory, seconds=5.0, term=1):
     wd.write_atomically(
         directory,
         wd.LEASE,
-        {"boot_id": wd.boot_id(), "instance": "u", "term": term, "deadline": deadline},
+        {
+            "boot_id": wd.boot_id(),
+            "instance": "u",
+            "term": term,
+            "deadline": deadline,
+            "held": seconds is None,
+        },
     )
 
 
@@ -24,9 +30,16 @@ def _start(directory, term=1, hashes=None, seconds=5.0):
             "instance": "u",
             "term": term,
             "deadline": time.monotonic() + seconds,
-            "hashes": hashes or {},
+            "hashes": hashes or {str(_conf(directory)): wd.sha256(_conf(directory))},
         },
     )
+
+
+def _conf(directory):
+    path = directory / "opensm.conf"
+    if not path.exists():
+        path.write_text("conf")
+    return path
 
 
 def _run(directory, wait=2.0):
@@ -115,3 +128,68 @@ def test_no_request_no_opensm(tmp_path):
     dog = wd.Watchdog(str(tmp_path), ["sleep", "60"])
     assert dog.run(0.5) == 1
     assert dog.process is None
+
+
+def test_opensm_dies_with_its_manager(tmp_path):
+    import subprocess
+
+    manager = subprocess.Popen(["sleep", "60"])
+    _lease(tmp_path, seconds=30)
+    _start(tmp_path)
+    dog = wd.Watchdog(str(tmp_path), ["sleep", "60"], die_with=manager.pid)
+    thread = threading.Thread(target=dog.run, args=(2.0,))
+    thread.start()
+    assert _started(dog)
+    manager.kill()
+    manager.wait()
+    thread.join(5)
+    assert dog.process.poll() is not None
+
+
+def test_missing_fields_are_no_permission(tmp_path):
+    # A lease without a deadline that doesn't say it's held
+    wd.write_atomically(
+        tmp_path, wd.LEASE, {"boot_id": wd.boot_id(), "instance": "u", "term": 1}
+    )
+    assert not wd.lease_valid(wd._read(tmp_path, wd.LEASE))
+    _lease(tmp_path)
+    lease = wd._read(tmp_path, wd.LEASE)
+    base = {"boot_id": wd.boot_id(), "instance": "u", "term": 1}
+    # No hashes
+    assert not wd.start_allowed(lease, dict(base, deadline=time.monotonic() + 5))[0]
+    # No deadline, with a lease that isn't held
+    hashes = {str(_conf(tmp_path)): wd.sha256(_conf(tmp_path))}
+    assert not wd.start_allowed(lease, dict(base, hashes=hashes))[0]
+    assert wd.start_allowed(
+        lease, dict(base, hashes=hashes, deadline=time.monotonic() + 5)
+    )[0]
+
+
+def test_the_kill_reaches_a_wrappers_children(tmp_path):
+    import os
+
+    marker = tmp_path / "child.pid"
+    _lease(tmp_path, seconds=30)
+    _start(tmp_path)
+    # A wrapper that doesn't exec, as an image's entrypoint might be
+    dog = wd.Watchdog(
+        str(tmp_path), ["sh", "-c", f"sleep 60 & echo $! > {marker}; wait"]
+    )
+    thread = threading.Thread(target=dog.run, args=(2.0,))
+    thread.start()
+    assert _started(dog)
+    for _ in range(50):
+        if marker.exists() and marker.read_text().strip():
+            break
+        time.sleep(0.05)
+    child = int(marker.read_text())
+    (tmp_path / wd.STOP).write_text("")
+    thread.join(5)
+    time.sleep(0.2)
+    try:
+        os.kill(child, 0)
+        with open(f"/proc/{child}/stat") as f:
+            alive = f.read().split()[2] != "Z"
+    except ProcessLookupError:
+        alive = False
+    assert not alive

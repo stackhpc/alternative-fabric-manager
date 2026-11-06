@@ -463,6 +463,19 @@ class GaleraLease:
             session.commit()
             return True
 
+    def agree_settings(self, settings):
+        """Store the cluster's HA settings, or check them against those
+        stored: every instance must agree, or the waits don't hold"""
+        name = "ha_settings"
+        with self._session() as session:
+            row = session.get(db.Secret, name, with_for_update=True)
+            if row is None:
+                session.add(db.Secret(name=name, value=settings))
+                session.commit()
+                return True
+            session.commit()
+            return row.value == settings
+
     def adopt_frozen(self, node, instance_uuid, frozen_term):
         """A restarted manager on the frozen node takes the frozen lease
         over: it replaces the old instance's entry with its own, and clears
@@ -483,6 +496,10 @@ class GaleraLease:
                 )
             )
             lease.holder_uuid = instance_uuid
+            # A confirmation was about the previous instance, and a candidate's
+            # view from before this must not let it take over.
+            lease.confirmed_term = 0
+            lease.counter += 1
             session.add(
                 db.TargetEntry(
                     node=node, instance_uuid=instance_uuid, term=lease.term, held=True

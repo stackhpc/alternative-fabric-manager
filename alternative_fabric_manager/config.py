@@ -290,6 +290,33 @@ class Config:
                 raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
 
 
+# The containers' stop timeout, set when they are created (see specs/ha.md)
+CONTAINER_STOP_TIMEOUT = 30
+
+
+def ha_settings(config):
+    """The settings every instance of a cluster must share, as stored"""
+    import json
+
+    return json.dumps(
+        {
+            name: getattr(config, name)
+            for name in (
+                "lease_timeout",
+                "self_stop_timeout",
+                "watchdog_timeout",
+                "reach_timeout",
+                "ha_period",
+                "call_timeout",
+                "fence_ask",
+                "manual_takeover",
+                "job_timeout",
+            )
+        },
+        sort_keys=True,
+    )
+
+
 def _ha_problems(config):
     """The timing inequalities of specs/ha.md that a configuration breaks"""
     problems = []
@@ -302,6 +329,28 @@ def _ha_problems(config):
         problems.append(
             "self_stop_timeout + ha_period + call_timeout must be less than "
             "lease_timeout"
+        )
+    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    takeover = (
+        apply_bound
+        + config.lease_timeout
+        + config.ha_period
+        + config.reach_timeout
+        + 5
+        + config.watchdog_timeout
+        + config.start_timeout
+        + 5
+    )
+    if config.job_timeout <= takeover:
+        problems.append(
+            f"[opensm] job_timeout must exceed {takeover:.0f} s, a takeover's "
+            "longest, so that no job times out during one; HA deployments use "
+            "300 s, with Nova's vif_plugging_timeout at 420 s"
+        )
+    if config.shutdown_timeout >= CONTAINER_STOP_TIMEOUT:
+        problems.append(
+            f"shutdown_timeout must be less than the container's stop "
+            f"timeout, {CONTAINER_STOP_TIMEOUT} s"
         )
     if config.watchdog_timeout <= config.ha_period + config.call_timeout:
         problems.append("watchdog_timeout must exceed ha_period + call_timeout")
