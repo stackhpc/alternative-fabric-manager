@@ -1,8 +1,15 @@
 # The virtualenv is built with uv, and only it is copied into the runtime
 # image, the official Python one without build tools.
-FROM python:3.12-slim AS builder
+ARG PYTHON_VERSION=3.12
+ARG PYTHON_DIGEST=sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54
+ARG UV_VERSION
+ARG UV_DIGEST=sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490
 
-COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}@${UV_DIGEST} AS uv
+
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS builder
+
+COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
@@ -14,7 +21,7 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY alternative_fabric_manager ./alternative_fabric_manager
 RUN uv sync --locked --no-dev --no-editable
 
-FROM python:3.12-slim
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST}
 
 LABEL org.opencontainers.image.title="alternative-fabric-manager" \
       org.opencontainers.image.description="An InfiniBand fabric manager for networking-mlnx that drives OpenSM partitions" \

@@ -139,3 +139,22 @@ uv run pytest
   [specs/ha.md](specs/ha.md).
 - A job that fails leaves its change in the recorded state, so the next
   change that applies also applies it.
+
+## Container image
+
+GitHub Actions publishes multi-architecture images to
+`ghcr.io/stackhpc/alternative-fabric-manager`. Release images are published
+from immutable Git tags in the form `<major>.<minor>.<patch>`, for example
+`0.1.0`. Update the project version before publishing a new release.
+
+Every build also receives an immutable `sha-<commit>` tag and a
+`build-<run-id>-<attempt>` tag. The latter distinguishes rebuilds of the
+same commit. Do not deploy a mutable convenience tag; pin deployments to the
+release image digest.
+
+The uv version is recorded in `.uv-version`. Pass it to local Docker builds
+with `docker build --build-arg UV_VERSION="$(<.uv-version)" .`.
+
+The weekly dependency workflow opens a fresh pull request when updates are
+available. It updates the uv image version and digest, Python base-image
+digest, and all dependencies in `uv.lock`, then runs the full test suite.
