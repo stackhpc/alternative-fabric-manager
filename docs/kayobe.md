@@ -22,10 +22,8 @@ The result:
   any instance may become leader and run OpenSM there. If the controllers
   have none, use another group's containers, such as `infra_vm_containers`,
   on hosts that do, and the same files.
-- **Docker, preferably.** AFM runs OpenSM's container through the Docker
-  API. With `container_engine: podman` it would use Podman's
-  Docker-compatible socket, which hasn't been tested, nor has OpenSM's
-  container joining AFM's PID namespace under Podman.
+- **Docker.** AFM runs OpenSM's container through the Docker API. Podman
+  is untested, and support for it is a future improvement (see below).
 - **Kayobe's own OpenSM is off**: `opensm_enabled: false`, the default. AFM
   runs OpenSM itself, and two would fight.
 - **No other subnet manager** on the fabric, managed or embedded in a
@@ -430,3 +428,10 @@ See specs/ha.md. In short: a paused node can resume as a stale master
 until its watchdog kills it, and Ask (SMInfo DISABLE) isn't sent yet; in
 both cases the new leader's fabric checks find the other master, and no job
 completes meanwhile.
+
+## Future improvements
+
+- **Podman.** The guide uses Kayobe's `container_engine` throughout, and
+  `afm_container_socket` would point AFM at Podman's Docker-compatible
+  socket, but neither that socket nor OpenSM's container joining AFM's PID
+  namespace has been tested under Podman.

@@ -1045,6 +1045,13 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 
 ## Future improvements
 
+### Podman
+
+The managed driver runs OpenSM's container through the Docker API, and
+relies on OpenSM's container joining the manager's PID namespace. Neither
+has been tested with Podman, whose Docker-compatible socket the Kayobe
+guide would use (docs/kayobe.md).
+
 ### Confirmed fencing
 
 Fencing that doesn't depend on the target's cooperation, which removes the
