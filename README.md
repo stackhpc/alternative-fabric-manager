@@ -78,6 +78,14 @@ Before you start it:
 - **Treat the manager as root on its host.** It uses the Docker socket to
   start OpenSM's container and read its log, and whatever can use that
   socket can control the host.
+- **On a new database, record the fabric's switches** once OpenSM has
+  swept, with `docker exec alternative-fabric-manager
+  alternative-fabric-manager --config-file
+  /etc/alternative-fabric-manager/afm.conf --confirm-switches`: until then
+  no job completes ("No expected switches"). Run it again whenever
+  switches are added or removed.
+
+`--status` shows who holds the lease in HA mode, its term, and any freeze.
 
 `--init` gives the container an init process, which reaps OpenSM's processes
 when OpenSM stops: they belong to the manager's PID namespace. For HA mode,
@@ -168,13 +176,13 @@ To deal with it:
    `unattributed` means OpenSM's message named no switch port: read
    OpenSM's log around the "Clearing Enforcement bit" message to find it.
 2. **Find the host behind each port**, with `ibnetdiscover -y $KEY` or
-   `smpquery -y $KEY nodeinfo` by directed route, where `KEY` is the M_Key
-   (see Hardening).
+   `smpquery -y $KEY -D nodeinfo <directed route>` if LIDs aren't
+   assigned, where `KEY` is the M_Key (see Hardening).
 3. **Bring the port's pkeys within its table**: move ports of that host
    onto fewer networks, or take the host out of service. Until then, treat
    that host as able to reach any partition.
 4. **Check that the port enforces again** after OpenSM's next sweep:
-   `smpquery -y $KEY portinfo -G <switch GUID> <port>` shows
+   `smpquery -y $KEY portinfo -G 0x<switch GUID> <port>` shows
    `PartEnforceInb` and `PartEnforceOutb` set.
 5. **Clear them**, so that jobs complete again:
 
@@ -183,8 +191,9 @@ To deal with it:
      --clear-enforcement-errors
    ```
 
-   If OpenSM still can't enforce a port, it logs the error again at its
-   next sweep, and the manager records it again.
+   Clear only ports you have checked in step 4. Clearing doesn't wait for
+   proof: OpenSM may not log the error again for a port it still can't
+   enforce, so a port cleared too early can go unnoticed.
 
 In a container, run these with `docker exec alternative-fabric-manager`.
 

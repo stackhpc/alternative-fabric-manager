@@ -192,17 +192,20 @@ def test_an_ending_freeze_needs_the_frozen_nodes_stop_not_the_candidates(lease):
     assert lease.targets() == [("b", "ub", term + 1)]
 
 
-def test_a_held_entry_doesnt_leave_unconfirmed(lease):
+def test_a_confirmed_takeover_ending_a_freeze_removes_the_held_entry(lease):
     term = _frozen(lease)
     lease.request_unfreeze()
     assert lease.confirm(term)
     state = lease.read()
     new = lease.acquire("b", "ub", state.term, state.counter, False)
-    # Confirmed for the frozen term, so the held entry may leave.
-    assert lease.remove_target("ub", new, "a", "ua", "unconfirmed")
+    assert new == term + 1
+    # The frozen holder's held entry leaves in the takeover itself, and the
+    # confirmation is used up.
+    assert lease.targets() == [("b", "ub", new)]
+    assert lease.read().confirmed_term == 0
 
 
-def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
+def test_a_verified_takeover_ending_a_freeze_removes_the_held_entry(lease):
     term = _frozen(lease)
     lease.register("a", "ua2", "hash", [])
     lease.record_verified_stop("a", "ua2")
@@ -210,8 +213,18 @@ def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
     state = lease.read()
     new = lease.acquire("b", "ub", state.term, state.counter, False)
     assert new == term + 1
-    # Left as verified in the takeover itself
-    assert ("a", "ua", term) not in lease.targets()
+    assert lease.targets() == [("b", "ub", new)]
+
+
+def test_a_held_entry_never_leaves_unconfirmed(lease):
+    term = _frozen(lease)
+    # Defensively: if a held entry were left in the set, it would leave only
+    # as verified, or with a confirmation for its term.
+    with lease.sessionmaker() as session:
+        session.get(db.Lease, 1).freeze_state = ""
+        session.commit()
+    b = lease.acquire("b", "ub", term, lease.read().counter, False)
+    assert not lease.remove_target("ub", b, "a", "ua", "unconfirmed")
 
 
 def test_confirmations_count_only_while_a_freeze_ends(lease):
@@ -270,3 +283,12 @@ def test_settings_a_newer_version_removed_dont_block_it(lease):
     assert lease.agree_settings('{"t": 30, "removed": false}')
     assert lease.agree_settings('{"t": 30}')
     assert not lease.agree_settings('{"t": 10}')
+
+
+def test_a_setting_a_newer_version_adds_is_stored_and_enforced(lease):
+    assert lease.agree_settings('{"t": 30}')
+    # The first instance with the new setting stores it...
+    assert lease.agree_settings('{"t": 30, "added": 5}')
+    # ...and others must agree on it, while older ones still agree.
+    assert not lease.agree_settings('{"t": 30, "added": 6}')
+    assert lease.agree_settings('{"t": 30}')

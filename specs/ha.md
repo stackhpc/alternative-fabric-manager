@@ -227,7 +227,9 @@ the target set, self-stop and the waits in Fencing.
     without releasing the lease, so a successor waits for the lease to
     expire and the unconfirmed wait; that is safe, since its OpenSM is
     verified stopped. If the manager is killed anyway, OpenSM dies with it,
-    since the manager is PID 1 of the namespace OpenSM's container joins.
+    since OpenSM's container joins the manager's PID namespace, whose init,
+    `docker run --init`, exits with the manager and takes the namespace with
+    it.
   - **A candidate** that stops cleanly marks its node row as stopped, so
     that it isn't counted as a live candidate.
   - **After a self-stop**, once the leader reaches a Primary component
@@ -517,8 +519,9 @@ its OpenSM is known stopped and unable to start by itself:
 
 ### Seeing the host's processes
 
-The manager is PID 1 of its own PID namespace, which OpenSM's container
-joins, so its own `/proc` shows only OpenSM's container. It verifies that
+The manager runs in its own PID namespace, under `docker run --init` as
+PID 1, and OpenSM's container joins it, so the manager's own `/proc` shows
+only the two containers. It verifies that
 no OpenSM runs on the host, in any container or none, through the host's
 `/proc`, mounted read-only into its container at `/host/proc`, looking for
 any process whose executable is `opensm`.
@@ -668,6 +671,9 @@ moved, until the cluster is unfrozen.
   adopted from, still holds the frozen lease. If the frozen node itself fails, the fabric has no subnet
   manager until an operator unfreezes the cluster: that is what a freeze
   trades.
+- **`--status`** shows the lease's holder and term, whether it was
+  released, and the freeze, with its frozen term; for a freeze that is
+  ending, it gives the `--confirm-takeover` command to end it.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
   freeze's expiry, read by any instance that reaches a Primary component,
   marks the freeze as ending. The frozen leader acknowledges it, in this
@@ -688,8 +694,8 @@ moved, until the cluster is unfrozen.
   clears the freeze in the same statement. The frozen leader's target
   entry is marked held, since the unconfirmed wait doesn't stop a held
   watchdog: it leaves only as verified, or with that confirmation.
-- **SIGTERM while frozen** stops OpenSM, since the manager is PID 1 of its
-  namespace, but doesn't release the lease; the node's manager starts it
+- **SIGTERM while frozen** stops OpenSM, since OpenSM's container is in the
+  manager's PID namespace, which ends with it, but doesn't release the lease; the node's manager starts it
   again when it comes back. Shutting the frozen node down for good needs an
   unfreeze first.
 
@@ -746,6 +752,11 @@ A takeover takes up to `T` for the lease to expire, plus `T_watchdog` for
 an unconfirmed target, plus starting OpenSM and its first sweep. A job in flight during a takeover must
 not time out, or networking-mlnx sets its port to ERROR. So, with every
 value a cluster setting in Galera, so that all instances agree:
+the first instance stores its `[ha]` settings, and an instance whose
+settings differ from the stored ones in any key both have refuses to start.
+A key only the instance has, from a newer version, is added to the stored
+settings, with a warning; a key only the stored settings have, from an
+older version, is ignored. So:
 
 - job timeout > the time a job can spend before the leader fails, the
   larger of a poll interval, a sweep (`sweep_timeout`) and a fabric check,
@@ -1187,8 +1198,10 @@ HA mode refuses to start unless each enabled step has what it needs:
   is configured;
 - step 4: refused until it is implemented.
 
-`[ha] fence_manual = true` makes every takeover wait for an operator to
-confirm the fence with the CLI, whatever steps are enabled. With no
+`[ha] fence_manual = true` makes a takeover wait for an operator to
+confirm the fence with the CLI when its enabled confirming steps fail.
+The CLI's `--confirm-takeover` accepts a confirmation only for a freeze
+that is ending, today; implementing `fence_manual` widens it to fences. With no
 confirming step enabled and `fence_manual` off, HA mode logs a warning at
 start, and the health check reports it.
 

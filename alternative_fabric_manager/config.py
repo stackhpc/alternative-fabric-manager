@@ -12,8 +12,10 @@
 
 """Configuration, read from an INI file"""
 
+import collections
 import configparser
 import dataclasses
+import logging
 import os
 import socket
 
@@ -51,6 +53,9 @@ MANAGED_OPENSM_KEYS = (
 REQUIRED_LOG_FLAGS = 0x07
 NO_HARDENING = ("none", "false", "no")
 ALL_HARDENING = ("all", "true", "yes")
+
+
+LOG = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -208,7 +213,14 @@ class Config:
         for section, names in OPTIONS:
             if not parser.has_section(section):
                 continue
-            unknown = set(parser.options(section)) - set(names)
+            for name in sorted(set(parser.options(section)) & REMOVED[section]):
+                LOG.warning(
+                    "[%s] %s was removed, and is ignored: %s",
+                    section,
+                    name,
+                    REMOVED_WHY[name],
+                )
+            unknown = set(parser.options(section)) - set(names) - REMOVED[section]
             if unknown:
                 raise ConfigError(
                     f"[{section}] has unknown options: {', '.join(sorted(unknown))}"
@@ -377,6 +389,13 @@ def _ha_problems(config):
         problems.append("M_Key protection level must be 1 or more")
     return problems
 
+
+# Options a release removed, which a configuration may still set: ignored,
+# with a warning, for a release or so
+REMOVED_WHY = {
+    "manual_takeover": "every takeover is automatic; see specs/ha.md, Fencing",
+}
+REMOVED = collections.defaultdict(set, {"ha": {"manual_takeover"}})
 
 OPTIONS = (
     ("api", ("host", "port", "url_prefix", "domain", "token")),

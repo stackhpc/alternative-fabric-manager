@@ -24,7 +24,8 @@ It takes 10-20 minutes; run it in the background. After changing the
 plugin, reinstall it into tempest's venv first:
 `/opt/stack/tempest/.tox/tempest/bin/pip install -q --no-deps --force-reinstall <plugin checkout>`.
 
-Expected on a single compute host with SDN sync: 16 passed, 4 skipped. The
+Expected on a single compute host with SDN sync, with the plugin as of
+this writing: 16 passed, 4 skipped; the counts change with its version. The
 skips are deliberate: no unsynced physical network configured,
 `mlnx_infiniband` binds VLAN ports, SDN restricts client IDs, and live
 migration needs a second host.
@@ -35,6 +36,8 @@ migration needs a second host.
    ```sh
    sudo sqlite3 /var/lib/docker/volumes/afm_data/_data/afm.sqlite \
      "select status, operation, count(*) from jobs where created_at > '<start>' group by 1,2;"
+   # In HA mode, the same query with mariadb and AFM's own credentials,
+   # against [database] connection
    sudo docker logs --since <start> alternative-fabric-manager 2>&1 | grep -E "Rejected|ERROR|waits"
    ```
 2. A port stuck in BUILD whose job never appears: AFM answered its request

@@ -152,3 +152,13 @@ def test_ha_needs_the_m_key_and_sm_key():
     with pytest.raises(config_mod.ConfigError, match="sm_key"):
         config_mod.Config(**base, hardening="m_key, enforcement").validate()
     config_mod.Config(**base, hardening="m_key, sm_key").validate()
+
+
+def test_a_removed_option_is_ignored_with_a_warning(tmp_path, caplog):
+    from alternative_fabric_manager import config as config_mod
+
+    path = tmp_path / "afm.conf"
+    path.write_text("[api]\ntoken = t\n[ha]\nmanual_takeover = true\n")
+    config = config_mod.Config.load(str(path))
+    assert not hasattr(config, "manual_takeover")
+    assert "manual_takeover was removed" in caplog.text

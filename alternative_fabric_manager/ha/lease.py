@@ -23,10 +23,13 @@ monotonic clock.
 import dataclasses
 import datetime
 import json
+import logging
 
 import sqlalchemy as sa
 
 from alternative_fabric_manager import db
+
+LOG = logging.getLogger(__name__)
 
 
 class NotPrimary(Exception):
@@ -509,11 +512,24 @@ class GaleraLease:
                 session.add(db.Secret(name=name, value=settings))
                 session.commit()
                 return True
-            session.commit()
-            # Only the settings both versions know: a setting a newer version
-            # removed mustn't keep its instances from leading.
+            # Only the settings both versions know are compared: a setting a
+            # newer version removed mustn't keep its instances from leading.
+            # A setting it added is stored by the first instance that has
+            # it, and checked against from then on; stored settings it lacks
+            # stay, for older instances during a rolling upgrade.
             stored, ours = json.loads(row.value), json.loads(settings)
-            return all(stored[key] == ours[key] for key in stored.keys() & ours.keys())
+            if any(stored[key] != ours[key] for key in stored.keys() & ours.keys()):
+                session.commit()
+                return False
+            added = sorted(ours.keys() - stored.keys())
+            if added:
+                LOG.warning("Storing new [ha] settings: %s", ", ".join(added))
+                row.value = json.dumps({**stored, **ours}, sort_keys=True)
+            ignored = sorted(stored.keys() - ours.keys())
+            if ignored:
+                LOG.info("Ignoring stored [ha] settings: %s", ", ".join(ignored))
+            session.commit()
+            return True
 
     def adopt_frozen(self, node, instance_uuid, frozen_term):
         """A restarted manager on the frozen node takes the frozen lease

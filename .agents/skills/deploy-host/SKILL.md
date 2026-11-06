@@ -60,7 +60,8 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    ```sh
    sudo docker build -q --network host -t alternative-fabric-manager:<tag> .
    ```
-3. **HA only: upgrade the schema**, if the branch adds an Alembic revision:
+3. **HA only: create or upgrade the schema**, on a new database, or if
+   the branch adds an Alembic revision:
    ```sh
    sudo docker run --rm --network host \
      -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \

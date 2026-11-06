@@ -41,20 +41,25 @@ def main(argv=None):
         help="Record the switches OpenSM sees now as the fabric's expected "
         "ones, which every fabric check must find, and exit",
     )
-    parser.add_argument(
+    enforcement = parser.add_mutually_exclusive_group()
+    enforcement.add_argument(
         "--show-enforcement-errors",
         action="store_true",
         help="List the switch ports whose partition enforcement OpenSM "
         "cleared, as <switch GUID>:<port>, and exit. While any is listed, no "
         "job completes",
     )
-    parser.add_argument(
+    enforcement.add_argument(
         "--clear-enforcement-errors",
         action="store_true",
-        help="Forget the switch ports --show-enforcement-errors lists, once "
-        "each has its enforcement back on, list them, and exit. Jobs then "
-        "complete again; a port OpenSM still can't enforce is listed again "
-        "at its next sweep",
+        help="Forget the switch ports --show-enforcement-errors lists, list "
+        "them, and exit; jobs then complete again. Check first that each "
+        "port enforces again: OpenSM needn't report one it still can't",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="HA: show the lease's holder, term and freeze, and exit",
     )
     parser.add_argument(
         "--db-upgrade",
@@ -103,6 +108,27 @@ def main(argv=None):
         db.make_sessionmaker(config.database_url)
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+
+    if args.status:
+        from alternative_fabric_manager.ha import lease as lease_mod
+
+        lease = lease_mod.GaleraLease(
+            db.make_sessionmaker(config.database_url, config.call_timeout)
+        )
+        state = lease.read()
+        print(f"holder: {state.holder_node or '-'}")
+        print(f"term: {state.term}")
+        print(f"released: {'yes' if state.released else 'no'}")
+        print(f"freeze: {state.freeze_state or 'none'}")
+        if state.freeze_state:
+            print(f"frozen term: {state.freeze_term}")
+        if state.freeze_state == "ending":
+            print(
+                "the frozen leader hasn't acknowledged the unfreeze: no takeover "
+                "until it does, its node's stop is verified, or "
+                f"--confirm-takeover {state.freeze_term}"
+            )
+        return
 
     if args.freeze or args.unfreeze or args.confirm_takeover is not None:
         from alternative_fabric_manager.ha import lease as lease_mod
