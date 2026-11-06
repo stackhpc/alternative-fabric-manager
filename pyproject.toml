@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 alternative-fabric-manager = "alternative_fabric_manager.cli:main"
+alternative-fabric-manager-watchdog = "alternative_fabric_manager.ha.watchdog:main"
 
 [dependency-groups]
 dev = [
