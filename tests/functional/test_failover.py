@@ -196,6 +196,13 @@ class Cluster:
             "a leader",
         )
 
+    def sm_pids(self, i):
+        return [
+            entry["pid"]
+            for entry in runner_mod.masters(self.fabric)
+            if entry["node"] == f"node-{i}"
+        ]
+
     def signal(self, i, sig):
         self.processes[i].send_signal(sig)
 
@@ -301,13 +308,24 @@ def port(n, network_n):
     }
 
 
+def _send(cluster, via, path, body):
+    """A request, retried on 503, as networking-mlnx does"""
+
+    def sent():
+        status, job = cluster.request(via, "POST", path, body)
+        if status == 503:
+            return None
+        assert status == 202, status
+        return job
+
+    return wait_for(sent, 20, f"{path} accepted")
+
+
 def apply_change(cluster, via, n, timeout=TAKEOVER + 60):
     """A network and a port, through instance via, completed"""
-    status, job = cluster.request(via, "POST", "/cloudx/Network", network(n, 100 + n))
-    assert status == 202, status
+    job = _send(cluster, via, "/cloudx/Network", network(n, 100 + n))
     cluster.job_completes(via, job, timeout)
-    status, job = cluster.request(via, "POST", "/cloudx/Port", port(n, n))
-    assert status == 202, status
+    job = _send(cluster, via, "/cloudx/Port", port(n, n))
     cluster.job_completes(via, job, timeout)
 
 
@@ -368,3 +386,82 @@ def test_without_galera_the_leader_stops_and_comes_back(cluster):
         docker("unpause", f"afm-galera-{i}")
     leader = cluster.wait_leader()
     apply_change(cluster, leader, 5)
+
+
+def _operator(cluster):
+    from alternative_fabric_manager import config as config_mod
+    from alternative_fabric_manager.ha import lease as lease_mod
+
+    config = config_mod.Config(
+        token=TOKEN, connection=url(1, cluster.password), **TIMINGS
+    )
+    sessionmaker = db.make_sessionmaker(config.connection, config.call_timeout)
+    return config, lease_mod.GaleraLease(sessionmaker), sessionmaker
+
+
+def test_a_frozen_leader_keeps_opensm_through_a_galera_outage(cluster):
+    from alternative_fabric_manager.ha import operator
+
+    leader = cluster.wait_leader()
+    apply_change(cluster, leader, 6)
+    config, lease, sessionmaker = _operator(cluster)
+    assert operator.freeze(config, lease, sessionmaker) == f"node-{leader}"
+    # New requests wait, with 503, which networking-mlnx retries.
+    follower = next(i for i in NODES if i != leader)
+    wait_for(
+        lambda: (
+            cluster.request(follower, "POST", "/cloudx/Network", network(7, 107))[0]
+            == 503
+        ),
+        10,
+        "503 while frozen",
+    )
+    for i in NODES:
+        docker("pause", f"afm-galera-{i}")
+    # Well past T_self, and past T plus the watchdog's lease: OpenSM stays.
+    end = time.monotonic() + TIMINGS["lease_timeout"] + TIMINGS["watchdog_timeout"] + 4
+    while time.monotonic() < end:
+        assert cluster.leader() == leader
+        time.sleep(0.5)
+    for i in NODES:
+        docker("unpause", f"afm-galera-{i}")
+    # Still frozen and held, with Galera back: no takeover.
+    time.sleep(TIMINGS["lease_timeout"] + 2)
+    assert cluster.leader() == leader
+    assert operator.unfreeze(config, lease, 30)
+    apply_change(cluster, follower, 7)
+    # A normal failover after it
+    cluster.signal(leader, signal.SIGKILL)
+    successor = cluster.wait_leader(other_than=leader)
+    apply_change(cluster, successor, 8)
+
+
+def test_an_unfreeze_the_leader_never_acknowledges_needs_an_operator(cluster):
+    from alternative_fabric_manager.ha import operator
+
+    leader = cluster.wait_leader()
+    config, lease, sessionmaker = _operator(cluster)
+
+    def frozen():
+        try:
+            return operator.freeze(config, lease, sessionmaker)
+        except operator.OperatorError:
+            # Until the leader's first fabric check passes
+            return None
+
+    wait_for(frozen, 30, "a freeze")
+    term = lease.read().term
+    # The frozen leader's manager pauses; an unfreeze can't be acknowledged.
+    cluster.signal(leader, signal.SIGSTOP)
+    assert not operator.unfreeze(config, lease, 5)
+    time.sleep(TIMINGS["lease_timeout"] + TIMINGS["watchdog_timeout"] + 2)
+    # Nobody took over: the held OpenSM may still run.
+    assert lease.read().term == term
+    assert cluster.leader() == leader
+    # The operator stops it, and confirms.
+    for pid in cluster.sm_pids(leader):
+        os.kill(pid, signal.SIGKILL)
+    operator.confirm_takeover(lease, term)
+    successor = cluster.wait_leader(other_than=leader)
+    cluster.signal(leader, signal.SIGCONT)
+    apply_change(cluster, successor, 9)

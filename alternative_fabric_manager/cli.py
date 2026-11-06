@@ -54,6 +54,22 @@ def main(argv=None):
         help="Bring the [database] connection database's schema up to date, "
         "and exit; run once per upgrade, before starting the new version",
     )
+    parser.add_argument(
+        "--freeze",
+        action="store_true",
+        help="HA: keep OpenSM on the current leader's node, whatever happens to "
+        "Galera, until --unfreeze; new requests get 503 meanwhile",
+    )
+    parser.add_argument(
+        "--unfreeze", action="store_true", help="HA: end a freeze, and exit"
+    )
+    parser.add_argument(
+        "--confirm-takeover",
+        type=int,
+        metavar="TERM",
+        help="HA: confirm that the leader of TERM's OpenSM can't act, for a "
+        "manual takeover or one while a freeze ends",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -78,6 +94,32 @@ def main(argv=None):
         db.make_sessionmaker(config.database_url)
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+
+    if args.freeze or args.unfreeze or args.confirm_takeover is not None:
+        from alternative_fabric_manager.ha import lease as lease_mod
+        from alternative_fabric_manager.ha import operator
+
+        sessionmaker = db.make_sessionmaker(config.database_url, config.call_timeout)
+        lease = lease_mod.GaleraLease(sessionmaker)
+        try:
+            if args.freeze:
+                node = operator.freeze(config, lease, sessionmaker)
+                print(f"Frozen on {node}")
+            elif args.unfreeze:
+                if operator.unfreeze(config, lease, config.lease_timeout):
+                    print("Unfrozen")
+                else:
+                    sys.exit(
+                        "alternative-fabric-manager: the leader hasn't acknowledged "
+                        "the unfreeze; no takeover until it does, its node's stop "
+                        "is verified, or --confirm-takeover"
+                    )
+            else:
+                operator.confirm_takeover(lease, args.confirm_takeover)
+                print(f"Confirmed term {args.confirm_takeover}")
+        except (operator.OperatorError, lease_mod.NotPrimary) as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
+        return
 
     if args.show_keys:
         manager = manager_mod.Manager(

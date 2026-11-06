@@ -224,17 +224,10 @@ class Coordinator:
             if not self.held:
                 self._step_down("a loop overran its bound")
             return
-        if self._opensm_gone:
+        if self._opensm_gone and not self.held:
             self._opensm_gone = False
-            if self.held:
-                LOG.error("OpenSM stopped while frozen: starting it again here")
-                self.runner.prepare(self.uuid, self.term, None)
-                threading.Thread(
-                    target=self.manager._start_opensm, name="restart", daemon=True
-                ).start()
-            else:
-                self._step_down("OpenSM stopped")
-                return
+            self._step_down("OpenSM stopped")
+            return
         if self._renewals_stopped:
             return
         try:
@@ -253,7 +246,32 @@ class Coordinator:
                 self.term,
                 None if self.held else self._watchdog_deadline(now),
             )
+        if self._opensm_gone and self.held:
+            self._restart_frozen()
         self._freeze_step()
+
+    def _restart_frozen(self):
+        """Start OpenSM again as the frozen node, only once a read from a
+        Primary component shows this instance still holds the frozen lease:
+        a confirmed takeover may have happened while this manager was
+        paused, and the held watchdog lease can't know it"""
+        try:
+            state = self.lease.read()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("Can't confirm the freeze to restart OpenSM: %s", e)
+            return
+        if (
+            state.holder_uuid != self.uuid
+            or state.term != self.term
+            or state.freeze_state not in ("frozen", "ending")
+        ):
+            return
+        self._opensm_gone = False
+        LOG.error("OpenSM stopped while frozen: starting it again here")
+        self.runner.prepare(self.uuid, self.term, None)
+        threading.Thread(
+            target=self.manager._start_opensm, name="restart", daemon=True
+        ).start()
 
     def _freeze_step(self):
         try:

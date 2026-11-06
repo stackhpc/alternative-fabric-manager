@@ -657,9 +657,11 @@ moved, until the cluster is unfrozen.
   then starts OpenSM, with a start request for the frozen term that carries the
   held deadline rather than `t0` + `T_self`. Rejoining's removal of the
   watchdog's files doesn't apply to the frozen node while it is frozen.
-  With Galera down, it may restart OpenSM from the watchdog's held lease
-  only before that lease's deadline, never after the freeze may have
-  ended, and it adopts the lease as soon as Galera returns. If the frozen node itself fails, the fabric has no subnet
+  It never restarts OpenSM from the watchdog's held lease alone, even with
+  Galera down: a confirmed takeover may have happened while its manager
+  was paused, which the held lease can't know. It restarts OpenSM only once
+  a read from a Primary component shows that it, or the instance it
+  adopted from, still holds the frozen lease. If the frozen node itself fails, the fabric has no subnet
   manager until an operator unfreezes the cluster: that is what a freeze
   trades.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
