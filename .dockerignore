@@ -4,3 +4,7 @@
 .ruff_cache
 **/__pycache__
 tests
+.agents
+.claude
+AGENTS.md
+CLAUDE.md
