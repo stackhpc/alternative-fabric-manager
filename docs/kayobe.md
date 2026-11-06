@@ -22,6 +22,10 @@ The result:
   any instance may become leader and run OpenSM there. If the controllers
   have none, use another group's containers, such as `infra_vm_containers`,
   on hosts that do, and the same files.
+- **Docker, preferably.** AFM runs OpenSM's container through the Docker
+  API. With `container_engine: podman` it would use Podman's
+  Docker-compatible socket, which hasn't been tested, nor has OpenSM's
+  container joining AFM's PID namespace under Podman.
 - **Kayobe's own OpenSM is off**: `opensm_enabled: false`, the default. AFM
   runs OpenSM itself, and two would fight.
 - **No other subnet manager** on the fabric, managed or embedded in a
@@ -81,7 +85,19 @@ afm_domain: "cloudx"
 afm_container_name: "alternative_fabric_manager"
 afm_config_dir: "/etc/alternative-fabric-manager"
 afm_state_dir: "/run/alternative-fabric-manager"
+# The container API AFM uses to run OpenSM's container: Docker's socket, or,
+# with container_engine: podman, Podman's Docker-compatible one,
+# /run/podman/podman.sock (untested)
+afm_container_socket: >-
+  {{ '/run/podman/podman.sock' if container_engine == 'podman'
+     else '/var/run/docker.sock' }}
+# Where AFM's database is created: a host kolla-ansible manages, which has
+# the kolla_toolbox container
+afm_database_host: "{{ groups['controllers'][0] }}"
 ```
+
+Every container command below uses Kayobe's `container_engine`, `docker`
+or `podman`.
 
 ## The container
 
@@ -103,7 +119,7 @@ controller_containers:
     volumes:
       - "{{ afm_config_dir }}:{{ afm_config_dir }}:ro"
       - "/etc/opensm:/etc/opensm"
-      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "{{ afm_container_socket }}:/var/run/docker.sock"
       # The tmpfs the manager and OpenSM's watchdog share
       - "{{ afm_state_dir }}:{{ afm_state_dir }}"
       # The host's processes, to verify that no OpenSM runs
@@ -151,10 +167,12 @@ lease before Docker kills it.
 
 # Idempotently, as kolla-ansible creates its own databases: with the
 # kolla_toolbox container's MySQL modules, as kolla's database_user.
+# kolla_toolbox is a long-lived container on every host kolla-ansible
+# manages, so this runs once, on one of them, whichever hosts AFM runs on.
 - name: Ensure AFM's database and user exist
   ansible.builtin.command:
     argv:
-      - docker
+      - "{{ container_engine }}"
       - exec
       - kolla_toolbox
       - ansible
@@ -185,6 +203,7 @@ lease before Docker kills it.
         append_privs: true
   register: afm_database
   changed_when: "'CHANGED' in afm_database.stdout"
+  delegate_to: "{{ afm_database_host }}"
   run_once: true
   become: true
   no_log: true
@@ -192,7 +211,7 @@ lease before Docker kills it.
 - name: Ensure AFM's schema is up to date
   ansible.builtin.command:
     argv:
-      - docker
+      - "{{ container_engine }}"
       - run
       - --rm
       - --network=host
@@ -208,7 +227,10 @@ lease before Docker kills it.
   become: true
 ```
 
-`login_user` falls back to `root`, kolla's default `database_user`.
+`login_user` falls back to `root`, kolla's default `database_user`. The
+passwords are in the command's arguments, so they are briefly visible in
+that host's process list, as with kolla-ansible's own database tasks;
+`no_log` keeps them out of Kayobe's output.
 
 ### AFM's configuration
 
@@ -339,7 +361,9 @@ runs OpenSM and every instance is healthy.
         url: "http://{{ internal_net_name | net_ip }}:{{ afm_api_port }}/healthz"
 
     - name: Find OpenSM's container
-      ansible.builtin.command: docker ps --filter name=^opensm$ --format "{{ '{{' }}.Names{{ '}}' }}"
+      ansible.builtin.command: >-
+        {{ container_engine }} ps --filter name=^opensm$
+        --format "{{ '{{' }}.Names{{ '}}' }}"
       register: afm_opensm
       changed_when: false
       become: true
@@ -366,16 +390,17 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 1. Deploy: `kayobe overcloud service deploy`.
 2. Record the fabric's switches, on the leader, the controller running the
    `opensm` container. Until then no job completes ("No expected
-   switches"):
+   switches"). Here and below, set `ENGINE=podman` on Podman hosts:
 
    ```sh
-   docker exec alternative_fabric_manager alternative-fabric-manager \
+   ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
    ```
 
 3. Run the networking-mlnx tempest plugin against the deployment.
 
 ## Upgrades and maintenance
+
 
 - **Upgrade AFM** by changing `afm_tag` and running
   `kayobe overcloud service deploy`. Its `pre.yml` upgrades the schema
@@ -386,16 +411,16 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   the leader whatever happens to Galera, and unfreeze after:
 
   ```sh
-  docker exec alternative_fabric_manager alternative-fabric-manager \
+  ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
     --config-file /etc/alternative-fabric-manager/afm.conf --freeze
   # ...
-  docker exec alternative_fabric_manager alternative-fabric-manager \
+  ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
     --config-file /etc/alternative-fabric-manager/afm.conf --unfreeze
   ```
 
   New requests get 503 while frozen, which networking-mlnx retries.
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
-  `KEY=$(docker exec alternative_fabric_manager alternative-fabric-manager
+  `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk
   '/^m_key/{print $2}')`, then `ibswitches -y $KEY`. Never print the keys.
 
