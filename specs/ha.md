@@ -1017,7 +1017,9 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       requests, the leader's hold and the watchdog's held lease, restarting
       OpenSM only on the frozen node, and candidates' timers restarted at
       the unfreeze.
-- [ ] A CLI to confirm a takeover that ends a freeze, record configuration epochs,
+- [x] `--force-unfreeze`, to end a freeze its leader never acknowledged.
+- [ ] `--confirm-fenced <node>`, with `fence_manual` (see Manual fencing).
+- [ ] A CLI to record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
       in containers, with faults injected: the leader killed, paused, cut
@@ -1195,8 +1197,8 @@ since a successor repeats it.
 
 With a confirming step enabled, if none confirms within
 `[ha] fence_timeout`, the takeover doesn't start OpenSM. The new leader keeps the lease, retries the ladder and raises an
-alarm; an operator can confirm a fence with the CLI, which asks them to
-check that the target's OpenSM can't act. The fabric runs on the target's
+alarm; an operator can confirm a fence with `--confirm-fenced` (see
+Manual fencing), after checking that the target's OpenSM can't act. The fabric runs on the target's
 OpenSM, if it still runs, or without a subnet manager, until then.
 
 HA mode refuses to start unless each enabled step has what it needs:
@@ -1210,12 +1212,43 @@ HA mode refuses to start unless each enabled step has what it needs:
 - step 4: refused until it is implemented.
 
 `[ha] fence_manual = true` makes a takeover wait for an operator to
-confirm the fence with the CLI when its enabled confirming steps fail.
-The CLI's `--force-unfreeze` is for freezes only; `fence_manual` will have
-its own command, naming the node whose fence the operator confirms, since
-the target set can hold several. With no
-confirming step enabled and `fence_manual` off, HA mode logs a warning at
-start, and the health check reports it.
+confirm the fence with `--confirm-fenced` when its enabled confirming steps
+fail. With no confirming step enabled and `fence_manual` off, HA mode logs
+a warning at start, and the health check reports it.
+
+#### Manual fencing
+
+Still to come, with `fence_manual`. The operator fences the target
+themselves, by stopping its OpenSM or its node, or disabling its switch
+port, and then confirms it:
+
+```sh
+alternative-fabric-manager --config-file … --confirm-fenced <node>
+```
+
+- **It names a node**, since the target set can hold several entries; the
+  operator gets the node from `--status`, which lists the target set's
+  entries waiting for a fence, each with its node, instance and term, and
+  what each enabled step last reported.
+- **It confirms what it read.** It reads the node's entries, and records
+  the confirmation as a compare-and-set naming each entry's instance and
+  term, as `--force-unfreeze` names the frozen holder's: an entry added
+  since, such as the node rejoining with a new instance and becoming a
+  target again, isn't covered, and the command says so and exits non-zero.
+  The leader then removes each confirmed entry from the target set as
+  "manual", as it would for a confirming step.
+- **Not for a held entry**, a frozen leader's: the command refuses, and
+  points to `--force-unfreeze`, since a freeze has its own two-phase rules
+  (see Freeze).
+- **Nothing checks the claim.** The help and `--status` say what the
+  operator must check first: that no `opensm` process runs on the target
+  node, or that the node is off, or that its switch port is disabled.
+- **Rejoining:** a node whose fence was confirmed by hand rejoins as one
+  that left the target set unconfirmed does (see Rejoining), since the
+  manager can't tell what the operator did to it.
+
+It is a separate command from `--force-unfreeze`, which ends a freeze and
+names no node: `--force-unfreeze` stays for freezes only.
 
 #### Unconfirmed takeovers, with the ladder
 
