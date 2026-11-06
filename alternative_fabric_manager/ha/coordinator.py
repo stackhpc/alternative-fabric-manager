@@ -22,8 +22,9 @@ or, unconfirmed, after Ask and T_watchdog.
 The coordinator drives OpenSM through a runner:
 - write_lease(instance, term, deadline): the watchdog's lease, the deadline
   on CLOCK_MONOTONIC, or None while held;
-- start(instance, term, deadline): a start request with that deadline, and
-  OpenSM started under the watchdog, returning a SweepReport or None;
+- prepare(instance, term, deadline): remove any stop request, and set the
+  start request's lease and deadline, for the manager's next OpenSM start,
+  which the runner, as its driver, makes under the watchdog;
 - stop(): ask the watchdog to stop OpenSM, killing it if it doesn't;
 - verify_stopped(): whether no OpenSM runs on the node;
 - ask(adapters): SMInfo DISABLE to a node's adapters, best effort.
@@ -35,6 +36,7 @@ import threading
 import time
 import uuid
 
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager.ha import lease as lease_mod
 
 LOG = logging.getLogger(__name__)
@@ -98,6 +100,13 @@ class Coordinator:
                 self.lease.register(
                     self.node, self.uuid, self.config_hash, self.adapters
                 )
+                if not self.lease.agree_settings(config_mod.ha_settings(self.config)):
+                    LOG.error(
+                        "This instance's [ha] settings differ from the cluster's: "
+                        "not a candidate"
+                    )
+                    time.sleep(self.config.ha_period)
+                    continue
                 state = self.lease.read()
                 if state.freeze_state in ("frozen", "ending") and (
                     state.holder_node == self.node
