@@ -78,11 +78,10 @@ def main(argv=None):
     )
     parser.add_argument(
         "--confirm-takeover",
-        type=int,
-        metavar="TERM",
+        action="store_true",
         help="HA: while a freeze ends and its frozen leader can't acknowledge "
-        "it, confirm that that leader's OpenSM, of the frozen TERM, can't act, "
-        "so that another instance may take over",
+        "it, confirm that that leader's OpenSM can't act, so that another "
+        "instance may take over",
     )
     args = parser.parse_args(argv)
 
@@ -115,22 +114,12 @@ def main(argv=None):
         lease = lease_mod.GaleraLease(
             db.make_sessionmaker(config.database_url, config.call_timeout)
         )
-        state = lease.read()
-        print(f"holder: {state.holder_node or '-'}")
-        print(f"term: {state.term}")
-        print(f"released: {'yes' if state.released else 'no'}")
-        print(f"freeze: {state.freeze_state or 'none'}")
-        if state.freeze_state:
-            print(f"frozen term: {state.freeze_term}")
-        if state.freeze_state == "ending":
-            print(
-                "the frozen leader hasn't acknowledged the unfreeze: no takeover "
-                "until it does, its node's stop is verified, or "
-                f"--confirm-takeover {state.freeze_term}"
-            )
+        from alternative_fabric_manager.ha import operator
+
+        print("\n".join(operator.status(lease.read())))
         return
 
-    if args.freeze or args.unfreeze or args.confirm_takeover is not None:
+    if args.freeze or args.unfreeze or args.confirm_takeover:
         from alternative_fabric_manager.ha import lease as lease_mod
         from alternative_fabric_manager.ha import operator
 
@@ -150,8 +139,8 @@ def main(argv=None):
                         "is verified, or --confirm-takeover"
                     )
             else:
-                operator.confirm_takeover(lease, args.confirm_takeover)
-                print(f"Confirmed term {args.confirm_takeover}")
+                node, term = operator.confirm_takeover(lease)
+                print(f"Confirmed that {node}'s OpenSM, term {term}, can't act")
         except (operator.OperatorError, lease_mod.NotPrimary) as e:
             sys.exit(f"alternative-fabric-manager: {e}")
         return

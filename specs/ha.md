@@ -671,9 +671,13 @@ moved, until the cluster is unfrozen.
   adopted from, still holds the frozen lease. If the frozen node itself fails, the fabric has no subnet
   manager until an operator unfreezes the cluster: that is what a freeze
   trades.
-- **`--status`** shows the lease's holder and term, whether it was
-  released, and the freeze, with its frozen term; for a freeze that is
-  ending, it gives the `--confirm-takeover` command to end it.
+- **`--status`** shows the lease's holder, its instance and term, whether
+  it was released, and the freeze, with its frozen term. While a freeze
+  ends unacknowledged, it reports the unfreeze as pending and names the
+  frozen leader's node as the one to check; once confirmed, it says so.
+  `--confirm-takeover` takes no term: it confirms the freeze ending when it
+  reads the lease row, and `confirm()` accepts it only if that freeze is
+  still ending, so it never confirms a later one.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
   freeze's expiry, read by any instance that reaches a Primary component,
   marks the freeze as ending. The frozen leader acknowledges it, in this

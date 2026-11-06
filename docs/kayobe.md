@@ -417,6 +417,13 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   ```
 
   New requests get 503 while frozen, which networking-mlnx retries.
+
+  If `--unfreeze` reports that the leader hasn't acknowledged it, run
+  `--status`: it shows "unfreeze pending" and names the frozen leader's
+  host. No instance takes over until that leader's manager acknowledges.
+  If its manager is paused or hung, stop its OpenSM, check that no
+  `opensm` process runs on that host, and run `--confirm-takeover`; another
+  instance then takes over.
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk

@@ -85,7 +85,8 @@ Before you start it:
   no job completes ("No expected switches"). Run it again whenever
   switches are added or removed.
 
-`--status` shows who holds the lease in HA mode, its term, and any freeze.
+`--status` shows who holds the lease in HA mode, its term, and any freeze,
+including an unfreeze still pending and the manager to check.
 
 `--init` gives the container an init process, which reaps OpenSM's processes
 when OpenSM stops: they belong to the manager's PID namespace. For HA mode,

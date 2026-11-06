@@ -61,11 +61,48 @@ def unfreeze(config, lease, wait):
     return False
 
 
-def confirm_takeover(lease, term):
-    """Confirm that the frozen leader of term's OpenSM can't act, while a
-    freeze it never acknowledged ends"""
-    if not lease.confirm(term):
+def confirm_takeover(lease):
+    """Confirm that the frozen leader's OpenSM can't act, while a freeze it
+    never acknowledged ends; returns its node and term
+
+    The confirmation names the term read here, and lease.confirm() takes it
+    only if that freeze is still the one ending, so a freeze that ends and
+    another that starts meanwhile is never confirmed by mistake."""
+    state = lease.read()
+    if state.freeze_state != "ending":
         raise OperatorError(
-            f"Only while a freeze ends, for its frozen term: term {term} isn't "
-            "frozen, or the cluster isn't unfreezing: run --unfreeze first"
+            "Only while a freeze ends: the cluster isn't unfreezing; "
+            "run --unfreeze first"
         )
+    if not lease.confirm(state.term):
+        raise OperatorError("The freeze changed meanwhile: check --status")
+    return state.holder_node, state.term
+
+
+def status(state):
+    """--status's lines, for a LeaseState"""
+    holder = state.holder_node or "-"
+    lines = [
+        f"holder: {holder} (instance {state.holder_uuid or '-'})",
+        f"term: {state.term}",
+        f"released: {'yes' if state.released else 'no'}",
+        f"freeze: {state.freeze_state or 'none'}",
+    ]
+    if state.freeze_state:
+        lines.append(f"frozen term: {state.freeze_term}")
+    if state.freeze_state == "ending":
+        if state.confirmed_term == state.term:
+            lines.append(
+                f"unfreeze pending: the takeover from {holder} is confirmed; "
+                "another instance takes over at its next poll"
+            )
+        else:
+            lines += [
+                f"unfreeze pending: {holder}'s manager hasn't acknowledged it, "
+                "so no instance takes over until it does, its node's stop is "
+                "verified, or an operator confirms.",
+                f"Check {holder}: if its manager is paused or hung, stop its "
+                "OpenSM, check that no opensm process runs there, and run "
+                "--confirm-takeover.",
+            ]
+    return lines
