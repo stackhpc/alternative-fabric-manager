@@ -1,0 +1,123 @@
+# Release a version: bump it in pyproject.toml and uv.lock, commit that to
+# main, tag the commit once pushed, open a draft release with generated
+# notes, and build the release's image.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to release, as <major>.<minor>.<patch>, such as 0.2.0"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Push the commit and the tag, and create the release
+      contents: write
+      # Dispatch the image build: a tag pushed with GITHUB_TOKEN doesn't
+      # trigger workflows itself
+      actions: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check that this runs on main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Run this workflow on main, not $GITHUB_REF" >&2
+          exit 1
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # Every tag, to compare with
+          fetch-depth: 0
+          # To push the commit and the tag
+          persist-credentials: true
+
+      - name: Validate the version
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The version must be <major>.<minor>.<patch>: $VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists" >&2
+            exit 1
+          fi
+          current="$(sed -nE 's/^version = "([^"]+)"$/\1/p' pyproject.toml | head -1)"
+          latest="$(git tag --list '[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)"
+          for previous in "$current" "$latest"; do
+            [[ -z "$previous" ]] && continue
+            highest="$(printf '%s\n%s\n' "$previous" "$VERSION" | sort -V | tail -1)"
+            if [[ "$VERSION" == "$previous" || "$highest" != "$VERSION" ]]; then
+              echo "$VERSION must be newer than $previous" >&2
+              exit 1
+            fi
+          done
+          echo "Releasing $VERSION, after pyproject.toml's $current and tag ${latest:-none}"
+
+      - name: Read uv version
+        id: uv_version
+        run: |
+          version="$(<.uv-version)"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "Unexpected uv version: $version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: ${{ steps.uv_version.outputs.version }}
+
+      - name: Bump the version
+        run: |
+          # Sets [project] version, and the project's version in uv.lock
+          uv version "$VERSION"
+          changed="$(git diff --name-only | sort | tr '\n' ' ')"
+          if [[ "$changed" != "pyproject.toml uv.lock " ]]; then
+            echo "Expected changes to pyproject.toml and uv.lock only: $changed" >&2
+            exit 1
+          fi
+          git diff
+
+      - name: Commit and push to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -a -m "Release $VERSION"
+          git push origin HEAD:main
+
+      - name: Tag the pushed commit
+        run: |
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Open a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$VERSION" \
+            --generate-notes
+
+      - name: Build the release's image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build-push-image.yaml --repo "$GITHUB_REPOSITORY" --ref "$VERSION"
