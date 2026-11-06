@@ -42,11 +42,19 @@ def main(argv=None):
         "ones, which every fabric check must find, and exit",
     )
     parser.add_argument(
+        "--show-enforcement-errors",
+        action="store_true",
+        help="List the switch ports whose partition enforcement OpenSM "
+        "cleared, as <switch GUID>:<port>, and exit. While any is listed, no "
+        "job completes",
+    )
+    parser.add_argument(
         "--clear-enforcement-errors",
         action="store_true",
-        help="Forget the switch ports whose partition enforcement OpenSM "
-        "cleared, once they are dealt with, and exit; until then no job "
-        "completes",
+        help="Forget the switch ports --show-enforcement-errors lists, once "
+        "each has its enforcement back on, list them, and exit. Jobs then "
+        "complete again; a port OpenSM still can't enforce is listed again "
+        "at its next sweep",
     )
     parser.add_argument(
         "--db-upgrade",
@@ -143,11 +151,16 @@ def main(argv=None):
             print(f"0x{guid:016x}")
         return
 
-    if args.clear_enforcement_errors:
+    if args.show_enforcement_errors or args.clear_enforcement_errors:
         manager = manager_mod.Manager(
             config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
         )
-        for port in manager.clear_enforcement_errors():
+        ports = (
+            manager.clear_enforcement_errors()
+            if args.clear_enforcement_errors
+            else manager.enforcement_errors()
+        )
+        for port in ports:
             print(port)
         return
 

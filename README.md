@@ -142,6 +142,52 @@ rate and MTU it has now, as `saquery -g` shows them. Otherwise OpenSM
 recreates it, which disrupts IPoIB on the default partition across the
 fabric.
 
+### Switch ports that stop enforcing partitions
+
+A switch port enforces partitions with a table of the pkeys allowed through
+it. If a port needs more pkeys than its table holds, because the host
+behind it has ports in more networks than that, OpenSM logs `ERR 0507` or
+`ERR 0513` and **clears the port's enforcement bit**: the switch then lets
+any pkey through that port, so a host behind it can reach other tenants'
+partitions.
+
+The manager can't fix that by itself, so it fails closed: it records the
+switch port, logs "OpenSM cleared a switch port's enforcement", and **no
+job completes, for any port on the fabric**, until an operator has dealt
+with it. New ports stay `DOWN` meanwhile, and Nova's wait for them fails.
+
+To deal with it:
+
+1. **List the ports**, as `<switch GUID>:<port>`:
+
+   ```sh
+   alternative-fabric-manager --config-file /etc/alternative-fabric-manager/afm.conf \
+     --show-enforcement-errors
+   ```
+
+   `unattributed` means OpenSM's message named no switch port: read
+   OpenSM's log around the "Clearing Enforcement bit" message to find it.
+2. **Find the host behind each port**, with `ibnetdiscover -y $KEY` or
+   `smpquery -y $KEY nodeinfo` by directed route, where `KEY` is the M_Key
+   (see Hardening).
+3. **Bring the port's pkeys within its table**: move ports of that host
+   onto fewer networks, or take the host out of service. Until then, treat
+   that host as able to reach any partition.
+4. **Check that the port enforces again** after OpenSM's next sweep:
+   `smpquery -y $KEY portinfo -G <switch GUID> <port>` shows
+   `PartEnforceInb` and `PartEnforceOutb` set.
+5. **Clear them**, so that jobs complete again:
+
+   ```sh
+   alternative-fabric-manager --config-file /etc/alternative-fabric-manager/afm.conf \
+     --clear-enforcement-errors
+   ```
+
+   If OpenSM still can't enforce a port, it logs the error again at its
+   next sweep, and the manager records it again.
+
+In a container, run these with `docker exec alternative-fabric-manager`.
+
 ## Development
 
 ```sh
