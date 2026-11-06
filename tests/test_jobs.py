@@ -94,6 +94,8 @@ def test_an_unsound_fabric_holds_jobs(manager, fabric, seen, detail):
         assert detail in applied.check_detail
 
     fabric.fabric_result = _fabric()
+    # After another master, a passing check, then a sweep and a check
+    manager.reconcile()
     manager.reconcile()
     assert _status(manager, job) == db.JobStatus.COMPLETED
 
@@ -712,3 +714,32 @@ def test_a_start_that_swept_is_recorded(manager, fabric):
     manager.check_fabric()
     manager.evaluate_jobs()
     assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_no_sweep_while_another_master_acts(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    job = manager.put_network(OTHER, conftest.network(OTHER, 200))
+    fabric.fabric_result = _fabric(sms=((OWN, 3), (0x1234, 3)))
+    manager.check_fabric()
+    calls = fabric.calls
+    # Another master could undo a sweep made now.
+    manager.reconcile()
+    manager.reconcile()
+    assert fabric.calls == calls
+    assert _status(manager, job) == db.JobStatus.PENDING
+    # It goes; a check passes, then a sweep, then a check after it.
+    fabric.fabric_result = _fabric()
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.PENDING
+    manager.reconcile()
+    assert fabric.calls == calls + 1
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_no_job_completes_while_opensm_isnt_running(manager, fabric):
+    job = manager.put_network(NETWORK_ID, conftest.network())
+    manager.sync()
+    manager.check_fabric()
+    fabric.is_running = False
+    assert _status(manager, job) == db.JobStatus.PENDING

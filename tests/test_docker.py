@@ -372,3 +372,20 @@ def test_managed_start_reports_its_first_sweep(managed_config):
     client = FakeManagedClient(log=MAD_PKEY_FAILURES[1] + "\n" + STARTED)
     report = docker_driver.ManagedDocker(managed_config, client=client).start()
     assert report is not None and report.unattributed
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pkey_mgr_process_partition_table: ERR 0503: Failed to obtain P_Key "
+        "0x8064 block and index for compute-0 mlx5_0",
+        "pkey_mgr_update_port: ERR 0511: Failed to set PortInfo for node "
+        "0xec0d9a0300b12560 port 7 (SwitchIB)",
+        "pkey_mgr_update_port: ERR 0514: Failed to allocate backup blocks",
+    ],
+)
+def test_more_pkey_manager_errors_fail_closed(line):
+    report = SweepReport()
+    docker_driver._note_pkey_error(report, line)
+    assert report.unattributed
+    assert not docker_driver._is_partitions_error(line)

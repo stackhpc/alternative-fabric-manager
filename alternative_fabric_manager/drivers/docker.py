@@ -53,6 +53,9 @@ STANDBY_MARKER = "Entering STANDBY state"
 # in OpenSM 5.17, by code (see specs/ha.md, OpenSM errors)
 PKEY_ERROR_CODES = (
     "0502",
+    "0503",
+    "0511",
+    "0514",
     "0505",
     "0506",
     "0508",

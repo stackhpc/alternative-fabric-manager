@@ -93,6 +93,9 @@ class Manager:
         self._thread = None
         # The partitions file last written and swept
         self._written = None
+        # Whether the last fabric check saw another master, or OpenSM's own
+        # not master: no sweep counts, nor is one made, until a check passes
+        self._contested_fabric = False
         # A generation whose render or apply failed in a way that can't be
         # traced to an object, so that it isn't tried again until the
         # recorded state changes
@@ -844,6 +847,11 @@ class Manager:
         """Make OpenSM's partitions match the recorded state"""
         if not self.driver.running():
             return
+        if self._contested_fabric:
+            # Another master could undo a sweep made now; wait for a check
+            # that passes, then sweep, then check again.
+            LOG.warning("Not applying the partitions while another SM may act")
+            return
         reason = self._needs_sync()
         if reason is None:
             return
@@ -976,10 +984,13 @@ class Manager:
         try:
             fabric = self._fabric()
         except ReloadError as e:
+            # Not knowing is no evidence either way: a contested fabric stays
+            # contested until a check passes.
             ok, detail = False, f"Can't query the fabric: {e}"
         else:
             ok, detail = self._judge(fabric)
-            if fabric is not None and self._contested(fabric):
+            self._contested_fabric = fabric is not None and self._contested(fabric)
+            if self._contested_fabric:
                 # Another master may have set pkey tables since the last
                 # sweep, so it is no evidence: sweep again, once the check
                 # passes, before any job completes.
@@ -1076,9 +1087,12 @@ class Manager:
         in that order. Cleared enforcement holds every job until an operator
         clears it; the spec's PortInfo check of it is still to come."""
         applied = session.get(db.Applied, 1)
+        running = self.driver.running()
         fresh = datetime.timedelta(seconds=2 * self.config.check_interval)
         ready = (
             applied is not None
+            and running
+            and not self._contested_fabric
             and self._written is not None
             and applied.check_ok
             and applied.check_time is not None
