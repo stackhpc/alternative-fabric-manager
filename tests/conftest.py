@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from fastapi import testclient
 
@@ -57,12 +59,32 @@ class FakeReloader:
         return self.fabric_result
 
 
+# AFM_TEST_DATABASE_URL runs the tests against a server, such as
+# mysql+pymysql://root:<password>@127.0.0.1:3399/afm_test: its database is
+# dropped and created again for each test.
+SERVER_URL = os.environ.get("AFM_TEST_DATABASE_URL")
+
+
+def _fresh_server_database(url):
+    import sqlalchemy as sa
+
+    parsed = sa.engine.make_url(url)
+    engine = sa.create_engine(parsed.set(database=""))
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f"DROP DATABASE IF EXISTS `{parsed.database}`")
+        connection.exec_driver_sql(f"CREATE DATABASE `{parsed.database}`")
+    engine.dispose()
+    db.upgrade(url)
+    return url
+
+
 @pytest.fixture
 def config(tmp_path):
     return config_mod.Config(
         token=TOKEN,
         driver="none",
         database=":memory:",
+        connection=_fresh_server_database(SERVER_URL) if SERVER_URL else "",
         config_dir=str(tmp_path),
     )
 
@@ -75,7 +97,9 @@ def reloader():
 @pytest.fixture
 def manager(config, reloader, monkeypatch):
     monkeypatch.setattr(manager_mod, "RETRY_DELAY", 0)
-    return manager_mod.Manager(config, db.make_sessionmaker(config.database), reloader)
+    return manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), reloader
+    )
 
 
 @pytest.fixture

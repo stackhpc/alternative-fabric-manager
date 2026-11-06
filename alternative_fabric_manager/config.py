@@ -70,7 +70,17 @@ class Config:
     token: str = ""
 
     # [database]
+    # An SQLite file, for a single instance
     database: str = "/var/lib/alternative-fabric-manager/afm.sqlite"
+    # Or a database URL, mysql+pymysql://user:password@host/afm for MariaDB
+    # or Galera, which overrides it. The schema is then managed with
+    # alternative-fabric-manager --db-upgrade.
+    connection: str = ""
+
+    @property
+    def database_url(self):
+        """The database to use: the connection URL, or the SQLite file"""
+        return self.connection or self.database
 
     # [opensm]
     # managed: the manager runs OpenSM in a container of its own, in the
@@ -249,7 +259,7 @@ class Config:
 
 OPTIONS = (
     ("api", ("host", "port", "url_prefix", "domain", "token")),
-    ("database", ("database",)),
+    ("database", ("database", "connection")),
     (
         "opensm",
         (

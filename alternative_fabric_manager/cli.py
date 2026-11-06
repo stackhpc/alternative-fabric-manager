@@ -48,6 +48,12 @@ def main(argv=None):
         "cleared, once they are dealt with, and exit; until then no job "
         "completes",
     )
+    parser.add_argument(
+        "--db-upgrade",
+        action="store_true",
+        help="Bring the [database] connection database's schema up to date, "
+        "and exit; run once per upgrade, before starting the new version",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -59,9 +65,23 @@ def main(argv=None):
     except config_mod.ConfigError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
+    if args.db_upgrade:
+        if not config.connection:
+            sys.exit(
+                "alternative-fabric-manager: --db-upgrade needs [database] "
+                "connection; an SQLite file upgrades itself"
+            )
+        db.upgrade(config.connection)
+        return
+
+    try:
+        db.make_sessionmaker(config.database_url)
+    except db.SchemaError as e:
+        sys.exit(f"alternative-fabric-manager: {e}")
+
     if args.show_keys:
         manager = manager_mod.Manager(
-            config, db.make_sessionmaker(config.database), drivers.NoOpenSM()
+            config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
         )
         for name, value in manager.keys().items():
             print(f"{name} {value}")
@@ -69,7 +89,9 @@ def main(argv=None):
 
     if args.confirm_switches:
         manager = manager_mod.Manager(
-            config, db.make_sessionmaker(config.database), drivers.make_driver(config)
+            config,
+            db.make_sessionmaker(config.database_url),
+            drivers.make_driver(config),
         )
         switches = manager.confirm_switches()
         if not switches:
@@ -80,7 +102,7 @@ def main(argv=None):
 
     if args.clear_enforcement_errors:
         manager = manager_mod.Manager(
-            config, db.make_sessionmaker(config.database), drivers.NoOpenSM()
+            config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
         )
         for port in manager.clear_enforcement_errors():
             print(port)
@@ -88,7 +110,7 @@ def main(argv=None):
 
     manager = manager_mod.Manager(
         config,
-        db.make_sessionmaker(config.database),
+        db.make_sessionmaker(config.database_url),
         drivers.make_driver(config),
     )
     app = api.create_app(config, manager)

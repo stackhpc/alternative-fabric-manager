@@ -12,12 +12,23 @@
 
 """The fabric's desired state, and the jobs that apply it"""
 
+import contextlib
 import datetime
 import enum
 import os
 
 import sqlalchemy as sa
 from sqlalchemy import orm
+from sqlalchemy.dialects import mysql
+
+# UTC timestamps, to the microsecond on MariaDB too, whose DATETIME has
+# whole seconds unless asked otherwise
+Timestamp = sa.DateTime(timezone=True).with_variant(
+    mysql.DATETIME(fsp=6), "mysql", "mariadb"
+)
+# Each database call's timeout, in seconds: a call blocked on an
+# unreachable database must not hold up its loop (see specs/ha.md)
+CALL_TIMEOUT = 3
 
 
 class Base(orm.DeclarativeBase):
@@ -85,14 +96,14 @@ class Job(Base):
     # JSON (see effects.py)
     effect: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
     deadline: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
-        sa.DateTime(timezone=True), nullable=True
+        Timestamp, nullable=True
     )
     error: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
     created_at: orm.Mapped[datetime.datetime] = orm.mapped_column(
-        sa.DateTime(timezone=True), default=_now
+        Timestamp, default=_now
     )
     finished_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
-        sa.DateTime(timezone=True), nullable=True
+        Timestamp, nullable=True
     )
 
 
@@ -143,7 +154,7 @@ class Applied(Base):
     # The last fabric check
     check_ok: orm.Mapped[bool] = orm.mapped_column(default=False)
     check_time: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
-        sa.DateTime(timezone=True), nullable=True
+        Timestamp, nullable=True
     )
     check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
 
@@ -221,7 +232,86 @@ def _upgrade(engine):
             )
 
 
+class SchemaError(Exception):
+    """The database's schema isn't the one this version needs"""
+
+
+def _alembic_config(url):
+    from alembic.config import Config
+
+    config = Config()
+    config.set_main_option(
+        "script_location", os.path.join(os.path.dirname(__file__), "migrations")
+    )
+    # Alembic's options are interpolated, so a literal % must be doubled.
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    return config
+
+
+def upgrade(url):
+    """Bring a server database's schema up to date, at deploy time"""
+    from alembic import command
+
+    command.upgrade(_alembic_config(url), "head")
+
+
+def _check_schema(engine):
+    """Refuse a server database whose schema isn't this version's"""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(
+        _alembic_config(engine.url.render_as_string(hide_password=False))
+    ).get_current_head()
+    with engine.connect() as connection:
+        current = MigrationContext.configure(connection).get_current_revision()
+    if current != head:
+        raise SchemaError(
+            f"The database's schema is at {current or 'nothing'}, not {head}: "
+            "run alternative-fabric-manager --db-upgrade"
+        )
+
+
+def _make_server_engine(url):
+    """An engine for MariaDB or Galera"""
+    engine = sa.create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        connect_args={
+            "connect_timeout": CALL_TIMEOUT,
+            "read_timeout": CALL_TIMEOUT,
+            "write_timeout": CALL_TIMEOUT,
+        },
+    )
+
+    @sa.event.listens_for(engine, "connect")
+    def _session_settings(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET SESSION time_zone = '+00:00'")
+        # Read what other Galera nodes have committed (see specs/ha.md); a
+        # server without wsrep has no such variable.
+        with contextlib.suppress(Exception):
+            cursor.execute("SET SESSION wsrep_sync_wait = 1")
+        cursor.close()
+
+    return engine
+
+
 def make_sessionmaker(database):
+    """Return a session factory for an SQLite file, or a database URL
+
+    An SQLite file's schema is created, and upgraded in place; a server
+    database's is managed with Alembic, at deploy time.
+    """
+    if "://" in database:
+        engine = _make_server_engine(database)
+        _check_schema(engine)
+        return orm.sessionmaker(engine, expire_on_commit=False)
+    return _make_sqlite_sessionmaker(database)
+
+
+def _make_sqlite_sessionmaker(database):
     """Return a session factory for an SQLite file, creating the schema"""
     if database != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(database)), exist_ok=True)
