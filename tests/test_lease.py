@@ -69,14 +69,14 @@ def test_a_verified_stop_counts_only_from_another_instance_after_the_entry(lease
     term = _take(lease, "b", "ub")
     # a's own instance can't vouch for itself.
     lease.record_verified_stop("a", "ua")
-    assert not lease.remove_target(term, "a", "ua", "verified")
+    assert not lease.remove_target("ub", term, "a", "ua", "verified")
     # a's restarted instance verifies, at the current term, after the entry.
     lease.register("a", "ua2", "hash", [])
     lease.record_verified_stop("a", "ua2")
-    assert lease.remove_target(term, "a", "ua", "verified")
+    assert lease.remove_target("ub", term, "a", "ua", "verified")
     assert lease.targets() == [("b", "ub", 2)]
     # Only the leader of the current term removes entries.
-    assert not lease.remove_target(term - 1, "b", "ub", "unconfirmed")
+    assert not lease.remove_target("ub", term - 1, "b", "ub", "unconfirmed")
 
 
 def test_taking_clears_the_mark_and_removes_covered_own_entries(lease):
@@ -161,11 +161,85 @@ def test_adopting_a_frozen_lease_clears_an_earlier_verified_stop(lease):
     # a's manager restarts, verifies its stop, then adopts and starts OpenSM.
     lease.register("a", "ua2", "hash", [])
     lease.record_verified_stop("a", "ua2")
-    assert lease.adopt_frozen("a", "ua2") == term
+    assert lease.adopt_frozen("a", "ua2", term) == term
     assert lease.targets() == [("a", "ua2", term)]
     # An unfreeze that the leader doesn't acknowledge: the earlier mark
     # mustn't let a candidate take over.
     lease.request_unfreeze()
     state = lease.read()
     assert lease.acquire("b", "ub", state.term, state.counter, False) is None
-    assert not lease.remove_target(term, "a", "ua2", "verified")
+    assert not lease.remove_target("ua2", term, "a", "ua2", "verified")
+
+
+def _frozen(lease):
+    term = _take(lease, "a", "ua")
+    lease.request_freeze(term, "operator", 30)
+    lease.acknowledge_freeze("ua", term)
+    return term
+
+
+def test_an_ending_freeze_needs_the_frozen_nodes_stop_not_the_candidates(lease):
+    term = _frozen(lease)
+    # b's own rejoin verified b's node, not the frozen node.
+    lease.record_verified_stop("b", "ub")
+    lease.request_unfreeze()
+    state = lease.read()
+    assert lease.acquire("b", "ub", state.term, state.counter, False) is None
+    # The frozen node's restarted instance verifies its stop: now it may.
+    lease.register("a", "ua2", "hash", [])
+    lease.record_verified_stop("a", "ua2")
+    assert lease.acquire("b", "ub", state.term, state.counter, False) == term + 1
+    assert lease.targets() == [("b", "ub", term + 1)]
+
+
+def test_a_held_entry_doesnt_leave_unconfirmed(lease):
+    term = _frozen(lease)
+    lease.request_unfreeze()
+    assert lease.confirm(term)
+    state = lease.read()
+    new = lease.acquire("b", "ub", state.term, state.counter, False)
+    # Confirmed for the frozen term, so the held entry may leave.
+    assert lease.remove_target("ub", new, "a", "ua", "unconfirmed")
+
+
+def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
+    term = _frozen(lease)
+    lease.register("a", "ua2", "hash", [])
+    lease.record_verified_stop("a", "ua2")
+    lease.request_unfreeze()
+    state = lease.read()
+    new = lease.acquire("b", "ub", state.term, state.counter, False)
+    assert new == term + 1
+    # Left as verified in the takeover itself
+    assert ("a", "ua", term) not in lease.targets()
+
+
+def test_an_earlier_confirmation_doesnt_end_a_later_freeze(lease):
+    term = _take(lease, "a", "ua")
+    assert lease.confirm(term)
+    lease.request_freeze(term, "operator", 30)
+    lease.acknowledge_freeze("ua", term)
+    # No confirmation while frozen
+    assert not lease.confirm(term)
+    lease.request_unfreeze()
+    state = lease.read()
+    assert lease.acquire("b", "ub", state.term, state.counter, False) is None
+
+
+def test_only_the_holder_removes_targets(lease):
+    _take(lease, "a", "ua")
+    term = _take(lease, "b", "ub")
+    assert not lease.remove_target("uc", term, "a", "ua", "unconfirmed")
+    assert lease.remove_target("ub", term, "a", "ua", "unconfirmed")
+
+
+def test_a_holder_cant_vouch_for_its_own_stop(lease):
+    _take(lease, "a", "ua")
+    assert lease.record_verified_stop("a", "ua") is None
+
+
+def test_release_withdraws_a_pending_freeze_request(lease):
+    term = _take(lease, "a", "ua")
+    lease.request_freeze(term, "operator", 30)
+    assert lease.release("a", "ua", term)
+    assert lease.read().freeze_state == ""

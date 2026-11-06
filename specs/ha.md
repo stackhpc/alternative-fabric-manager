@@ -676,9 +676,12 @@ moved, until the cluster is unfrozen.
   that its OpenSM can't act, as with `manual_takeover`; its watchdog's
   held deadline, if the freeze had an expiry, stops OpenSM meanwhile. A
   takeover while the freeze is ending is a compare-and-set that requires
-  either an operator's confirmation recorded in the lease row, or the
-  frozen node's verified-stop term at least the frozen term, and it
-  clears the freeze in the same statement.
+  either an operator's confirmation recorded in the lease row while the
+  freeze is ending, or the frozen node's verified stop, by an instance
+  other than the holder, at a term at least the frozen term, and it
+  clears the freeze in the same statement. The frozen leader's target
+  entry is marked held, since the unconfirmed wait doesn't stop a held
+  watchdog: it leaves only as verified, or with that confirmation.
 - **SIGTERM while frozen** stops OpenSM, since the manager is PID 1 of its
   namespace, but doesn't release the lease; the node's manager starts it
   again when it comes back. Shutting the frozen node down for good needs an

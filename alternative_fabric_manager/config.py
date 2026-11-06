@@ -15,6 +15,7 @@
 import configparser
 import dataclasses
 import os
+import socket
 
 # Every port is only a limited member of the default partition, so that ports
 # can't reach each other there; flat networks' ports are added as full
@@ -119,6 +120,31 @@ class Config:
     # sets a port whose job failed to ERROR, so this must be longer than the
     # longest the manager can take to apply a change.
     job_timeout: float = 180.0
+
+    # [ha] (see specs/ha.md). Times are in seconds.
+    ha: bool = False
+    # This instance's node, unique in the cluster
+    node: str = dataclasses.field(default_factory=socket.gethostname)
+    # T: how long a lease goes unrenewed before candidates take it
+    lease_timeout: float = 30.0
+    # T_self: how long a leader goes without renewing before it stops OpenSM
+    self_stop_timeout: float = 20.0
+    # T_watchdog: the watchdog's lease, and the unconfirmed wait
+    watchdog_timeout: float = 45.0
+    # T_reach: how long candidates wait for one that reaches every switch
+    reach_timeout: float = 30.0
+    # How often leases are renewed and read
+    ha_period: float = 2.0
+    # Every database call's timeout
+    call_timeout: float = 3.0
+    # Ask the old leader's SM to disable itself, at a takeover
+    fence_ask: bool = True
+    # Wait for an operator's confirmation at every takeover
+    manual_takeover: bool = False
+    # How long a step-down at SIGTERM may take
+    shutdown_timeout: float = 20.0
+    # The tmpfs that the manager and OpenSM's watchdog share
+    ha_state_dir: str = "/run/alternative-fabric-manager"
     # The rule for the default partition. All flat networks share it. Keep
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
@@ -199,9 +225,16 @@ class Config:
         config.validate()
         return config
 
+    def _validate_ha(self):
+        problems = _ha_problems(self)
+        if problems:
+            raise ConfigError("[ha] " + "; ".join(problems))
+
     def validate(self):
         if not self.token:
             raise ConfigError("[api] token must be set")
+        if self.ha:
+            self._validate_ha()
         if self.driver not in DRIVERS:
             raise ConfigError(f"[opensm] driver must be one of {', '.join(DRIVERS)}")
         if not self.default_partition.strip().endswith(";"):
@@ -257,6 +290,26 @@ class Config:
                 raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
 
 
+def _ha_problems(config):
+    """The timing inequalities of specs/ha.md that a configuration breaks"""
+    problems = []
+    if not config.connection:
+        problems.append("[database] connection must name a server database")
+    if (
+        config.self_stop_timeout + config.ha_period + config.call_timeout
+        >= config.lease_timeout
+    ):
+        problems.append(
+            "self_stop_timeout + ha_period + call_timeout must be less than "
+            "lease_timeout"
+        )
+    if config.watchdog_timeout <= config.ha_period + config.call_timeout:
+        problems.append("watchdog_timeout must exceed ha_period + call_timeout")
+    if config.driver == "none":
+        problems.append("[opensm] driver must start OpenSM")
+    return problems
+
+
 OPTIONS = (
     ("api", ("host", "port", "url_prefix", "domain", "token")),
     ("database", ("database", "connection")),
@@ -283,6 +336,23 @@ OPTIONS = (
             "ipoib_rate",
             "ipoib_mtu",
             "ipoib_sl",
+        ),
+    ),
+    (
+        "ha",
+        (
+            "ha",
+            "node",
+            "lease_timeout",
+            "self_stop_timeout",
+            "watchdog_timeout",
+            "reach_timeout",
+            "ha_period",
+            "call_timeout",
+            "fence_ask",
+            "manual_takeover",
+            "shutdown_timeout",
+            "ha_state_dir",
         ),
     ),
 )

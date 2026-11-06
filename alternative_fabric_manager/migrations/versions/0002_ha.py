@@ -77,6 +77,7 @@ def upgrade():
         sa.Column("node", sa.String(length=255), nullable=False),
         sa.Column("instance_uuid", sa.String(length=36), nullable=False),
         sa.Column("term", sa.Integer(), nullable=False),
+        sa.Column("held", sa.Boolean(), nullable=False),
         sa.PrimaryKeyConstraint("node", "instance_uuid"),
     )
     op.add_column(

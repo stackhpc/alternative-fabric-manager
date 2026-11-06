@@ -216,6 +216,9 @@ class TargetEntry(Base):
     node: orm.Mapped[str] = orm.mapped_column(sa.String(255), primary_key=True)
     instance_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), primary_key=True)
     term: orm.Mapped[int] = orm.mapped_column()
+    # A frozen leader's entry: its watchdog lease is held, so the unconfirmed
+    # wait doesn't stop its OpenSM, and it leaves only verified or confirmed
+    held: orm.Mapped[bool] = orm.mapped_column(default=False)
 
 
 class Node(Base):

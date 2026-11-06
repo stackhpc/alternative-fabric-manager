@@ -60,9 +60,11 @@ def _check_primary(session):
     # MariaDB, as in tests.
     try:
         wsrep_on = session.scalar(sa.text("SELECT @@wsrep_on"))
-    except sa.exc.DBAPIError:
+    except sa.exc.DBAPIError as e:
         session.rollback()
-        return
+        if db.UNKNOWN_SYSTEM_VARIABLE in getattr(e.orig, "args", ())[:1]:
+            return
+        raise NotPrimary(f"Can't tell whether the node is Primary: {e}") from e
     if not wsrep_on:
         return
     rows = dict(
@@ -182,14 +184,25 @@ class GaleraLease:
             passed = deadline is not None and now > deadline
             own = session.get(db.Node, node)
             if not self._takeover_allowed(lease, passed):
+                # While a freeze is ending, the frozen node's OpenSM must be
+                # verified stopped, by another instance than the holder.
+                frozen = session.get(db.Node, lease.holder_node)
                 stopped = (
                     lease.freeze_state == "ending"
-                    and own is not None
-                    and own.verified_stop_term >= lease.freeze_term
+                    and frozen is not None
+                    and frozen.verified_stop_uuid not in ("", lease.holder_uuid)
+                    and frozen.verified_stop_term >= lease.freeze_term
                 )
                 if not stopped:
                     session.rollback()
                     return None
+                # The frozen holder's entry now leaves as verified.
+                session.execute(
+                    sa.delete(db.TargetEntry).where(
+                        db.TargetEntry.node == lease.holder_node,
+                        db.TargetEntry.instance_uuid == lease.holder_uuid,
+                    )
+                )
             lease.holder_node = node
             lease.holder_uuid = instance_uuid
             lease.term += 1
@@ -200,10 +213,16 @@ class GaleraLease:
             lease.freeze_request_deadline = None
             term = lease.term
             stop_term = own.verified_stop_term if own is not None else -1
+            stop_uuid = own.verified_stop_uuid if own is not None else ""
             for entry in session.scalars(
                 sa.select(db.TargetEntry).where(db.TargetEntry.node == node)
             ):
-                if entry.instance_uuid != instance_uuid and stop_term >= entry.term:
+                if (
+                    entry.instance_uuid != instance_uuid
+                    and stop_uuid not in ("", entry.instance_uuid)
+                    and stop_term >= entry.term
+                    and not entry.held
+                ):
                     session.delete(entry)
             session.add(
                 db.TargetEntry(node=node, instance_uuid=instance_uuid, term=term)
@@ -221,7 +240,11 @@ class GaleraLease:
             if lease.holder_uuid != instance_uuid or lease.term != term:
                 session.rollback()
                 return False
-            if lease.freeze_state not in ("",):
+            if lease.freeze_state == "requested":
+                # Not frozen yet: withdraw the request, and release.
+                lease.freeze_state = ""
+                lease.freeze_request_deadline = None
+            elif lease.freeze_state:
                 # A frozen leader never releases (see Freeze).
                 session.rollback()
                 return False
@@ -245,13 +268,15 @@ class GaleraLease:
             session.commit()
             return entries
 
-    def remove_target(self, term, node, instance_uuid, how):
+    def remove_target(self, leader_uuid, term, node, instance_uuid, how):
         """Remove a target entry, as the leader of term, recording how it
         left: "verified", if its node verified its stop after the entry was
-        added, or "unconfirmed" after the wait"""
+        added, or "unconfirmed" after the wait. A held entry, a frozen
+        leader's, leaves unconfirmed only with an operator's confirmation
+        for its term."""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.term != term:
+            if lease.term != term or lease.holder_uuid != leader_uuid:
                 session.rollback()
                 return False
             entry = session.get(db.TargetEntry, (node, instance_uuid))
@@ -267,6 +292,9 @@ class GaleraLease:
                 ):
                     session.rollback()
                     return False
+            elif entry.held and lease.confirmed_term != entry.term:
+                session.rollback()
+                return False
             session.delete(entry)
             session.commit()
             return True
@@ -299,7 +327,14 @@ class GaleraLease:
         lease term read in the same transaction"""
         with self._session() as session:
             lease = self._row(session, lock=True)
+            if lease.holder_uuid == instance_uuid and not lease.released:
+                # A holder can't vouch for its own stop.
+                session.rollback()
+                return None
             row = session.get(db.Node, node)
+            if row is None:
+                row = db.Node(name=node, instance_uuid=instance_uuid)
+                session.add(row)
             row.verified_stop_uuid = instance_uuid
             row.verified_stop_term = lease.term
             session.commit()
@@ -338,6 +373,8 @@ class GaleraLease:
             now = _utc_now(session)
             lease.freeze_state = "requested"
             lease.freeze_term = term
+            # No earlier confirmation may end this freeze.
+            lease.confirmed_term = 0
             lease.freeze_by = by
             lease.freeze_at = now
             lease.freeze_request_deadline = now + datetime.timedelta(
@@ -368,6 +405,11 @@ class GaleraLease:
                 return False
             lease.freeze_state = "frozen"
             lease.freeze_request_deadline = None
+            session.execute(
+                sa.update(db.TargetEntry)
+                .where(db.TargetEntry.instance_uuid == instance_uuid)
+                .values(held=True)
+            )
             session.commit()
             return True
 
@@ -400,6 +442,11 @@ class GaleraLease:
                 return False
             lease.freeze_state = ""
             lease.counter += 1
+            session.execute(
+                sa.update(db.TargetEntry)
+                .where(db.TargetEntry.instance_uuid == instance_uuid)
+                .values(held=False)
+            )
             session.commit()
             return True
 
@@ -407,20 +454,26 @@ class GaleraLease:
         """An operator confirms that the holder of term's OpenSM can't act"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.term != term:
+            if lease.term != term or lease.freeze_state in ("requested", "frozen"):
+                # Confirmations count for a manual takeover, or once a freeze
+                # is ending; never for a freeze still in force.
                 session.rollback()
                 return False
             lease.confirmed_term = term
             session.commit()
             return True
 
-    def adopt_frozen(self, node, instance_uuid):
+    def adopt_frozen(self, node, instance_uuid, frozen_term):
         """A restarted manager on the frozen node takes the frozen lease
         over: it replaces the old instance's entry with its own, and clears
         its node's verified-stop mark, as a takeover does"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.freeze_state != "frozen" or lease.holder_node != node:
+            if (
+                lease.freeze_state not in ("frozen", "ending")
+                or lease.holder_node != node
+                or lease.term != frozen_term
+            ):
                 session.rollback()
                 return None
             session.execute(
@@ -431,7 +484,9 @@ class GaleraLease:
             )
             lease.holder_uuid = instance_uuid
             session.add(
-                db.TargetEntry(node=node, instance_uuid=instance_uuid, term=lease.term)
+                db.TargetEntry(
+                    node=node, instance_uuid=instance_uuid, term=lease.term, held=True
+                )
             )
             own = session.get(db.Node, node)
             if own is not None:
