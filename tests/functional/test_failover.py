@@ -331,9 +331,14 @@ def apply_change(cluster, via, n, timeout=TAKEOVER + 60):
 
 def test_one_leader_and_jobs_through_any_instance(cluster):
     leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
     follower = next(i for i in NODES if i != leader)
     apply_change(cluster, follower, 1)
+    apply_change(cluster, leader, 2)
+    # Applying partitions, by SIGHUP through the watchdog, keeps the leader.
     assert cluster.leader() == leader
+    assert lease.read().term == term
 
 
 def test_a_killed_leader_is_replaced(cluster):

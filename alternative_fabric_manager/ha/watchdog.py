@@ -12,7 +12,9 @@
 
 """The watchdog: OpenSM's container's entrypoint (see specs/ha.md)
 
-It starts OpenSM only on a single-use start request, for the lease it has,
+It passes SIGHUP on to OpenSM, which is how the manager has it read its
+partitions file again. It starts OpenSM only on a single-use start request,
+for the lease it has,
 and kills OpenSM with SIGKILL when its lease lapses, when the manager asks
 it to stop, or when it gets SIGTERM; then it exits, and so does the
 container. It exits too if OpenSM exits.
@@ -158,6 +160,14 @@ class Watchdog:
             return None
         return request
 
+    def forward(self, signum):
+        """Pass a signal to OpenSM: the manager sends SIGHUP to the
+        container, whose first process is the watchdog, to have OpenSM read
+        its partitions file again"""
+        if self.process is not None and self.process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.process.pid, signum)
+
     def _kill(self, why):
         if self.process is not None and self.process.poll() is None:
             LOG.warning("Killing OpenSM: %s", why)
@@ -222,6 +232,8 @@ def main(argv=None):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     dog = Watchdog(args.state_dir, command or ["opensm"], args.die_with)
     signal.signal(signal.SIGTERM, lambda *_: setattr(dog, "stopping", True))
+    # Without this, SIGHUP would end the watchdog, and OpenSM with it.
+    signal.signal(signal.SIGHUP, lambda signum, _frame: dog.forward(signum))
     sys.exit(dog.run())
 
 

@@ -193,3 +193,48 @@ def test_the_kill_reaches_a_wrappers_children(tmp_path):
     except ProcessLookupError:
         alive = False
     assert not alive
+
+
+def test_sighup_reaches_opensm_and_doesnt_end_the_watchdog(tmp_path):
+    import signal
+    import subprocess
+    import sys
+
+    marker = tmp_path / "hups"
+    script = tmp_path / "opensm.py"
+    script.write_text(
+        "import signal, time\n"
+        f"path = {str(marker)!r}\n"
+        "signal.signal(signal.SIGHUP, lambda *_: open(path, 'a').write('hup\\n'))\n"
+        "while True:\n    time.sleep(0.1)\n"
+    )
+    _lease(tmp_path, seconds=30)
+    _start(tmp_path)
+    dog = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "alternative_fabric_manager.ha.watchdog",
+            "--state-dir",
+            str(tmp_path),
+            "--",
+            sys.executable,
+            str(script),
+        ]
+    )
+    try:
+        for _ in range(50):
+            if not (tmp_path / wd.START).exists():
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        dog.send_signal(signal.SIGHUP)
+        for _ in range(50):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        assert marker.read_text() == "hup\n"
+        assert dog.poll() is None
+    finally:
+        (tmp_path / wd.STOP).write_text("")
+        dog.wait(5)

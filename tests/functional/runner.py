@@ -202,10 +202,12 @@ class ProcessRunner:
 
     def reload(self):
         pids = self._own_sms()
-        if not pids:
+        if not pids or self.watchdog is None:
             raise ReloadError("OpenSM isn't running")
         before = self._sweeps() or 0
-        os.kill(pids[0], signal.SIGHUP)
+        # To the watchdog, as Docker signals a container's first process,
+        # which passes it on to OpenSM
+        os.kill(self.watchdog.pid, signal.SIGHUP)
         end = time.monotonic() + self.config.sweep_timeout
         while time.monotonic() < end:
             if (self._sweeps() or 0) > before:
