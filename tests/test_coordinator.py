@@ -67,6 +67,8 @@ class Manager:
         self.term = 0
         self.unanswered_checks = 0
         self.failed_applies = 0
+        self.missing_checks = 0
+        self.missing_checks = 0
         self.on_opensm_stopped = None
         self.starts = 0
 
@@ -311,13 +313,13 @@ def test_a_candidate_whose_link_is_down_never_takes_the_lease(lease, clock):
 
 
 def test_an_unanswered_fabric_moves_leadership_only_to_a_live_candidate(lease, clock):
-    a = make(lease, "a")
+    a = make(lease, "a", step_down_cooldown=0)
     lead(a)
     a.manager.unanswered_checks = 3
     # Nobody else: stay, rather than leave the fabric with no SM.
     a._lead()
     assert a.role == coordinator_mod.Role.LEADER
-    b = make(lease, "b")
+    b = make(lease, "b", step_down_cooldown=0)
     b._rejoin()
     b._tick()
     a._lead()
@@ -339,3 +341,41 @@ def test_a_deposed_leaders_sweep_doesnt_replace_the_successors(lease):
     with sessionmaker() as session:
         applied = session.get(db.Applied, 1)
         assert (applied.body, applied.term) == ("new", 2)
+
+
+def test_the_cooldown_keeps_a_new_leader_through_a_shared_fault(lease, clock):
+    a = make(lease, "a", step_down_cooldown=300)
+    lead(a)
+    b = make(lease, "b", step_down_cooldown=300)
+    b._rejoin()
+    b._tick()
+    a.manager.unanswered_checks = 3
+    a._lead()
+    assert a.role == coordinator_mod.Role.LEADER
+
+
+def test_a_missing_switch_moves_leadership_to_a_node_that_reaches_more(lease, clock):
+    a = make(lease, "a", step_down_cooldown=0)
+    lead(a)
+    a._reach_value = 0
+    a.manager.missing_checks = 3
+    b = make(lease, "b", step_down_cooldown=0)
+    b._rejoin()
+    b._tick()
+    a._lead()
+    assert a.role == coordinator_mod.Role.STARTING
+
+
+def test_a_new_leadership_counts_failures_afresh(tmp_path):
+    from alternative_fabric_manager import manager as manager_mod
+    from alternative_fabric_manager.drivers import NoOpenSM
+
+    config = config_mod.Config(
+        token="t", driver="none", database=":memory:", config_dir=str(tmp_path)
+    )
+    manager = manager_mod.Manager(config, db.make_sessionmaker(":memory:"), NoOpenSM())
+    manager.unanswered_checks = manager.failed_applies = manager.missing_checks = 3
+    manager.start()
+    manager.halt()
+    assert (manager.unanswered_checks, manager.failed_applies) == (0, 0)
+    assert manager.missing_checks == 0

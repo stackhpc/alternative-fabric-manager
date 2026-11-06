@@ -96,15 +96,6 @@ def main(argv=None):
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
-    if config.ha and not (
-        args.freeze or args.unfreeze or args.confirm_takeover is not None
-    ):
-        # Without the coordinator, each instance would run its own OpenSM.
-        sys.exit(
-            "alternative-fabric-manager: [ha] ha = true isn't supported by this "
-            "command yet: the HA service wiring isn't built"
-        )
-
     if args.freeze or args.unfreeze or args.confirm_takeover is not None:
         from alternative_fabric_manager.ha import lease as lease_mod
         from alternative_fabric_manager.ha import operator
@@ -160,6 +151,10 @@ def main(argv=None):
             print(port)
         return
 
+    if config.ha:
+        _serve_ha(config, args)
+        return
+
     manager = manager_mod.Manager(
         config,
         db.make_sessionmaker(config.database_url),
@@ -176,6 +171,46 @@ def main(argv=None):
         )
     finally:
         manager.stop()
+
+
+def _serve_ha(config, args):
+    """One instance of an HA cluster: the coordinator decides whether this
+    instance runs OpenSM (see specs/ha.md)"""
+    import threading
+
+    from alternative_fabric_manager.drivers import ha_docker
+    from alternative_fabric_manager.ha import coordinator as coordinator_mod
+    from alternative_fabric_manager.ha import lease as lease_mod
+
+    sessionmaker = db.make_sessionmaker(config.database_url, config.call_timeout)
+    holder = {}
+    driver = ha_docker.HAManagedDocker(
+        config, m_key=lambda: holder["manager"]._key("m_key")
+    )
+    manager = manager_mod.Manager(config, sessionmaker, driver)
+    holder["manager"] = manager
+    coordinator = coordinator_mod.Coordinator(
+        config, lease_mod.GaleraLease(sessionmaker), driver, manager
+    )
+    app = api.create_app(config, manager, coordinator)
+
+    class Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # Step down before uvicorn stops: it raises the signal again once
+            # it has, which ends the process.
+            coordinator.shutdown()
+            super().handle_exit(sig, frame)
+
+    server = Server(
+        uvicorn.Config(
+            app,
+            host=config.host,
+            port=config.port,
+            log_level="debug" if args.debug else "info",
+        )
+    )
+    threading.Thread(target=coordinator.start, name="coordinator", daemon=True).start()
+    server.run()
 
 
 if __name__ == "__main__":

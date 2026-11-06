@@ -143,8 +143,13 @@ class Config:
     manual_takeover: bool = False
     # How long a step-down at SIGTERM may take
     shutdown_timeout: float = 20.0
+    # How long after leadership moves its discretionary triggers wait, so
+    # that a fault every node shares can't bounce it between them
+    step_down_cooldown: float = 300.0
     # The tmpfs that the manager and OpenSM's watchdog share
     ha_state_dir: str = "/run/alternative-fabric-manager"
+    # The host's /proc, mounted read-only, to verify no OpenSM runs
+    host_proc: str = "/host/proc"
     # The rule for the default partition. All flat networks share it. Keep
     # ALL=full while ports on flat networks must reach each other; otherwise
     # give ports limited membership.
@@ -311,6 +316,7 @@ def ha_settings(config):
                 "fence_ask",
                 "manual_takeover",
                 "job_timeout",
+                "step_down_cooldown",
             )
         },
         sort_keys=True,
@@ -354,8 +360,8 @@ def _ha_problems(config):
         )
     if config.watchdog_timeout <= config.ha_period + config.call_timeout:
         problems.append("watchdog_timeout must exceed ha_period + call_timeout")
-    if config.driver == "none":
-        problems.append("[opensm] driver must start OpenSM")
+    if config.driver != "managed":
+        problems.append("[opensm] driver must be managed: the manager starts OpenSM")
     # Without them, a tenant's SM could set ports or win a handover, and Ask
     # has no key (see Fencing, Required keys).
     missing = {"m_key", "sm_key"} - config.hardening_groups
@@ -410,7 +416,9 @@ OPTIONS = (
             "fence_ask",
             "manual_takeover",
             "shutdown_timeout",
+            "step_down_cooldown",
             "ha_state_dir",
+            "host_proc",
         ),
     ),
 )

@@ -127,6 +127,8 @@ class Manager:
         # three of either (see Stepping down)
         self.unanswered_checks = 0
         self.failed_applies = 0
+        # Consecutive checks that found expected switches missing
+        self.missing_checks = 0
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
         self._contested_fabric = False
@@ -548,6 +550,10 @@ class Manager:
     def start(self):
         """Write the current state, start OpenSM, then keep it in sync"""
         self._stop.clear()
+        # Counted afresh for each OpenSM this manager starts
+        self.unanswered_checks = 0
+        self.failed_applies = 0
+        self.missing_checks = 0
         # A new leader inherits a contested check: its first sweep then
         # doesn't count until a check passes (see Job completion).
         with self._lock, self.sessionmaker() as session:
@@ -1106,6 +1112,7 @@ class Manager:
                 else "The SA has no record of OpenSM's own subnet manager"
             )
         missing = expected - fabric.switches
+        self.missing_checks = self.missing_checks + 1 if missing else 0
         if not expected:
             return False, "No expected switches: confirm them with --confirm-switches"
         if missing:

@@ -44,6 +44,8 @@ class LeaseState:
     freeze_term: int
     freeze_request_deadline_passed: bool
     confirmed_term: int
+    # Seconds since leadership last moved, by the database's clock
+    moved_age: float = 0.0
 
 
 def _utc_now(session):
@@ -51,6 +53,14 @@ def _utc_now(session):
     if session.get_bind().dialect.name == "sqlite":
         return datetime.datetime.now(datetime.timezone.utc)
     return session.scalar(sa.text("SELECT UTC_TIMESTAMP(6)"))
+
+
+def _age(when, now):
+    if when is None or now is None:
+        return float("inf")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return (now - when).total_seconds()
 
 
 def _check_primary(session):
@@ -126,6 +136,7 @@ class GaleraLease:
                 freeze_term=lease.freeze_term,
                 freeze_request_deadline_passed=deadline is not None and now > deadline,
                 confirmed_term=lease.confirmed_term,
+                moved_age=_age(lease.moved_at, now),
             )
             session.commit()
             return state

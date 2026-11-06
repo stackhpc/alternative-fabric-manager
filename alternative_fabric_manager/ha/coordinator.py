@@ -93,11 +93,19 @@ class Coordinator:
         # candidates from dead rows
         self._heartbeats = {}
         self._expired_since = None
+        # This node's reach, refreshed on a thread of its own, since a scan
+        # of a large fabric mustn't hold up renewals
+        self._reach_value = None
+        self._moved_age = 0.0
         manager.on_opensm_stopped = self._opensm_stopped
 
     # Lifecycle
 
     def start(self):
+        if getattr(self.runner, "reach", None) is not None:
+            threading.Thread(
+                target=self._refresh_reach, name="reach", daemon=True
+            ).start()
         self._rejoin()
         self._thread = threading.Thread(target=self._run, name="lease", daemon=True)
         self._thread.start()
@@ -190,17 +198,27 @@ class Coordinator:
         elif self.role == Role.CANDIDATE:
             self._watch()
 
-    def _reach(self):
-        """Expected switches this node reaches; 0 if its own port is down"""
+    def _probe_reach(self):
         reach = getattr(self.runner, "reach", None)
         if reach is None:
             return 1
         try:
-            value = reach()
+            return reach() or 0
         except Exception as e:  # noqa: BLE001
             LOG.warning("Can't tell what this node reaches: %s", e)
             return 0
-        return value or 0
+
+    def _refresh_reach(self):
+        while not self._stop.is_set():
+            self._reach_value = self._probe_reach()
+            self._stop.wait(max(self.config.ha_period * 4, 2.0))
+
+    def _reach(self):
+        """Expected switches this node reaches; 0 if its own port is down"""
+        if self._reach_value is None:
+            # Not refreshed yet, or no thread, as in tests
+            return self._probe_reach()
+        return self._reach_value
 
     def _live_others(self):
         """Other nodes whose heartbeat moved within T, not stopped, and not
@@ -281,18 +299,10 @@ class Coordinator:
             self._opensm_gone = False
             self._step_down("OpenSM stopped")
             return
-        if not self.held and (
-            self.manager.unanswered_checks >= 3 or self.manager.failed_applies >= 3
-        ):
-            # A paused or wedged OpenSM under a healthy manager; only worth
-            # moving if another node could do better.
-            try:
-                others = self._live_others()
-            except Exception:  # noqa: BLE001
-                others = []
-            if others:
-                self._step_down("OpenSM doesn't answer, or can't be applied to")
-                return
+        why = self._discretionary_trigger()
+        if why:
+            self._step_down(why)
+            return
         if self._renewals_stopped:
             return
         try:
@@ -314,6 +324,28 @@ class Coordinator:
         if self._opensm_gone and self.held:
             self._restart_frozen()
         self._freeze_step()
+
+    def _discretionary_trigger(self):
+        """Why an established leader should hand over, if a live candidate
+        could do better and the cooldown has passed (see Stepping down)"""
+        if self.held or self.role != Role.LEADER:
+            return None
+        manager = self.manager
+        stalled = manager.unanswered_checks >= 3 or manager.failed_applies >= 3
+        missing = getattr(manager, "missing_checks", 0) >= 3
+        if not (stalled or missing):
+            return None
+        if self._moved_age < self.config.step_down_cooldown:
+            return None
+        try:
+            others = self._live_others()
+        except Exception:  # noqa: BLE001
+            return None
+        if stalled and others:
+            return "OpenSM doesn't answer, or can't be applied to"
+        if missing and any(reach > self._reach() for _name, reach in others):
+            return "expected switches are missing, and another node reaches more"
+        return None
 
     def _restart_frozen(self):
         """Start OpenSM again as the frozen node, only once a read from a
@@ -357,6 +389,7 @@ class Coordinator:
             LOG.warning("Can't read the lease: %s", e)
             return
         self.frozen = state.freeze_state in ("frozen", "ending")
+        self._moved_age = state.moved_age
         ours = state.holder_uuid == self.uuid and state.term == self.term
         if not ours:
             return
