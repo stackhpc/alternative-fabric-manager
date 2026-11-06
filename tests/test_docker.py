@@ -1,3 +1,5 @@
+import types
+
 import pytest
 
 from alternative_fabric_manager.drivers import UNATTRIBUTED, ReloadError, SweepReport
@@ -286,3 +288,58 @@ def test_pkey_errors_are_not_partitions_errors():
     for line in (PKEY_BY_DESCRIPTION, PKEY_BY_PORT, ENFORCEMENT):
         assert not docker_driver._is_partitions_error(line.replace("osm_vm", "prtn"))
     assert docker_driver._is_partitions_error("osm_prtn_make_new: ERR 0A01: x")
+
+
+IBSWITCHES = (
+    'Switch\t: 0xec0d9a0300b12560 ports 41 "SwitchIB Mellanox Technologies" '
+    "base port 0 lid 2 lmc 0\n"
+)
+SMIR = """SMInfoRecord dump:
+\t\tRID
+\t\tLID.....................1
+\t\tSMInfo dump:
+\t\tGUID....................0x040973ffffc75168
+\t\tSM_Key..................0x0000000000000000
+\t\tActCount................1234
+\t\tPriority................15
+\t\tSMState.................3
+SMInfoRecord dump:
+\t\tRID
+\t\tLID.....................9
+\t\tSMInfo dump:
+\t\tGUID....................0x0002c90300001235
+\t\tSM_Key..................0x0000000000000000
+\t\tActCount................5
+\t\tPriority................0
+\t\tSMState.................2
+"""
+IBSTAT_P = (
+    "0x040973ffffc75168\n0xffffffffffffffff\n0xffffffffffffffff\n0x0000000000000000\n"
+)
+
+
+class FakeExecContainer:
+    status = "running"
+
+    def __init__(self):
+        self.commands = []
+
+    def exec_run(self, command):
+        self.commands.append(command)
+        outputs = {"ibswitches": IBSWITCHES, "saquery": SMIR, "ibstat": IBSTAT_P}
+        return 0, outputs[command[0]].encode()
+
+
+def test_fabric_parses_the_tools_output():
+    container = FakeExecContainer()
+    client = types.SimpleNamespace(
+        containers=types.SimpleNamespace(get=lambda name: container)
+    )
+    driver = docker_driver.DockerReloader("opensm", 30, client=client)
+    fabric = driver.fabric(m_key="0x11", sa_key="0x22")
+    assert fabric.switches == {0xEC0D9A0300B12560}
+    assert fabric.sms == [(0x040973FFFFC75168, 3), (0x0002C90300001235, 2)]
+    # Placeholder GUIDs of unassigned virtual functions aren't ours.
+    assert fabric.own_guids == {0x040973FFFFC75168}
+    assert ["ibswitches", "-y", "0x11"] in container.commands
+    assert ["saquery", "--smkey", "0x22", "SMIR"] in container.commands

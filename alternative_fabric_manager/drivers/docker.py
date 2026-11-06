@@ -185,6 +185,8 @@ class DockerReloader:
         # OpenSM binds to one of the host's ports, not necessarily the
         # first: an SM on any of them is this one.
         own = {int(g, 16) for g in re.findall(r"0x([0-9a-fA-F]+)", ports)}
+        # Unassigned virtual functions report placeholder GUIDs.
+        own -= {0, 0xFFFFFFFFFFFFFFFF}
         return Fabric(switch_guids, sms, own)
 
     @staticmethod

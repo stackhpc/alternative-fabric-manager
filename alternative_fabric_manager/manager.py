@@ -387,6 +387,9 @@ class Manager:
                     session.scalars(sa.select(db.Deferred).order_by(db.Deferred.job_id))
                 )
                 for row in rows:
+                    if sa.inspect(row).deleted or sa.inspect(row).detached:
+                        # Dropped with its network earlier in this pass
+                        continue
                     if self._retry(session, row):
                         progress = True
             session.commit()
@@ -398,7 +401,9 @@ class Manager:
             self._time_out(job)
         if job is None or job.status not in OPEN:
             session.delete(row)
-            if row.kind == "network":
+            # Its ports wait for it only if the network doesn't exist: an
+            # existing network's ports aren't held up by its update.
+            if row.kind == "network" and session.get(db.Network, row.object_id) is None:
                 for other in list(session.scalars(sa.select(db.Deferred))):
                     if (
                         other.kind == "port"
@@ -703,6 +708,8 @@ class Manager:
                     db.Job.operation.in_(operations),
                     db.Job.status.in_(OPEN),
                     db.Job.generation <= generation,
+                    # A waiting request wasn't rendered.
+                    db.Job.id.not_in(sa.select(db.Deferred.job_id)),
                 )
                 .values(
                     status=db.JobStatus.FAILED,
@@ -926,6 +933,7 @@ class Manager:
                     db.Job.generation > applied_generation,
                     db.Job.generation <= generation,
                     db.Job.status.in_(OPEN),
+                    db.Job.id.not_in(sa.select(db.Deferred.job_id)),
                 )
                 .values(status=db.JobStatus.FAILED, error=reason, finished_at=_now())
             )

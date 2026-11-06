@@ -622,3 +622,41 @@ def test_jobs_wait_while_opensm_isnt_master(manager, fabric):
     assert _status(manager, job) == db.JobStatus.PENDING
     with manager.sessionmaker() as session:
         assert "isn't master" in session.get(db.Applied, 1).check_detail
+
+
+def test_an_existing_networks_ended_wait_doesnt_fail_its_ports(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.put_network(OTHER, conftest.network(OTHER, 200))
+    holder = "20:12:34:56:00:00:00:00:02"
+    manager.put_port(OTHER_PORT, conftest.port(OTHER_PORT, OTHER, client_id=holder))
+    manager.reconcile()
+    # The network's VLAN change waits on another network's pkey, and a port
+    # on it waits on a GUID.
+    update = manager.put_network(NETWORK_ID, conftest.network(NETWORK_ID, 200))
+    port = manager.put_port(PORT_ID, conftest.port(client_id=holder))
+    with manager.sessionmaker() as session:
+        session.get(db.Job, update).deadline = datetime.datetime(
+            2000, 1, 1, tzinfo=datetime.timezone.utc
+        )
+        session.commit()
+    manager.reconcile()
+    assert _status(manager, update) == db.JobStatus.FAILED
+    assert _status(manager, port) == db.JobStatus.PENDING
+    manager.delete_port(OTHER_PORT)
+    manager.reconcile()
+    assert _status(manager, port) == db.JobStatus.COMPLETED
+
+
+def test_a_waiting_request_isnt_failed_by_a_render_it_wasnt_in(manager, fabric):
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.put_network(OTHER, conftest.network(OTHER, 200))
+    manager.reconcile()
+    waiting = manager.put_network(OTHER, conftest.network(OTHER, 100))
+
+    def reload():
+        # The default partition's line, which no object changed
+        raise PartitionsRejected("PARSE ERROR", line=3)
+
+    fabric.reload = reload
+    manager.reconcile()
+    assert _status(manager, waiting) == db.JobStatus.PENDING
