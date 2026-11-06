@@ -143,6 +143,10 @@ class Config:
     manual_takeover: bool = False
     # How long a step-down at SIGTERM may take
     shutdown_timeout: float = 20.0
+    # The manager's container's stop timeout, which the deployment sets: 30 s
+    # with docker run --stop-timeout, Docker's default of 10 s otherwise, as
+    # with Kayobe's controller_containers
+    container_stop_timeout: float = 30.0
     # How long after leadership moves its discretionary triggers wait, so
     # that a fault every node shares can't bounce it between them
     step_down_cooldown: float = 300.0
@@ -297,10 +301,6 @@ class Config:
                 raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
 
 
-# The containers' stop timeout, set when they are created (see specs/ha.md)
-CONTAINER_STOP_TIMEOUT = 30
-
-
 def ha_settings(config):
     """The settings every instance of a cluster must share, as stored"""
     import json
@@ -355,10 +355,10 @@ def _ha_problems(config):
             "longest, so that no job times out during one; HA deployments use "
             "300 s, with Nova's vif_plugging_timeout at 420 s"
         )
-    if config.shutdown_timeout >= CONTAINER_STOP_TIMEOUT:
+    if config.shutdown_timeout >= config.container_stop_timeout:
         problems.append(
-            f"shutdown_timeout must be less than the container's stop "
-            f"timeout, {CONTAINER_STOP_TIMEOUT} s"
+            "shutdown_timeout must be less than container_stop_timeout, the "
+            "manager's container's stop timeout"
         )
     if config.watchdog_timeout <= config.ha_period + config.call_timeout:
         problems.append("watchdog_timeout must exceed ha_period + call_timeout")
@@ -423,6 +423,7 @@ OPTIONS = (
             "fence_ask",
             "manual_takeover",
             "shutdown_timeout",
+            "container_stop_timeout",
             "step_down_cooldown",
             "ha_state_dir",
             "host_proc",
