@@ -144,7 +144,7 @@ def test_an_ending_freeze_needs_a_confirmation_or_a_verified_stop(lease):
     lease.request_unfreeze()
     state = lease.read()
     assert lease.acquire("b", "ub", state.term, state.counter, False) is None
-    assert lease.confirm(term)
+    assert lease.confirm(term, "ua")
     assert lease.acquire("b", "ub", state.term, state.counter, False) == term + 1
 
 
@@ -192,17 +192,20 @@ def test_an_ending_freeze_needs_the_frozen_nodes_stop_not_the_candidates(lease):
     assert lease.targets() == [("b", "ub", term + 1)]
 
 
-def test_a_held_entry_doesnt_leave_unconfirmed(lease):
+def test_a_confirmed_takeover_ending_a_freeze_removes_the_held_entry(lease):
     term = _frozen(lease)
     lease.request_unfreeze()
-    assert lease.confirm(term)
+    assert lease.confirm(term, "ua")
     state = lease.read()
     new = lease.acquire("b", "ub", state.term, state.counter, False)
-    # Confirmed for the frozen term, so the held entry may leave.
-    assert lease.remove_target("ub", new, "a", "ua", "unconfirmed")
+    assert new == term + 1
+    # The frozen holder's held entry leaves in the takeover itself, and the
+    # confirmation is used up.
+    assert lease.targets() == [("b", "ub", new)]
+    assert lease.read().confirmed_term == 0
 
 
-def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
+def test_a_verified_takeover_ending_a_freeze_removes_the_held_entry(lease):
     term = _frozen(lease)
     lease.register("a", "ua2", "hash", [])
     lease.record_verified_stop("a", "ua2")
@@ -210,17 +213,28 @@ def test_a_held_entry_needs_a_confirmation_for_its_term(lease):
     state = lease.read()
     new = lease.acquire("b", "ub", state.term, state.counter, False)
     assert new == term + 1
-    # Left as verified in the takeover itself
-    assert ("a", "ua", term) not in lease.targets()
+    assert lease.targets() == [("b", "ub", new)]
 
 
-def test_an_earlier_confirmation_doesnt_end_a_later_freeze(lease):
+def test_a_held_entry_never_leaves_unconfirmed(lease):
+    term = _frozen(lease)
+    # Defensively: if a held entry were left in the set, it would leave only
+    # as verified, or with a confirmation for its term.
+    with lease.sessionmaker() as session:
+        session.get(db.Lease, 1).freeze_state = ""
+        session.commit()
+    b = lease.acquire("b", "ub", term, lease.read().counter, False)
+    assert not lease.remove_target("ub", b, "a", "ua", "unconfirmed")
+
+
+def test_confirmations_count_only_while_a_freeze_ends(lease):
     term = _take(lease, "a", "ua")
-    assert lease.confirm(term)
+    # No confirmation outside a freeze that is ending
+    assert not lease.confirm(term, "ua")
     lease.request_freeze(term, "operator", 30)
     lease.acknowledge_freeze("ua", term)
     # No confirmation while frozen
-    assert not lease.confirm(term)
+    assert not lease.confirm(term, "ua")
     lease.request_unfreeze()
     state = lease.read()
     assert lease.acquire("b", "ub", state.term, state.counter, False) is None
@@ -250,7 +264,7 @@ def test_adoption_voids_a_confirmation_and_a_stale_view(lease):
     lease.request_unfreeze()
     # The frozen node is down; an operator confirms; then it comes back.
     stale = lease.read()
-    assert lease.confirm(term)
+    assert lease.confirm(term, "ua")
     lease.register("a", "ua2", "hash", [])
     assert lease.adopt_frozen("a", "ua2", term) == term
     # A candidate on the view from before the adoption loses.
@@ -259,7 +273,80 @@ def test_adoption_voids_a_confirmation_and_a_stale_view(lease):
     assert lease.acquire("b", "ub", fresh.term, fresh.counter, False) is None
 
 
+def test_a_confirmation_from_before_an_adoption_is_refused(lease):
+    from alternative_fabric_manager.ha import operator
+
+    term = _frozen(lease)
+    lease.request_unfreeze()
+    # The operator reads the frozen holder, ua; its manager restarts and
+    # adopts the frozen lease, keeping the term, before the confirmation.
+    stale = lease.read()
+    lease.register("a", "ua2", "hash", [])
+    assert lease.adopt_frozen("a", "ua2", term) == term
+    assert not lease.confirm(stale.term, stale.holder_uuid)
+    fresh = lease.read()
+    assert lease.acquire("b", "ub", fresh.term, fresh.counter, False) is None
+    # Confirming again names the new instance.
+    with pytest.raises(operator.OperatorError):
+        lease_read = lease.read
+        lease.read = lambda: stale
+        try:
+            operator.force_unfreeze(lease)
+        finally:
+            lease.read = lease_read
+    assert operator.force_unfreeze(lease) == ("a", term)
+
+
 def test_every_instance_agrees_on_the_settings(lease):
     assert lease.agree_settings('{"t": 30}')
     assert lease.agree_settings('{"t": 30}')
     assert not lease.agree_settings('{"t": 10}')
+
+
+def test_settings_a_newer_version_removed_dont_block_it(lease):
+    assert lease.agree_settings('{"t": 30, "removed": false}')
+    assert lease.agree_settings('{"t": 30}')
+    assert not lease.agree_settings('{"t": 10}')
+
+
+def test_a_setting_a_newer_version_adds_is_stored_and_enforced(lease):
+    assert lease.agree_settings('{"t": 30}')
+    # The first instance with the new setting stores it...
+    assert lease.agree_settings('{"t": 30, "added": 5}')
+    # ...and others must agree on it, while older ones still agree.
+    assert not lease.agree_settings('{"t": 30, "added": 6}')
+    assert lease.agree_settings('{"t": 30}')
+
+
+def test_force_unfreeze_confirms_the_ending_freeze_without_a_term(lease):
+    from alternative_fabric_manager.ha import operator
+
+    term = _take(lease, "a", "ua")
+    # Not while running, nor while frozen
+    with pytest.raises(operator.OperatorError):
+        operator.force_unfreeze(lease)
+    lease.request_freeze(term, "operator", 30)
+    lease.acknowledge_freeze("ua", term)
+    with pytest.raises(operator.OperatorError):
+        operator.force_unfreeze(lease)
+    lease.request_unfreeze()
+    assert operator.force_unfreeze(lease) == ("a", term)
+    state = lease.read()
+    assert lease.acquire("b", "ub", state.term, state.counter, False) == term + 1
+
+
+def test_status_names_the_manager_to_check_while_an_unfreeze_is_pending(lease):
+    from alternative_fabric_manager.ha import operator
+
+    term = _take(lease, "a", "ua")
+    assert not any("pending" in line for line in operator.status(lease.read()))
+    lease.request_freeze(term, "operator", 30)
+    lease.acknowledge_freeze("ua", term)
+    lease.request_unfreeze()
+    lines = operator.status(lease.read())
+    assert "holder: a (instance ua)" in lines
+    assert any(line.startswith("unfreeze pending: a's manager") for line in lines)
+    assert any(line.startswith("Check a:") for line in lines)
+    operator.force_unfreeze(lease)
+    lines = operator.status(lease.read())
+    assert any("forced" in line for line in lines)

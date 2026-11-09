@@ -558,8 +558,7 @@ class Coordinator:
         others = [entry for entry in self.lease.targets() if entry[1] != self.uuid]
         if not others:
             return False
-        confirmed = None
-        for node, instance, entry_term in others:
+        for node, instance, _entry_term in others:
             if self.lease.remove_target(self.uuid, term, node, instance, "verified"):
                 LOG.info("%s's OpenSM is verified stopped", node)
                 continue
@@ -568,12 +567,6 @@ class Coordinator:
                 self._ask(node)
             if _now() - taken_at < self.config.watchdog_timeout:
                 continue
-            if self.config.manual_takeover:
-                # Only an operator's confirmation for that entry's own term
-                if confirmed is None:
-                    confirmed = self.lease.read().confirmed_term
-                if confirmed != entry_term:
-                    continue
             if self.lease.remove_target(self.uuid, term, node, instance, "unconfirmed"):
                 LOG.warning("%s leaves the target set unconfirmed", node)
         return True

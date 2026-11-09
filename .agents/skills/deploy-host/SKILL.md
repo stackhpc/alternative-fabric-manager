@@ -1,88 +1,127 @@
 ---
 name: deploy-host
-description: Rebuild and redeploy AFM on the infiniband-testing host, which runs it in HA mode, safely - back up the database that holds the fabric's keys, rebuild the image, recreate the container with its HA mounts, and verify the lease, OpenSM under the watchdog, and the fabric check. Use when asked to deploy, redeploy or try a branch on the host.
+description: Deploy or redeploy AFM on a DevStack host set up as networking-mlnx's DevStack guide describes, with networking-mlnx's SDN driver pointing at it, in single-node or HA mode - back up the database that holds the fabric's keys, build the image, recreate the container, and verify OpenSM, the fabric check and, in HA mode, the lease. Use when asked to deploy, redeploy or try a branch of AFM on a DevStack host.
 ---
 
-# Redeploy AFM on infiniband-testing
+# Deploy AFM on a DevStack host
 
-AFM there manages the OpenSM of a **shared** fabric, in HA mode (approved
-2026-11-06: M_Key and SM_Key protection), as a single instance:
+The host runs DevStack as networking-mlnx's DevStack guide describes
+(`devstack/README.rst` in networking-mlnx: OVN with the `mlnx_infiniband`
+mechanism driver and the `neutron_ml2_mlnx` plugin), on a host with a port
+on the InfiniBand fabric. AFM runs beside it in a container, and replaces
+UFM as networking-mlnx's SDN controller: the guide's "SDN mechanism
+driver" section, with `[sdn] url` pointing at AFM.
 
-- container `alternative-fabric-manager`, image `alternative-fabric-manager:ha`;
-- its database in the `afm-mariadb` container (MariaDB 10.11, port 3398,
-  volume `afm_mariadb`); passwords in /etc/alternative-fabric-manager/
-  mariadb-root.pw and mariadb-afm.pw (root-only, never print them);
-- config /etc/alternative-fabric-manager/afm.conf (mode 600), with
-  `[database] connection`, `[ha] ha = true`, and
-  `hardening = m_key, sm_key, enforcement`;
-- the watchdog's tmpfs /run/alternative-fabric-manager.
+Find out before changing anything:
 
-The database holds the fabric's keys. Never drop or recreate it, and never
-print the keys.
+- **Who else uses the fabric.** If others share it, agree the hardening
+  first (`[opensm] hardening`; see `docs/opensm-hardening.md`): M_Key
+  protection locks out SMP tools without the key, and SM_Key protection,
+  which HA mode needs, keeps other subnet managers from taking over.
+- **The mode**: single-node (`[database] database`, an SQLite file in the
+  `afm_data` volume) or HA (`[ha] ha = true`, with `[database] connection`
+  to MariaDB or Galera).
+- **Where the configuration is**, usually
+  `/etc/alternative-fabric-manager/afm.conf`, mode 600.
 
-## Rollback, kept ready
+AFM's database holds the fabric's OpenSM keys. Never drop or recreate it,
+and never print the keys or the database's passwords.
 
-- `alternative-fabric-manager-single`: the stopped single-node container,
-  with the SQLite database in the `afm_data` volume, unchanged since the
-  switch to HA;
-- `$CLAUDE_JOB_DIR/tmp/afm_data.backup/afm.conf.pre-ha`: its config.
+## Wire networking-mlnx to AFM
 
-To roll back: stop and rename the HA container, rename the single one back
-to `alternative-fabric-manager`, restore afm.conf.pre-ha, and start it.
+In DevStack's `local.conf`, as the networking-mlnx guide's SDN section
+shows, with `mlnx_infiniband` as well, since its ports are InfiniBand:
 
-## Steps
+```ini
+[[local|localrc]]
+enable_plugin neutron_ml2_mlnx https://opendev.org/x/networking-mlnx
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn,mlnx_infiniband,mlnx_sdn_assist
 
-1. **Back up the database**:
+[[post-config|/$Q_PLUGIN_CONF_FILE]]
+[sdn]
+sync_enabled = True
+url = http://127.0.0.1:8090/ufmRestV3
+domain = cloudx
+token = <AFM's [api] token>
+physical_networks = <the InfiniBand physical networks>
+bind_normal_ports = False
+```
+
+On a running DevStack, set the same in `/etc/neutron/plugins/ml2/ml2_conf.ini`
+and restart `devstack@neutron-api` (and its RPC and periodic workers).
+Changing a shared DevStack's configuration needs its owner's agreement.
+
+## Deploy or redeploy
+
+1. **Back up the database.** Single-node:
+   `sudo cp -a /var/lib/docker/volumes/afm_data/_data/afm.sqlite <backup>`.
+   HA: `mariadb-dump` of AFM's database, with its own credentials.
+2. **Build**, with `--network host` if the host's Docker has no bridge:
    ```sh
-   APW=$(sudo cat /etc/alternative-fabric-manager/mariadb-afm.pw)
-   sudo docker exec afm-mariadb mariadb-dump -uafm -p"$APW" -h127.0.0.1 -P3398 afm \
-     | sudo tee "$CLAUDE_JOB_DIR/tmp/afm_data.backup/afm.sql.$(date +%s)" >/dev/null
+   sudo docker build -q --network host -t alternative-fabric-manager:<tag> .
    ```
-2. **Build**; the host's Docker has no bridge network:
-   ```sh
-   cd /opt/stack/alternative-fabric-manager
-   sudo docker build -q --network host -t alternative-fabric-manager:ha .
-   ```
-3. **Upgrade the schema**, if the branch adds an Alembic revision:
+3. **HA only: create or upgrade the schema**, on a new database, or if
+   the branch adds an Alembic revision:
    ```sh
    sudo docker run --rm --network host \
      -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
-     alternative-fabric-manager:ha --config-file /etc/alternative-fabric-manager/afm.conf --db-upgrade
+     alternative-fabric-manager:<tag> \
+     --config-file /etc/alternative-fabric-manager/afm.conf --db-upgrade
    ```
-4. **Recreate the container.** Stopping it steps the leader down and
-   releases the lease; OpenSM's container dies with it. `--init` reaps the
-   OpenSM processes the shared PID namespace reparents to the manager:
+   An SQLite database upgrades itself.
+4. **Recreate the container.** Stopping it stops OpenSM too, so the fabric
+   has no subnet manager until the new one starts; in HA mode the instance
+   steps down and releases the lease first. Name the container as
+   `[opensm] manager_container` says:
    ```sh
-   sudo docker stop -t 30 alternative-fabric-manager && sudo docker rm alternative-fabric-manager
-   sudo docker run -d --init --name alternative-fabric-manager --restart unless-stopped \
-     --stop-timeout 30 --network host \
+   sudo docker stop -t 30 alternative-fabric-manager
+   sudo docker rm alternative-fabric-manager
+   sudo docker run -d --init --name alternative-fabric-manager \
+     --restart unless-stopped --stop-timeout 30 --network host \
      -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
      -v /etc/opensm:/etc/opensm -v /var/run/docker.sock:/var/run/docker.sock \
      -v afm_data:/var/lib/alternative-fabric-manager \
-     -v /run/alternative-fabric-manager:/run/alternative-fabric-manager \
-     -v /proc:/host/proc:ro \
-     alternative-fabric-manager:ha --config-file /etc/alternative-fabric-manager/afm.conf
+     alternative-fabric-manager:<tag> \
+     --config-file /etc/alternative-fabric-manager/afm.conf
    ```
-5. **Verify**, within a minute:
-   - the log shows "Took the lease", "SUBNET UP" and "Leading, term N":
-     `sudo docker logs alternative-fabric-manager 2>&1 | grep -E "lease|SUBNET UP|Leading|ERROR" | grep -vi "key 0x"`;
-   - the watchdog is OpenSM's parent: `sudo docker top opensm -o pid,args`;
-   - the lease's counter moves, and the applied row's check passes in the
-     current term:
-     ```sh
-     q() { sudo docker exec afm-mariadb mariadb -uafm -p"$APW" -h127.0.0.1 -P3398 afm -N -e "$1"; }
-     q "select holder_node, term, counter, released from lease"
-     q "select term, check_ok, check_detail, contested, pkey_errors from applied"
-     ```
-   If no leader appears, the node row's `reach` tells whether the node sees
-   its own port up; a `stop` file in /run/alternative-fabric-manager with
-   an `[opensm] <defunct>` process means a stop that wasn't verified. Roll
-   back while you diagnose: the fabric has no SM meanwhile.
-6. Then run the SDN tempest suite (the `tempest-sdn` skill).
+   HA mode also needs the watchdog's tmpfs and the host's processes:
+   `-v /run/alternative-fabric-manager:/run/alternative-fabric-manager`
+   and `-v /proc:/host/proc:ro`.
+5. **On a new database, record the fabric's switches**, or no job ever
+   completes ("No expected switches"):
+   ```sh
+   sudo docker exec alternative-fabric-manager alternative-fabric-manager \
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
+   ```
+
+## Verify
+
+Within a minute:
+
+- **OpenSM started**: the log shows "SUBNET UP", and, in HA mode, "Took the
+  lease" and "Leading, term N":
+  `sudo docker logs alternative-fabric-manager 2>&1 | grep -E "lease|SUBNET UP|Leading|ERROR" | grep -vi "key 0x"`.
+- **The fabric check passes**: the `applied` row's `check_detail` is "The
+  fabric is complete", with no `pkey_errors` or `enforcement_errors`, read
+  with `sqlite3` on the SQLite file, or `mariadb` in HA mode.
+- **HA mode**: the watchdog is OpenSM's parent
+  (`sudo docker top opensm -o pid,args`), and the `lease` row's counter
+  moves.
+
+If no HA leader appears, the `nodes` row's `reach` tells whether the node
+sees its own port up. If OpenSM doesn't start, read the `opensm`
+container's log. Roll back while you diagnose: the fabric has no subnet
+manager meanwhile.
+
+Then run networking-mlnx's tempest plugin against it (the `tempest-sdn`
+skill).
 
 ## Never
 
-- print the keys (`--show-keys` output, opensm.conf), or the database
+- print the keys (`--show-keys` output, `opensm.conf`) or the database
   passwords;
-- run SMP tools without `-y $KEY`, or any SMP Set, on this fabric;
-- connect to eswitchd on tcp://127.0.0.1:60001.
+- run SMP tools on a protected fabric without `-y $KEY`, where `KEY` comes
+  from `--show-keys` into a variable, never to the screen;
+- send SMP Sets, or disable switch ports, on a fabric others share;
+- connect to eswitchd's socket (tcp://127.0.0.1:60001) by hand: it exits on
+  messages it can't decode.

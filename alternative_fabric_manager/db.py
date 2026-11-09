@@ -204,7 +204,7 @@ class Lease(Base):
         Timestamp, nullable=True
     )
     # An operator's confirmation that the holder's OpenSM can't act, for a
-    # manual takeover, or one while a freeze is ending: the term it's for
+    # takeover that ends a freeze the leader never acknowledged: the term
     confirmed_term: orm.Mapped[int] = orm.mapped_column(default=0)
 
 

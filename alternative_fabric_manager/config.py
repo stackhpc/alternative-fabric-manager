@@ -12,8 +12,10 @@
 
 """Configuration, read from an INI file"""
 
+import collections
 import configparser
 import dataclasses
+import logging
 import os
 import socket
 
@@ -51,6 +53,9 @@ MANAGED_OPENSM_KEYS = (
 REQUIRED_LOG_FLAGS = 0x07
 NO_HARDENING = ("none", "false", "no")
 ALL_HARDENING = ("all", "true", "yes")
+
+
+LOG = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -139,8 +144,6 @@ class Config:
     call_timeout: float = 3.0
     # Ask the old leader's SM to disable itself, at a takeover
     fence_ask: bool = True
-    # Wait for an operator's confirmation at every takeover
-    manual_takeover: bool = False
     # How long a step-down at SIGTERM may take
     shutdown_timeout: float = 20.0
     # The manager's container's stop timeout, which the deployment sets: 30 s
@@ -210,7 +213,14 @@ class Config:
         for section, names in OPTIONS:
             if not parser.has_section(section):
                 continue
-            unknown = set(parser.options(section)) - set(names)
+            for name in sorted(set(parser.options(section)) & REMOVED[section]):
+                LOG.warning(
+                    "[%s] %s was removed, and is ignored: %s",
+                    section,
+                    name,
+                    REMOVED_WHY[name],
+                )
+            unknown = set(parser.options(section)) - set(names) - REMOVED[section]
             if unknown:
                 raise ConfigError(
                     f"[{section}] has unknown options: {', '.join(sorted(unknown))}"
@@ -316,7 +326,6 @@ def ha_settings(config):
                 "ha_period",
                 "call_timeout",
                 "fence_ask",
-                "manual_takeover",
                 "job_timeout",
                 "step_down_cooldown",
             )
@@ -381,6 +390,13 @@ def _ha_problems(config):
     return problems
 
 
+# Options a release removed, which a configuration may still set: ignored,
+# with a warning, for a release or so
+REMOVED_WHY = {
+    "manual_takeover": "every takeover is automatic; see specs/ha.md, Fencing",
+}
+REMOVED = collections.defaultdict(set, {"ha": {"manual_takeover"}})
+
 OPTIONS = (
     ("api", ("host", "port", "url_prefix", "domain", "token")),
     ("database", ("database", "connection")),
@@ -421,7 +437,6 @@ OPTIONS = (
             "ha_period",
             "call_timeout",
             "fence_ask",
-            "manual_takeover",
             "shutdown_timeout",
             "container_stop_timeout",
             "step_down_cooldown",

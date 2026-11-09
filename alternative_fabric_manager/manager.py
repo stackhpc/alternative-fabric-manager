@@ -1137,6 +1137,13 @@ class Manager:
             session.commit()
         return sorted(fabric.switches)
 
+    def enforcement_errors(self):
+        """The switch ports whose partition enforcement OpenSM cleared, as
+        "<switch GUID>:<port>", or "unattributed" for one it didn't name"""
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            return json.loads(applied.enforcement_errors or "[]") if applied else []
+
     def clear_enforcement_errors(self):
         """Forget the switch ports whose enforcement OpenSM cleared, once an
         operator has dealt with them"""

@@ -15,7 +15,7 @@ description, not a port GUID. Check the binary, never memory.
 The pinned image is the one the `opensm` container runs:
 
 ```sh
-D="$CLAUDE_JOB_DIR/tmp/osmbin"; mkdir -p "$D"
+D="${SCRATCH:-/tmp/afm}/osmbin"; mkdir -p "$D"
 sudo docker cp opensm:/usr/sbin/opensm "$D/"
 sudo docker cp -L opensm:/usr/lib64/libopensm.so.28 "$D/libopensm.so.28.0.0"
 sudo chown -R "$USER" "$D"

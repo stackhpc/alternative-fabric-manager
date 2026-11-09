@@ -41,12 +41,25 @@ def main(argv=None):
         help="Record the switches OpenSM sees now as the fabric's expected "
         "ones, which every fabric check must find, and exit",
     )
-    parser.add_argument(
+    enforcement = parser.add_mutually_exclusive_group()
+    enforcement.add_argument(
+        "--show-enforcement-errors",
+        action="store_true",
+        help="List the switch ports whose partition enforcement OpenSM "
+        "cleared, as <switch GUID>:<port>, and exit. While any is listed, no "
+        "job completes",
+    )
+    enforcement.add_argument(
         "--clear-enforcement-errors",
         action="store_true",
-        help="Forget the switch ports whose partition enforcement OpenSM "
-        "cleared, once they are dealt with, and exit; until then no job "
-        "completes",
+        help="Forget the switch ports --show-enforcement-errors lists, list "
+        "them, and exit; jobs then complete again. Check first that each "
+        "port enforces again: OpenSM needn't report one it still can't",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="HA: show the lease's holder, term and freeze, and exit",
     )
     parser.add_argument(
         "--db-upgrade",
@@ -64,12 +77,12 @@ def main(argv=None):
         "--unfreeze", action="store_true", help="HA: end a freeze, and exit"
     )
     parser.add_argument(
-        "--confirm-takeover",
-        type=int,
-        metavar="TERM",
-        help="HA: confirm that the OpenSM of the leader that held TERM can't "
-        "act: for a manual takeover, the term of the leader being replaced; "
-        "while a freeze ends, the frozen term",
+        "--force-unfreeze",
+        action="store_true",
+        help="HA: end a freeze whose frozen leader can't acknowledge the "
+        "unfreeze, so that another instance may take over. Only after "
+        "stopping that leader's OpenSM and checking that no opensm process "
+        "runs on its host: nothing checks this for you (see --status)",
     )
     args = parser.parse_args(argv)
 
@@ -96,7 +109,22 @@ def main(argv=None):
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
-    if args.freeze or args.unfreeze or args.confirm_takeover is not None:
+    if args.status:
+        from alternative_fabric_manager.ha import lease as lease_mod
+
+        lease = lease_mod.GaleraLease(
+            db.make_sessionmaker(config.database_url, config.call_timeout)
+        )
+        from alternative_fabric_manager.ha import operator
+
+        try:
+            state = lease.read()
+        except lease_mod.NotPrimary as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
+        print("\n".join(operator.status(state)))
+        return
+
+    if args.freeze or args.unfreeze or args.force_unfreeze:
         from alternative_fabric_manager.ha import lease as lease_mod
         from alternative_fabric_manager.ha import operator
 
@@ -113,11 +141,14 @@ def main(argv=None):
                     sys.exit(
                         "alternative-fabric-manager: the leader hasn't acknowledged "
                         "the unfreeze; no takeover until it does, its node's stop "
-                        "is verified, or --confirm-takeover"
+                        "is verified, or --force-unfreeze"
                     )
             else:
-                operator.confirm_takeover(lease, args.confirm_takeover)
-                print(f"Confirmed term {args.confirm_takeover}")
+                node, term = operator.force_unfreeze(lease)
+                print(
+                    f"Forced the unfreeze: {node}'s OpenSM, term {term}, is taken "
+                    "as stopped, and another instance may take over"
+                )
         except (operator.OperatorError, lease_mod.NotPrimary) as e:
             sys.exit(f"alternative-fabric-manager: {e}")
         return
@@ -143,11 +174,16 @@ def main(argv=None):
             print(f"0x{guid:016x}")
         return
 
-    if args.clear_enforcement_errors:
+    if args.show_enforcement_errors or args.clear_enforcement_errors:
         manager = manager_mod.Manager(
             config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
         )
-        for port in manager.clear_enforcement_errors():
+        ports = (
+            manager.clear_enforcement_errors()
+            if args.clear_enforcement_errors
+            else manager.enforcement_errors()
+        )
+        for port in ports:
             print(port)
         return
 

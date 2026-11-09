@@ -72,23 +72,22 @@ the tests, and have the change reviewed (see the `review-loop` skill).
   `_ADDED_COLUMNS` in db.py for SQLite's in-place upgrade. Only amend a
   revision that has never been deployed.
 
-## Safety on the test host
+## Safety on a shared fabric
 
-The development host, infiniband-testing, shares its InfiniBand fabric
-(several hosts and a switch) with others, and AFM there manages its OpenSM.
+Development usually happens on a DevStack host set up as networking-mlnx's
+DevStack guide describes, whose InfiniBand fabric others may share. AFM
+there manages the fabric's OpenSM, so:
 
 - **Never print OpenSM's keys** (M_Key, SM_Key, SA_Key). `--show-keys`
   prints them; use it only to feed a diagnostic tool, as in
   `KEY=$(... --show-keys | awk '/^m_key/{print $2}')`, never to display.
-- **The fabric is M_Key protected.** SMP tools (`ibswitches`, `smpquery`,
-  `ibportstate`) need `-y $KEY`. Never disable switch ports or send SMInfo
-  Sets on this fabric.
-- **AFM's database holds the fabric's keys.** The host runs AFM in HA mode,
-  with its database in the `afm-mariadb` container; the old SQLite database
-  in the `afm_data` volume is the rollback. Never drop or recreate either;
-  back up before every redeploy (see the `deploy-host` skill).
-- **M_Key and SM_Key protection were approved here**, on 2026-11-06, for
-  HA mode.
-- Don't connect to eswitchd on tcp://127.0.0.1:60001; it crashes on junk.
-- Shared DevStack configuration changes need the user's approval.
+- **Agree the hardening with whoever shares the fabric** before changing
+  `[opensm] hardening`. With M_Key protection on, SMP tools (`ibswitches`,
+  `smpquery`, `ibportstate`) need `-y $KEY`. Never disable switch ports or
+  send SMInfo Sets on a fabric others share.
+- **AFM's database holds the fabric's keys.** Never drop or recreate it;
+  back it up before every redeploy (see the `deploy-host` skill).
+- Don't connect to eswitchd on tcp://127.0.0.1:60001 by hand; it exits on
+  messages it can't decode.
+- Changes to a shared DevStack's configuration need its owner's agreement.
 - Delete OpenStack resources by explicit ID only.

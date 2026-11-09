@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Operators' commands: freeze, unfreeze, confirm a takeover"""
+"""Operators' commands: freeze, unfreeze, force an unfreeze, status"""
 
 import socket
 import time
@@ -61,9 +61,49 @@ def unfreeze(config, lease, wait):
     return False
 
 
-def confirm_takeover(lease, term):
-    """Confirm that the holder of term's OpenSM can't act"""
-    if not lease.confirm(term):
+def force_unfreeze(lease):
+    """End a freeze its frozen leader never acknowledged, by confirming that
+    that leader's OpenSM can't act; returns its node and term
+
+    The confirmation names the term and the holding instance read here, and
+    lease.confirm() takes it only if both still hold the ending freeze, so
+    neither a later freeze nor an instance that adopted this one meanwhile
+    is confirmed by mistake."""
+    state = lease.read()
+    if state.freeze_state != "ending":
         raise OperatorError(
-            f"Term {term} isn't current, or the cluster is frozen: unfreeze first"
+            "Only while a freeze ends: the cluster isn't unfreezing; "
+            "run --unfreeze first"
         )
+    if not lease.confirm(state.term, state.holder_uuid):
+        raise OperatorError("The freeze changed meanwhile: check --status")
+    return state.holder_node, state.term
+
+
+def status(state):
+    """--status's lines, for a LeaseState"""
+    holder = state.holder_node or "-"
+    lines = [
+        f"holder: {holder} (instance {state.holder_uuid or '-'})",
+        f"term: {state.term}",
+        f"released: {'yes' if state.released else 'no'}",
+        f"freeze: {state.freeze_state or 'none'}",
+    ]
+    if state.freeze_state:
+        lines.append(f"frozen term: {state.freeze_term}")
+    if state.freeze_state == "ending":
+        if state.confirmed_term == state.term:
+            lines.append(
+                f"unfreeze pending: forced, with {holder}'s OpenSM taken as stopped; "
+                "another instance takes over at its next poll"
+            )
+        else:
+            lines += [
+                f"unfreeze pending: {holder}'s manager hasn't acknowledged it, "
+                "so no instance takes over until it does, its node's stop is "
+                "verified, or an operator forces the unfreeze.",
+                f"Check {holder}: if its manager is paused or hung, stop its "
+                "OpenSM, check that no opensm process runs there, and run "
+                "--force-unfreeze.",
+            ]
+    return lines

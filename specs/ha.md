@@ -227,7 +227,9 @@ the target set, self-stop and the waits in Fencing.
     without releasing the lease, so a successor waits for the lease to
     expire and the unconfirmed wait; that is safe, since its OpenSM is
     verified stopped. If the manager is killed anyway, OpenSM dies with it,
-    since the manager is PID 1 of the namespace OpenSM's container joins.
+    since OpenSM's container joins the manager's PID namespace, whose init,
+    `docker run --init`, exits with the manager and takes the namespace with
+    it.
   - **A candidate** that stops cleanly marks its node row as stopped, so
     that it isn't counted as a live candidate.
   - **After a self-stop**, once the leader reaches a Primary component
@@ -457,10 +459,10 @@ Instead, a target leaves the set, with a term compare-and-set, once:
    or that has no route, as for a crashed or powered-off target, counts as
    asked.
 
-`[ha] manual_takeover = true`, a cluster setting, makes every takeover wait
-for an operator to confirm with the CLI that the old leader's OpenSM can't
-act, instead of the unconfirmed wait. A clean release and a verified stop
-still count without an operator.
+There is no option to make every takeover wait for an operator instead of
+the unconfirmed wait: it would trade the paused-node limitation for a fabric
+without a subnet manager until someone acts, and confirmed fencing, a future
+improvement, removes the limitation without that cost.
 
 ### Why the unconfirmed wait is enough
 
@@ -517,8 +519,9 @@ its OpenSM is known stopped and unable to start by itself:
 
 ### Seeing the host's processes
 
-The manager is PID 1 of its own PID namespace, which OpenSM's container
-joins, so its own `/proc` shows only OpenSM's container. It verifies that
+The manager runs in its own PID namespace, under `docker run --init` as
+PID 1, and OpenSM's container joins it, so the manager's own `/proc` shows
+only the two containers. It verifies that
 no OpenSM runs on the host, in any container or none, through the host's
 `/proc`, mounted read-only into its container at `/host/proc`, looking for
 any process whose executable is `opensm`.
@@ -557,9 +560,8 @@ cgroup, so pausing the manager's container doesn't pause it.
   - the **takeover loop**, which runs a takeover and OpenSM's start
     separately from the apply loop: Ask, 5 s, the unconfirmed wait,
     `T_watchdog`, and `start_timeout`, 60 s in HA mode, so `B_takeover` is
-    120 s. Waits with no bound, for an operator under `manual_takeover`
-    or an unacknowledged unfreeze, poll in iterations of a few seconds
-    each;
+    120 s. A wait with no bound, for an unacknowledged unfreeze, polls in
+    iterations of a few seconds each;
   - the lease renewal loop: a call timeout, 3 s.
 
   A call that fails or times out still finishes its iteration. `T_watchdog` must
@@ -669,6 +671,15 @@ moved, until the cluster is unfrozen.
   adopted from, still holds the frozen lease. If the frozen node itself fails, the fabric has no subnet
   manager until an operator unfreezes the cluster: that is what a freeze
   trades.
+- **`--status`** shows the lease's holder, its instance and term, whether
+  it was released, and the freeze, with its frozen term. While a freeze
+  ends unacknowledged, it reports the unfreeze as pending and names the
+  frozen leader's node as the one to check; once confirmed, it says so.
+  `--force-unfreeze` takes no term: it confirms the freeze ending when it
+  reads the lease row, naming its term and holding instance, and
+  `confirm()` accepts it only if both still hold the ending freeze, so it
+  confirms neither a later freeze nor an instance that adopted this one
+  meanwhile, which keeps the term.
 - **Unfreezing is two-phase**, and needs Galera. `--unfreeze`, or the
   freeze's expiry, read by any instance that reaches a Primary component,
   marks the freeze as ending. The frozen leader acknowledges it, in this
@@ -679,8 +690,8 @@ moved, until the cluster is unfrozen.
   acknowledgement, treating it as a renewal. Until the leader
   acknowledges, no candidate takes over on expiry: a leader that never
   acknowledges, because it is paused, hung, or cut off, leaves the lease
-  only through a verified stop of its node, or an operator's confirmation
-  that its OpenSM can't act, as with `manual_takeover`; its watchdog's
+  only through a verified stop of its node, or an operator's confirmation,
+  with `--force-unfreeze`, that its OpenSM can't act; its watchdog's
   held deadline, if the freeze had an expiry, stops OpenSM meanwhile. A
   takeover while the freeze is ending is a compare-and-set that requires
   either an operator's confirmation recorded in the lease row while the
@@ -689,8 +700,8 @@ moved, until the cluster is unfrozen.
   clears the freeze in the same statement. The frozen leader's target
   entry is marked held, since the unconfirmed wait doesn't stop a held
   watchdog: it leaves only as verified, or with that confirmation.
-- **SIGTERM while frozen** stops OpenSM, since the manager is PID 1 of its
-  namespace, but doesn't release the lease; the node's manager starts it
+- **SIGTERM while frozen** stops OpenSM, since OpenSM's container is in the
+  manager's PID namespace, which ends with it, but doesn't release the lease; the node's manager starts it
   again when it comes back. Shutting the frozen node down for good needs an
   unfreeze first.
 
@@ -747,6 +758,11 @@ A takeover takes up to `T` for the lease to expire, plus `T_watchdog` for
 an unconfirmed target, plus starting OpenSM and its first sweep. A job in flight during a takeover must
 not time out, or networking-mlnx sets its port to ERROR. So, with every
 value a cluster setting in Galera, so that all instances agree:
+the first instance stores its `[ha]` settings, and an instance whose
+settings differ from the stored ones in any key both have refuses to start.
+A key only the instance has, from a newer version, is added to the stored
+settings, with a warning; a key only the stored settings have, from an
+older version, is ignored. So:
 
 - job timeout > the time a job can spend before the leader fails, the
   larger of a poll interval, a sweep (`sweep_timeout`) and a fabric check,
@@ -879,6 +895,11 @@ instance can't reach the database.
   version that can't, says so, and needs every instance stopped. Each
   release of the lease restarts OpenSM on another node, so its SA state is
   rebuilt.
+- **From a version with `[ha] manual_takeover`:** an instance of the old
+  version with it set waits for an operator to confirm every takeover it
+  leads, and the new version's CLI can't confirm one outside a freeze. Set
+  it to false and roll that out before upgrading; the new version ignores
+  the option, with a warning, and the stored setting.
 - **From single node:** with the manager stopped, which stops OpenSM too,
   so the fabric has no subnet manager meanwhile:
   1. copy the networks, ports and keys into Galera, and continue the
@@ -917,7 +938,6 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | The leader cut off from Galera only, or in a minority partition | Its renewals fail, so it stops its OpenSM within `T_self`. The majority side's candidates see the lease unrenewed for `T`, elect a leader, and take over after the unconfirmed wait | Jobs wait through the takeover. No two masters |
 | The leader shut down cleanly | It fails `/healthz`, stops and verifies its OpenSM, and releases the lease | A candidate takes over at once, without waiting |
 | A takeover's winner dies before starting OpenSM | Its targets, and itself, stay in the target set. The next candidate waits for them all | Jobs wait longer |
-| `manual_takeover` set | A candidate takes the lease, asks the old SM to stop, and waits for an operator to confirm | The fabric runs without a subnet manager until then |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
@@ -991,14 +1011,15 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       single-use start requests on tmpfs, the file hashes, `T_watchdog` from
       the cluster setting, and SIGKILL of OpenSM on SIGTERM.
 - [ ] Takeovers: SMInfo DISABLE behind `fence_ask`, the unconfirmed wait,
-      `manual_takeover`, rejoining with a verified stop, and the required
-      keys check.
+      rejoining with a verified stop, and the required keys check.
 - [ ] Freeze: `--freeze` (with `--drain` and `--for`) and `--unfreeze`,
       the takeover compare-and-set requiring not frozen, 503 for new
       requests, the leader's hold and the watchdog's held lease, restarting
       OpenSM only on the frozen node, and candidates' timers restarted at
       the unfreeze.
-- [ ] A CLI to confirm a manual takeover, record configuration epochs,
+- [x] `--force-unfreeze`, to end a freeze its leader never acknowledged.
+- [ ] `--confirm-fenced <node>`, with `fence_manual` (see Manual fencing).
+- [ ] A CLI to record configuration epochs,
       confirm or remove expected switches, and force a step-down.
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
       in containers, with faults injected: the leader killed, paused, cut
@@ -1176,8 +1197,8 @@ since a successor repeats it.
 
 With a confirming step enabled, if none confirms within
 `[ha] fence_timeout`, the takeover doesn't start OpenSM. The new leader keeps the lease, retries the ladder and raises an
-alarm; an operator can confirm a fence with the CLI, which asks them to
-check that the target's OpenSM can't act. The fabric runs on the target's
+alarm; an operator can confirm a fence with `--confirm-fenced` (see
+Manual fencing), after checking that the target's OpenSM can't act. The fabric runs on the target's
 OpenSM, if it still runs, or without a subnet manager, until then.
 
 HA mode refuses to start unless each enabled step has what it needs:
@@ -1190,10 +1211,44 @@ HA mode refuses to start unless each enabled step has what it needs:
   is configured;
 - step 4: refused until it is implemented.
 
-`[ha] fence_manual = true` makes every takeover wait for an operator to
-confirm the fence with the CLI, whatever steps are enabled. With no
-confirming step enabled and `fence_manual` off, HA mode logs a warning at
-start, and the health check reports it.
+`[ha] fence_manual = true` makes a takeover wait for an operator to
+confirm the fence with `--confirm-fenced` when its enabled confirming steps
+fail. With no confirming step enabled and `fence_manual` off, HA mode logs
+a warning at start, and the health check reports it.
+
+#### Manual fencing
+
+Still to come, with `fence_manual`. The operator fences the target
+themselves, by stopping its OpenSM or its node, or disabling its switch
+port, and then confirms it:
+
+```sh
+alternative-fabric-manager --config-file … --confirm-fenced <node>
+```
+
+- **It names a node**, since the target set can hold several entries; the
+  operator gets the node from `--status`, which lists the target set's
+  entries waiting for a fence, each with its node, instance and term, and
+  what each enabled step last reported.
+- **It confirms what it read.** It reads the node's entries, and records
+  the confirmation as a compare-and-set naming each entry's instance and
+  term, as `--force-unfreeze` names the frozen holder's: an entry added
+  since, such as the node rejoining with a new instance and becoming a
+  target again, isn't covered, and the command says so and exits non-zero.
+  The leader then removes each confirmed entry from the target set as
+  "manual", as it would for a confirming step.
+- **Not for a held entry**, a frozen leader's: the command refuses, and
+  points to `--force-unfreeze`, since a freeze has its own two-phase rules
+  (see Freeze).
+- **Nothing checks the claim.** The help and `--status` say what the
+  operator must check first: that no `opensm` process runs on the target
+  node, or that the node is off, or that its switch port is disabled.
+- **Rejoining:** a node whose fence was confirmed by hand rejoins as one
+  that left the target set unconfirmed does (see Rejoining), since the
+  manager can't tell what the operator did to it.
+
+It is a separate command from `--force-unfreeze`, which ends a freeze and
+names no node: `--force-unfreeze` stays for freezes only.
 
 #### Unconfirmed takeovers, with the ladder
 

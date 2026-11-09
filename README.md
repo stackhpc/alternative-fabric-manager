@@ -57,7 +57,7 @@ stops.
 
 ```sh
 docker build -t alternative-fabric-manager .
-docker run -d --name alternative-fabric-manager --restart unless-stopped \
+docker run -d --init --name alternative-fabric-manager --restart unless-stopped \
   --network host \
   -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
   -v /etc/opensm:/etc/opensm \
@@ -66,11 +66,32 @@ docker run -d --name alternative-fabric-manager --restart unless-stopped \
   alternative-fabric-manager
 ```
 
-Stop any other OpenSM on the host first: the manager removes any container
-called as `[opensm] container` says, `opensm` by default, and starts its own.
-The manager's container must be called as `[opensm] manager_container` says,
-`alternative-fabric-manager` by default. The Docker socket lets the manager start OpenSM and read its log,
-so treat the manager as root on its host.
+Before you start it:
+
+- **Stop any other subnet manager** on the host, such as a distribution's
+  `opensm` service, and make sure none runs elsewhere on the fabric. The
+  manager runs its own OpenSM, in a container named by `[opensm] container`
+  (`opensm` by default), and replaces any existing container of that name.
+- **Name the manager's container** as `[opensm] manager_container` says
+  (`alternative-fabric-manager` by default): OpenSM's container joins its
+  PID namespace, which is what makes OpenSM stop with the manager.
+- **Treat the manager as root on its host.** It uses the Docker socket to
+  start OpenSM's container and read its log, and whatever can use that
+  socket can control the host.
+- **On a new database, record the fabric's switches** once OpenSM has
+  swept, with `docker exec alternative-fabric-manager
+  alternative-fabric-manager --config-file
+  /etc/alternative-fabric-manager/afm.conf --confirm-switches`: until then
+  no job completes ("No expected switches"). Run it again whenever
+  switches are added or removed.
+
+`--status` shows who holds the lease in HA mode, its term, and any freeze,
+including an unfreeze still pending and the manager to check.
+
+`--init` gives the container an init process, which reaps OpenSM's processes
+when OpenSM stops: they belong to the manager's PID namespace. For HA mode,
+which needs more mounts and a server database, see
+[docs/kayobe.md](docs/kayobe.md) and [specs/ha.md](specs/ha.md).
 
 Copy [etc/afm.conf.sample](etc/afm.conf.sample) to
 `/etc/alternative-fabric-manager/afm.conf` and set a token. OpenSM's options
@@ -129,6 +150,53 @@ On a running fabric, give the default partition's IPoIB broadcast group the
 rate and MTU it has now, as `saquery -g` shows them. Otherwise OpenSM
 recreates it, which disrupts IPoIB on the default partition across the
 fabric.
+
+### Switch ports that stop enforcing partitions
+
+A switch port enforces partitions with a table of the pkeys allowed through
+it. If a port needs more pkeys than its table holds, because the host
+behind it has ports in more networks than that, OpenSM logs `ERR 0507` or
+`ERR 0513` and **clears the port's enforcement bit**: the switch then lets
+any pkey through that port, so a host behind it can reach other tenants'
+partitions.
+
+The manager can't fix that by itself, so it fails closed: it records the
+switch port, logs "OpenSM cleared a switch port's enforcement", and **no
+job completes, for any port on the fabric**, until an operator has dealt
+with it. New ports stay `DOWN` meanwhile, and Nova's wait for them fails.
+
+To deal with it:
+
+1. **List the ports**, as `<switch GUID>:<port>`:
+
+   ```sh
+   alternative-fabric-manager --config-file /etc/alternative-fabric-manager/afm.conf \
+     --show-enforcement-errors
+   ```
+
+   `unattributed` means OpenSM's message named no switch port: read
+   OpenSM's log around the "Clearing Enforcement bit" message to find it.
+2. **Find the host behind each port**, with `ibnetdiscover -y $KEY` or
+   `smpquery -y $KEY -D nodeinfo <directed route>` if LIDs aren't
+   assigned, where `KEY` is the M_Key (see Hardening).
+3. **Bring the port's pkeys within its table**: move ports of that host
+   onto fewer networks, or take the host out of service. Until then, treat
+   that host as able to reach any partition.
+4. **Check that the port enforces again** after OpenSM's next sweep:
+   `smpquery -y $KEY portinfo -G 0x<switch GUID> <port>` shows
+   `PartEnforceInb` and `PartEnforceOutb` set.
+5. **Clear them**, so that jobs complete again:
+
+   ```sh
+   alternative-fabric-manager --config-file /etc/alternative-fabric-manager/afm.conf \
+     --clear-enforcement-errors
+   ```
+
+   Clear only ports you have checked in step 4. Clearing doesn't wait for
+   proof: OpenSM may not log the error again for a port it still can't
+   enforce, so a port cleared too early can go unnoticed.
+
+In a container, run these with `docker exec alternative-fabric-manager`.
 
 ## Development
 

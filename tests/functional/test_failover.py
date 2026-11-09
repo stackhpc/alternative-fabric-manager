@@ -466,7 +466,7 @@ def test_an_unfreeze_the_leader_never_acknowledges_needs_an_operator(cluster):
     # The operator stops it, and confirms.
     for pid in cluster.sm_pids(leader):
         os.kill(pid, signal.SIGKILL)
-    operator.confirm_takeover(lease, term)
+    assert operator.force_unfreeze(lease)[1] == term
     successor = cluster.wait_leader(other_than=leader)
     cluster.signal(leader, signal.SIGCONT)
     apply_change(cluster, successor, 9)

@@ -23,10 +23,13 @@ monotonic clock.
 import dataclasses
 import datetime
 import json
+import logging
 
 import sqlalchemy as sa
 
 from alternative_fabric_manager import db
+
+LOG = logging.getLogger(__name__)
 
 
 class NotPrimary(Exception):
@@ -486,21 +489,20 @@ class GaleraLease:
             session.commit()
             return True
 
-    def confirm(self, term):
-        """An operator confirms that the holder of term's OpenSM can't act"""
+    def confirm(self, term, holder_uuid):
+        """An operator confirms that the frozen holder of term, the instance
+        holder_uuid, can't act, so that a takeover may end a freeze it never
+        acknowledged"""
         with self._session() as session:
             lease = self._row(session, lock=True)
-            if lease.freeze_state in ("requested", "frozen"):
-                # Never for a freeze still in force
-                session.rollback()
-                return False
-            entry_terms = set(session.scalars(sa.select(db.TargetEntry.term)))
-            # The holder's own term, while a freeze ends, or the term of a
-            # target entry a takeover waits for, as with manual_takeover
-            if not (
-                (term == lease.term and lease.freeze_state == "ending")
-                or term in entry_terms
+            if (
+                lease.freeze_state != "ending"
+                or term != lease.term
+                or holder_uuid != lease.holder_uuid
             ):
+                # Only while a freeze ends: never for one still in force, nor
+                # for an instance that adopted the frozen lease since the
+                # operator read it, which keeps the term
                 session.rollback()
                 return False
             lease.confirmed_term = term
@@ -517,8 +519,24 @@ class GaleraLease:
                 session.add(db.Secret(name=name, value=settings))
                 session.commit()
                 return True
+            # Only the settings both versions know are compared: a setting a
+            # newer version removed mustn't keep its instances from leading.
+            # A setting it added is stored by the first instance that has
+            # it, and checked against from then on; stored settings it lacks
+            # stay, for older instances during a rolling upgrade.
+            stored, ours = json.loads(row.value), json.loads(settings)
+            if any(stored[key] != ours[key] for key in stored.keys() & ours.keys()):
+                session.commit()
+                return False
+            added = sorted(ours.keys() - stored.keys())
+            if added:
+                LOG.warning("Storing new [ha] settings: %s", ", ".join(added))
+                row.value = json.dumps({**stored, **ours}, sort_keys=True)
+            ignored = sorted(stored.keys() - ours.keys())
+            if ignored:
+                LOG.info("Ignoring stored [ha] settings: %s", ", ".join(ignored))
             session.commit()
-            return row.value == settings
+            return True
 
     def adopt_frozen(self, node, instance_uuid, frozen_term):
         """A restarted manager on the frozen node takes the frozen lease

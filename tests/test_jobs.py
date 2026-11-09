@@ -779,3 +779,13 @@ def test_only_a_passing_check_ends_a_contest(manager, fabric):
     manager.reconcile()
     manager.reconcile()
     assert _status(manager, job) == db.JobStatus.COMPLETED
+
+
+def test_enforcement_errors_are_listed_without_clearing(manager, fabric):
+    fabric.report = SweepReport(enforcement_errors={f"{SWITCH:016x}:3"})
+    manager.put_network(NETWORK_ID, conftest.network())
+    manager.reconcile()
+    assert manager.enforcement_errors() == [f"{SWITCH:016x}:3"]
+    assert manager.enforcement_errors() == [f"{SWITCH:016x}:3"]
+    assert manager.clear_enforcement_errors() == [f"{SWITCH:016x}:3"]
+    assert manager.enforcement_errors() == []
