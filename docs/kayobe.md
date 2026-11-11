@@ -774,10 +774,20 @@ openstack server create --flavor baremetal --image <image> \
   --network <Ethernet network> --network infiniband-100 <name>
 ```
 
+A port created first and passed with `--port` works the same: Ironic
+makes it `baremetal`, whatever its `vnic_type`, and adds the client ID. No
+driver adds one for a bare metal port: if its Ironic port has no
+`client-id`, `mlnx_sdn_assist` doesn't bind it, and Ironic fails the
+deployment.
+
 A virtualised instance needs a `direct` port, created first: with
 `--network`, Nova creates a `normal` port, which nothing binds on
 `ibphysnet`, and the instance fails to boot. `mlnx_infiniband` derives the
-port's client ID from its MAC address.
+port's client ID from its MAC address when Nova binds it.
+
+Users never set a client ID on a Neutron port themselves, in either case:
+only administrators and services can set one on a network that
+`mlnx_sdn_assist` syncs, since the controller takes the GUID from it.
 
 ```sh
 openstack port create --network infiniband-100 --vnic-type direct ib0
