@@ -9,8 +9,14 @@ description: Run AFM's functional failover tests (three HA instances against a t
 containers (`afm-galera-1..3`, SQL ports 3401-3403, Galera 4601-4603), then,
 for each test, a fresh `afm` database and three AFM instances as processes
 (API ports 8191-8193), each on its own Galera node. Each instance's OpenSM is
-`tests/functional/fake_opensm.py`, run by the real watchdog. A monitor fails
-the test if two fake SMs are ever master at once.
+`tests/functional/fake_opensm.py`, run by the real watchdog. Two checks fail
+a test if two fake OpenSMs ever act at once, outside a window the test opens
+with `cluster.two_allowed()`: a monitor that samples live, unpaused, not
+disabled fakes from `/proc` every 50 ms, and, at teardown, an exact overlap
+check of each fake's heartbeat log (`fabric/life-<pid>.log`). A test can
+override the timings with `@pytest.mark.timings(...)`, for example a
+`watchdog_timeout` above `lease_timeout`, as in production, to exercise the
+unconfirmed wait.
 
 ## Run
 
@@ -31,7 +37,9 @@ AFM_FUNCTIONAL=1 timeout 2400 uv run pytest -q tests/functional/test_failover.py
 
 Each test's directory under `--basetemp` has `instance-<n>.log` (the
 instance's log and its watchdog's lines), `fabric/` (the fake SMs'
-registry), and `state-<n>/` (the watchdog's lease and requests). A merged
+registry, their heartbeat logs, `life-<pid>.log`, and the partitions
+generations each node's fakes swept, `generations-node-<n>.log`, all on the
+system's monotonic clock), and `state-<n>/` (the watchdog's lease and requests). A merged
 timeline usually explains a failure:
 
 ```sh
@@ -40,7 +48,7 @@ grep -h -E "WARNING|ERROR|watchdog" "$d"/instance-*.log \
   | grep -v "Deadlock\|alembic\|Duplicate" | sort | cut -c1-200
 ```
 
-- **"Two masters at once"** is a safety bug until proven otherwise: find
+- **"Two OpenSMs at once"** or **"lifetimes overlap"** is a safety bug until proven otherwise: find
   which instance started OpenSM, and what it knew about the lease then.
   Fix the code, and the spec if it allowed it.
 - Galera deadlocks and duplicate-key errors at startup are expected: three

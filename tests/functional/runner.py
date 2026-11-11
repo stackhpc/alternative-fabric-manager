@@ -33,6 +33,37 @@ def process_state(pid):
         return None
 
 
+def processes(kind, fabric=None, node=None):
+    """Live processes of a kind, "fake" (fake_opensm.py itself) or
+    "watchdog", optionally only those of one fabric directory or node, from
+    /proc, as {pid: state letter}. Paused ones are included."""
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().split(b"\0")
+        except OSError:
+            continue
+        if kind == "fake":
+            # The fake itself, python fake_opensm.py ..., not the watchdog,
+            # whose arguments name it too
+            matches = len(cmdline) > 1 and cmdline[1].endswith(b"fake_opensm.py")
+        else:
+            matches = b"alternative_fabric_manager.ha.watchdog" in cmdline
+        if not matches:
+            continue
+        if fabric is not None and fabric.encode() not in cmdline:
+            continue
+        if node is not None and node.encode() not in cmdline:
+            continue
+        state = process_state(int(pid))
+        if state not in (None, "Z", "X"):
+            found[int(pid)] = state
+    return found
+
+
 def masters(fabric):
     """The fake SMs that can act as master now: alive, not stopped, and not
     disabled. A paused (stopped) one can't act until it resumes."""
@@ -92,26 +123,7 @@ class ProcessRunner:
         )
 
     def _own_sms(self):
-        pids = []
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmdline = f.read().split(b"\0")
-            except OSError:
-                continue
-            # The fake itself, python fake_opensm.py ..., not the watchdog,
-            # whose arguments name it too
-            if (
-                len(cmdline) > 1
-                and cmdline[1].endswith(b"fake_opensm.py")
-                and self.node.encode() in cmdline
-            ):
-                state = process_state(int(pid))
-                if state not in (None, "Z", "X"):
-                    pids.append(int(pid))
-        return pids
+        return list(processes("fake", self.fabric_dir, self.node))
 
     def reach(self):
         """The one switch, unless a test cut this node's link"""
@@ -166,6 +178,8 @@ class ProcessRunner:
                 str(self.guid),
                 "--start-delay",
                 os.environ.get("AFM_FAKE_START_DELAY", "1.5"),
+                "--partitions",
+                self.config.partitions_file,
                 *(
                     ["--ignore-ask"]
                     if os.environ.get("AFM_FAKE_HONOURS_ASK") != "1"

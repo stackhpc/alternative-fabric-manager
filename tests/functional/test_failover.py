@@ -7,6 +7,7 @@ as OpenSM under the real watchdog, injects a fault, and checks, all the
 while, that no two OpenSMs act as master at once.
 """
 
+import contextlib
 import json
 import os
 import secrets
@@ -143,26 +144,124 @@ def url(i, password, database="afm"):
 
 
 class Cluster:
-    """Three instances, a fabric directory, and a monitor of masters"""
+    """Three instances, a fabric directory, and a monitor of OpenSMs"""
 
-    def __init__(self, tmp_path, password):
+    def __init__(self, tmp_path, password, timings=None):
         self.tmp = tmp_path
         self.password = password
+        self.timings = dict(TIMINGS, **(timings or {}))
         self.fabric = str(tmp_path / "fabric")
         os.makedirs(self.fabric)
         self.processes = {}
         self.violations = []
-        self.allow_two = False
+        self.monitor_errors = []
+        # (start, end) monotonic times in which a test lets two OpenSMs act,
+        # as for the known limitation of a paused node; end None while open
+        self.allowed = []
         self._stop = threading.Event()
         self._monitor = threading.Thread(target=self._watch, daemon=True)
         self._monitor.start()
 
+    def _allowed(self, start, end=None):
+        end = start if end is None else end
+        return any(a <= start and (b is None or end <= b) for a, b in self.allowed)
+
+    @contextlib.contextmanager
+    def two_allowed(self):
+        window = [time.monotonic(), None]
+        self.allowed.append(window)
+        try:
+            yield
+        finally:
+            window[1] = time.monotonic()
+            self.allowed[self.allowed.index(window)] = tuple(window)
+
+    def active(self):
+        """Fake OpenSMs that can act now: alive, not paused, and not
+        disabled, whether or not they have registered yet"""
+        disabled = set()
+        for name in os.listdir(self.fabric):
+            if name.startswith("sm-") and name.endswith(".json"):
+                try:
+                    with open(os.path.join(self.fabric, name)) as f:
+                        entry = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if not entry.get("master"):
+                    disabled.add(entry["pid"])
+        return [
+            pid
+            for pid, state in runner_mod.processes("fake", self.fabric).items()
+            if state not in ("T", "t") and pid not in disabled
+        ]
+
     def _watch(self):
         while not self._stop.is_set():
-            found = runner_mod.masters(self.fabric)
-            if len(found) > 1 and not self.allow_two:
-                self.violations.append((time.monotonic(), found))
+            try:
+                found = self.active()
+                now = time.monotonic()
+                if len(found) > 1 and not self._allowed(now):
+                    self.violations.append((now, found))
+            except Exception as e:  # noqa: BLE001 - reported at teardown
+                self.monitor_errors.append(repr(e))
             time.sleep(0.05)
+
+    def lifetimes(self):
+        """Each fake's runs of active heartbeats, as (start, end, pid, node):
+        a gap longer than a few heartbeats, as when paused, ends a run"""
+        runs = []
+        for name in os.listdir(self.fabric):
+            if not (name.startswith("life-") and name.endswith(".log")):
+                continue
+            pid = int(name[len("life-") : -len(".log")])
+            run = None
+            with open(os.path.join(self.fabric, name)) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) != 3:
+                        continue
+                    t, node, active = float(parts[0]), parts[1], parts[2] == "1"
+                    if run and (not active or t - run[1] > 0.35):
+                        runs.append((run[0], run[1], pid, node))
+                        run = None
+                    if active:
+                        run = [run[0] if run else t, t]
+            if run:
+                runs.append((run[0], run[1], pid, node))
+        return sorted(runs)
+
+    def check_lifetimes(self):
+        """Overlaps of two fakes' active runs outside an allowed window: an
+        exact check, where the monitor only samples"""
+        runs = self.lifetimes()
+        overlaps = []
+        for i, (_a0, a1, apid, anode) in enumerate(runs):
+            for b0, b1, bpid, bnode in runs[i + 1 :]:
+                if b0 >= a1:
+                    break
+                if bpid != apid and not self._allowed(b0, min(a1, b1)):
+                    overlaps.append((anode, apid, bnode, bpid, b0, min(a1, b1)))
+        return overlaps
+
+    def first_active(self, node, after):
+        """When node's first fake that started after a time began"""
+        starts = [r[0] for r in self.lifetimes() if r[3] == node and r[0] > after]
+        return min(starts) if starts else None
+
+    def fake_pids(self, i):
+        """Node i's fake OpenSMs, paused ones included"""
+        return list(runner_mod.processes("fake", self.fabric, f"node-{i}"))
+
+    def watchdog_pids(self, i):
+        return list(runner_mod.processes("watchdog", self.fabric, f"node-{i}"))
+
+    def generations(self, i):
+        """The generations node i's fakes swept, in order"""
+        path = os.path.join(self.fabric, f"generations-node-{i}.log")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [int(line.split()[2]) for line in f if line.strip()]
 
     def start(self, i):
         settings = {
@@ -173,7 +272,7 @@ class Cluster:
             "config_dir": str(self.tmp / f"config-{i}"),
             "state_dir": str(self.tmp / f"state-{i}"),
             "fabric": self.fabric,
-            "timings": TIMINGS,
+            "timings": self.timings,
         }
         log = open(self.tmp / f"instance-{i}.log", "a")  # noqa: SIM115
         self.processes[i] = subprocess.Popen(
@@ -213,13 +312,14 @@ class Cluster:
                 process.send_signal(signal.SIGCONT)
                 process.kill()
                 process.wait()
-        # Fake OpenSMs that outlived their instances, if a test failed
-        for entry in os.listdir(self.fabric):
-            if entry.startswith("sm-"):
+        # Fake OpenSMs and watchdogs that outlived their instances, if a
+        # test failed, registered or not, paused or not
+        for kind in ("watchdog", "fake"):
+            for pid in runner_mod.processes(kind, self.fabric):
                 try:
-                    with open(os.path.join(self.fabric, entry)) as f:
-                        os.kill(json.load(f)["pid"], signal.SIGKILL)
-                except (OSError, ValueError, KeyError):
+                    os.kill(pid, signal.SIGCONT)
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
                     pass
 
     def logs(self):
@@ -258,7 +358,7 @@ class Cluster:
 
 
 @pytest.fixture
-def cluster(galera, tmp_path):
+def cluster(galera, tmp_path, request):
     root = sa.create_engine(url(1, galera, ""))
     with root.begin() as connection:
         connection.exec_driver_sql("DROP DATABASE IF EXISTS afm")
@@ -269,17 +369,38 @@ def cluster(galera, tmp_path):
     with sessionmaker() as session:
         session.add(db.ExpectedSwitch(guid=f"{runner_mod.SWITCH:016x}"))
         session.commit()
-    cluster = Cluster(tmp_path, galera)
+    marker = request.node.get_closest_marker("timings")
+    cluster = Cluster(tmp_path, galera, marker.kwargs if marker else None)
     for i in NODES:
         cluster.start(i)
     yield cluster
+    monitor_alive = cluster._monitor.is_alive()
     cluster.stop()
     for i in NODES:
         query(i, galera, "SET GLOBAL wsrep_provider_options='gmcast.isolate=0'")
         docker("unpause", f"afm-galera-{i}", check=False)
-    if cluster.violations:
+    # So that the next test starts with a Primary component of three
+    for i in NODES:
+        wait_for(
+            lambda i=i: (
+                query(
+                    i, galera, "show status like 'wsrep_cluster_size'"
+                ).stdout.split()[-1:]
+                == ["3"]
+            ),
+            120,
+            f"node {i} back in a cluster of three",
+        )
+    overlaps = cluster.check_lifetimes()
+    if cluster.violations or overlaps:
         print(cluster.logs())
-    assert not cluster.violations, f"Two masters at once: {cluster.violations[:3]}"
+    assert monitor_alive and not cluster.monitor_errors, (
+        f"The monitor failed: {cluster.monitor_errors[:3]}"
+    )
+    assert not cluster.violations, f"Two OpenSMs at once: {cluster.violations[:3]}"
+    assert not overlaps, (
+        f"Two OpenSMs' lifetimes overlap: {overlaps[:3]}, allowed: {cluster.allowed}"
+    )
 
 
 NETWORK = "c13bba05-eb07-45ba-ace2-765706b2d70{}"
@@ -398,7 +519,7 @@ def _operator(cluster):
     from alternative_fabric_manager.ha import lease as lease_mod
 
     config = config_mod.Config(
-        token=TOKEN, connection=url(1, cluster.password), **TIMINGS
+        token=TOKEN, connection=url(1, cluster.password), **cluster.timings
     )
     sessionmaker = db.make_sessionmaker(config.connection, config.call_timeout)
     return config, lease_mod.GaleraLease(sessionmaker), sessionmaker
@@ -479,3 +600,103 @@ def test_a_candidate_whose_link_is_down_doesnt_take_over(cluster):
         f.write("down")
     cluster.signal(leader, signal.SIGKILL)
     assert cluster.wait_leader(other_than=leader) == up
+
+
+def _not_completed(cluster, via, job):
+    status, body = cluster.request(via, "GET", "/" + job)
+    assert status == 200 and body["Status"] in ("Pending", "Running"), body
+
+
+def _paused_or_alive(pids):
+    return any(runner_mod.process_state(pid) not in (None, "Z", "X") for pid in pids)
+
+
+@pytest.mark.timings(watchdog_timeout=12.0)
+def test_the_unconfirmed_wait_outlasts_a_paused_managers_opensm(cluster):
+    # T_watchdog above T, as in production (45 s over 30 s): a paused
+    # manager's watchdog kills its OpenSM only after a successor sees the
+    # lease expire, so only the unconfirmed wait keeps the two apart.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    old = cluster.fake_pids(leader)
+    assert old
+    cluster.signal(leader, signal.SIGSTOP)
+    bumped = wait_for(
+        lambda: time.monotonic() if lease.read().term > term else None,
+        cluster.timings["lease_timeout"] + 20,
+        "a takeover",
+    )
+    # The wait is exercised: the old OpenSM still runs when the lease moves.
+    assert _paused_or_alive(old), "the watchdog killed OpenSM before the takeover"
+    successor = cluster.wait_leader(other_than=leader)
+    started = cluster.first_active(f"node-{successor}", after=0)
+    assert started - bumped >= cluster.timings["watchdog_timeout"] - 1, (
+        f"the successor's OpenSM started {started - bumped:.1f} s after the "
+        "takeover, within the unconfirmed wait"
+    )
+    # The teardown checks that the two OpenSMs' lifetimes never overlapped.
+    cluster.signal(leader, signal.SIGCONT)
+    apply_change(cluster, successor, 1)
+
+
+def test_a_paused_nodes_stale_opensm_completes_no_job(cluster):
+    # The known limitation (see specs/ha.md, Fencing): a whole node paused,
+    # manager, watchdog and OpenSM, then only its OpenSM resumed after a
+    # takeover, acts as a second master until its watchdog resumes and
+    # kills it. No job may complete meanwhile.
+    leader = cluster.wait_leader()
+    apply_change(cluster, leader, 1)
+    watchdogs, fakes = cluster.watchdog_pids(leader), cluster.fake_pids(leader)
+    assert watchdogs and fakes
+    cluster.signal(leader, signal.SIGSTOP)
+    for pid in (*watchdogs, *fakes):
+        os.kill(pid, signal.SIGSTOP)
+    successor = cluster.wait_leader(other_than=leader)
+    _config, _lease, sessionmaker = _operator(cluster)
+    with cluster.two_allowed():
+        for pid in fakes:
+            os.kill(pid, signal.SIGCONT)
+        job = _send(cluster, successor, "/cloudx/Network", network(2, 102))
+        # Several checks' and sweeps' worth, with both masters acting
+        end = time.monotonic() + 10 * cluster.timings["check_interval"]
+        while time.monotonic() < end:
+            _not_completed(cluster, successor, job)
+            time.sleep(0.5)
+        with sessionmaker() as session:
+            assert session.get(db.Applied, 1).contested
+        # Its watchdog resumes, finds its lease lapsed, and kills it.
+        for pid in watchdogs:
+            os.kill(pid, signal.SIGCONT)
+        wait_for(lambda: not _paused_or_alive(fakes), 10, "the stale OpenSM killed")
+    cluster.signal(leader, signal.SIGCONT)
+    # Only now, after a check that passes and a sweep after it
+    cluster.job_completes(successor, job, TAKEOVER + 60)
+
+
+def test_a_job_in_flight_completes_on_the_successors_sweep(cluster):
+    leader = cluster.wait_leader()
+    follower = next(i for i in NODES if i != leader)
+    _config, lease, sessionmaker = _operator(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGSTOP)
+    job = _send(cluster, follower, "/cloudx/Network", network(3, 103))
+    with sessionmaker() as session:
+        generation = session.scalar(sa.select(sa.func.max(db.Job.generation)))
+    # No OpenSM can sweep it until the successor's starts.
+    while lease.read().term == term:
+        _not_completed(cluster, follower, job)
+        time.sleep(0.5)
+    successor = cluster.wait_leader(other_than=leader)
+    cluster.job_completes(follower, job, TAKEOVER + 60)
+    # On evidence: the successor's OpenSM swept a file with the job in it,
+    # and the sweep that counted is of the current term.
+    assert max(cluster.generations(successor), default=-1) >= generation
+    assert not cluster.generations(leader) or (
+        max(cluster.generations(leader)) < generation
+    )
+    with sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        assert applied.term == lease.read().term > term
+        assert applied.generation >= generation
+    cluster.signal(leader, signal.SIGCONT)

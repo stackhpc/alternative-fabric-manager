@@ -43,3 +43,6 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "timings(**overrides): HA timings for a functional test's cluster",
+]
