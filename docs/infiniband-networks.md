@@ -100,7 +100,8 @@ network creation to the SDN controller"
 (https://review.opendev.org/c/x/networking-mlnx/+/1014376), and Neutron
 must allow flat networks on `ibphysnet`. Create it as above with
 `--provider-network-type flat` and no `--provider-segment`, or with
-Kayobe (see [kayobe.md](kayobe.md#creating-the-network-with-kayobe)).
+openstack-config (see
+[kayobe.md](kayobe.md#creating-the-network-with-openstack-config)).
 
 ## Booting instances
 

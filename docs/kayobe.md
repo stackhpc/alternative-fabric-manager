@@ -667,14 +667,15 @@ on it. How to set it depends on the Kayobe release:
 The resulting port, and how to enroll one by hand, are in
 [infiniband-networks.md](infiniband-networks.md#bare-metal-ports).
 
-## Creating the network with Kayobe
+## Creating the network with openstack-config
 
 Networks are usually created as in
 [infiniband-networks.md](infiniband-networks.md#creating-networks). To
-have Kayobe create a flat InfiniBand network instead, with its
-`openstack_networks`, in `etc/kayobe/openstack-config.yml` or wherever the
-deployment keeps them (without Ironic, it needs `flat_networks`, under
-[For both](#for-both)):
+create a flat InfiniBand network with
+[openstack-config](https://github.com/stackhpc/openstack-config) instead,
+add it to `openstack_networks` in its
+`etc/openstack-config/openstack-config.yml` (without Ironic, the network
+needs `flat_networks`, under [For both](#for-both)):
 
 ```yaml
 openstack_networks:
