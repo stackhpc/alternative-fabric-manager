@@ -146,10 +146,12 @@ def url(i, password, database="afm"):
 class Cluster:
     """Three instances, a fabric directory, and a monitor of OpenSMs"""
 
-    def __init__(self, tmp_path, password, timings=None):
+    def __init__(self, tmp_path, password, timings=None, env=None):
         self.tmp = tmp_path
         self.password = password
         self.timings = dict(TIMINGS, **(timings or {}))
+        # The instances' environment, as for the fakes' settings
+        self.env = dict(os.environ, **(env or {}))
         self.fabric = str(tmp_path / "fabric")
         os.makedirs(self.fabric)
         self.processes = {}
@@ -279,6 +281,7 @@ class Cluster:
             [sys.executable, "-m", "tests.functional.instance", json.dumps(settings)],
             stdout=log,
             stderr=subprocess.STDOUT,
+            env=self.env,
             cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
         )
 
@@ -369,8 +372,14 @@ def cluster(galera, tmp_path, request):
     with sessionmaker() as session:
         session.add(db.ExpectedSwitch(guid=f"{runner_mod.SWITCH:016x}"))
         session.commit()
-    marker = request.node.get_closest_marker("timings")
-    cluster = Cluster(tmp_path, galera, marker.kwargs if marker else None)
+    timings = request.node.get_closest_marker("timings")
+    env = request.node.get_closest_marker("env")
+    cluster = Cluster(
+        tmp_path,
+        galera,
+        timings.kwargs if timings else None,
+        env.kwargs if env else None,
+    )
     for i in NODES:
         cluster.start(i)
     yield cluster
@@ -700,3 +709,137 @@ def test_a_job_in_flight_completes_on_the_successors_sweep(cluster):
         assert applied.term == lease.read().term > term
         assert applied.generation >= generation
     cluster.signal(leader, signal.SIGCONT)
+
+
+def _isolate(cluster, i, on):
+    query(
+        i,
+        cluster.password,
+        f"SET GLOBAL wsrep_provider_options='gmcast.isolate={int(on)}'",
+    )
+
+
+def _unstoppable(cluster, i, on):
+    path = os.path.join(cluster.fabric, f"unstoppable-node-{i}")
+    if on:
+        with open(path, "w") as f:
+            f.write("fault")
+    elif os.path.exists(path):
+        os.unlink(path)
+
+
+def test_an_opensm_that_cant_be_stopped_holds_every_job(cluster):
+    # A leader whose self-stop and watchdog both fail (see Why the
+    # unconfirmed wait is enough): its OpenSM ignores the ask, so after the
+    # unconfirmed wait two OpenSMs act, and the fabric checks must hold
+    # every job until the old one stops.
+    leader = cluster.wait_leader()
+    apply_change(cluster, leader, 1)
+    watchdogs, fakes = cluster.watchdog_pids(leader), cluster.fake_pids(leader)
+    assert watchdogs and fakes
+    for pid in watchdogs:
+        os.kill(pid, signal.SIGSTOP)
+    _unstoppable(cluster, leader, True)
+    with cluster.two_allowed():
+        isolated = time.monotonic()
+        _isolate(cluster, leader, True)
+        # The majority's successor starts its OpenSM only after the lease
+        # expires and the unconfirmed wait, with the old one still running.
+        successor = wait_for(
+            lambda: next(
+                (i for i in NODES if i != leader and cluster.fake_pids(i)), None
+            ),
+            TAKEOVER + 30,
+            "the successor's OpenSM",
+        )
+        started = cluster.first_active(f"node-{successor}", after=0)
+        timings = cluster.timings
+        assert started - isolated >= (
+            timings["lease_timeout"]
+            + timings["watchdog_timeout"]
+            - timings["ha_period"]
+        )
+        assert _paused_or_alive(fakes)
+        job = _send(cluster, successor, "/cloudx/Network", network(2, 102))
+        end = time.monotonic() + 10 * timings["check_interval"]
+        while time.monotonic() < end:
+            _not_completed(cluster, successor, job)
+            time.sleep(0.5)
+        # The old node rejoins Galera, and its watchdog resumes, finds its
+        # lease lapsed, and kills OpenSM.
+        _isolate(cluster, leader, False)
+        for pid in watchdogs:
+            os.kill(pid, signal.SIGCONT)
+        wait_for(lambda: not _paused_or_alive(fakes), 10, "the old OpenSM killed")
+    _unstoppable(cluster, leader, False)
+    cluster.job_completes(successor, job, TAKEOVER + 60)
+
+
+@pytest.mark.env(AFM_FAKE_HONOURS_ASK="1")
+def test_an_opensm_that_cant_be_stopped_honours_the_ask(cluster):
+    # The same fault, with an OpenSM that honours SMInfo DISABLE: the
+    # successor's ask makes it NOT-ACTIVE, so two never act at once.
+    leader = cluster.wait_leader()
+    watchdogs, fakes = cluster.watchdog_pids(leader), cluster.fake_pids(leader)
+    for pid in watchdogs:
+        os.kill(pid, signal.SIGSTOP)
+    _unstoppable(cluster, leader, True)
+    _isolate(cluster, leader, True)
+    successor = cluster.wait_leader(other_than=leader)
+    # Still running, but disabled: the monitors count it as not acting.
+    assert _paused_or_alive(fakes)
+    apply_change(cluster, successor, 1)
+    _isolate(cluster, leader, False)
+    for pid in watchdogs:
+        os.kill(pid, signal.SIGCONT)
+    _unstoppable(cluster, leader, False)
+
+
+def _winner(lease, term):
+    """The node that took the lease after a term, once it has"""
+    state = lease.read()
+    if state.term > term and state.holder_node:
+        return int(state.holder_node.rsplit("-", 1)[1]), state.term
+    return None
+
+
+def test_a_winner_that_dies_mid_takeover_is_waited_for(cluster):
+    # The winner takes the lease and is killed during its unconfirmed wait,
+    # before it starts OpenSM: the next takeover waits for both targets.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGKILL)
+    winner, winner_term = wait_for(
+        lambda: _winner(lease, term), cluster.timings["lease_timeout"] + 20, "a winner"
+    )
+    cluster.signal(winner, signal.SIGKILL)
+    assert not cluster.fake_pids(winner), "the winner started OpenSM already"
+    third = next(i for i in NODES if i not in (leader, winner))
+    assert cluster.wait_leader(other_than=leader) == third
+    assert lease.read().term == winner_term + 1
+    assert cluster.first_active(f"node-{winner}", after=0) is None
+    apply_change(cluster, third, 1)
+
+
+def test_a_winner_paused_mid_takeover_doesnt_start_opensm_later(cluster):
+    # As above, but the winner is paused, and resumes once the third node
+    # leads: it has lost the lease, and must not start OpenSM.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGKILL)
+    winner, winner_term = wait_for(
+        lambda: _winner(lease, term), cluster.timings["lease_timeout"] + 20, "a winner"
+    )
+    cluster.signal(winner, signal.SIGSTOP)
+    assert not cluster.fake_pids(winner), "the winner started OpenSM already"
+    third = next(i for i in NODES if i not in (leader, winner))
+    assert cluster.wait_leader(other_than=leader) == third
+    assert lease.read().term == winner_term + 1
+    cluster.signal(winner, signal.SIGCONT)
+    # Past its start timeout and a few periods: it never starts one.
+    time.sleep(cluster.timings["start_timeout"] + 5)
+    assert cluster.first_active(f"node-{winner}", after=0) is None
+    assert cluster.leader() == third
+    apply_change(cluster, winner, 1)

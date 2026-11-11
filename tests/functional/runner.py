@@ -131,8 +131,14 @@ class ProcessRunner:
             return None
         return 1
 
+    def _unstoppable(self):
+        """A test's fault: this node's OpenSM can't be stopped, nor its stop
+        verified, as when self-stop fails (see Why the unconfirmed wait is
+        enough). Only the watchdog's own kill still works."""
+        return os.path.exists(os.path.join(self.fabric_dir, f"unstoppable-{self.node}"))
+
     def verify_stopped(self):
-        return not self._own_sms()
+        return not self._unstoppable() and not self._own_sms()
 
     def ask(self, node):
         with open(os.path.join(self.fabric_dir, f"ask-{node}"), "w") as f:
@@ -237,6 +243,8 @@ class ProcessRunner:
         )
 
     def stop(self):
+        if self._unstoppable():
+            return
         with open(os.path.join(self.state_dir, wd.STOP), "w") as f:
             f.write("stop")
         if self.watchdog is not None:

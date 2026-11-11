@@ -45,4 +45,5 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 testpaths = ["tests"]
 markers = [
     "timings(**overrides): HA timings for a functional test's cluster",
+    "env(**variables): environment for a functional test's instances",
 ]
