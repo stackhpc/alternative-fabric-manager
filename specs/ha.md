@@ -517,6 +517,21 @@ its OpenSM is known stopped and unable to start by itself:
    term the node holds, so OpenSM can't come back by itself.
 3. If its configuration's hash is allowed, it becomes a candidate again.
 
+### Retiring a node
+
+Stop a node's manager cleanly before taking the node out of service, as
+with `docker stop`: it steps down if it leads, releasing the lease, and
+marks its node row stopped, which no instance counts as a live candidate.
+Its row stays, and nothing acts on it. A frozen leader's node needs an
+unfreeze first (see Freeze). A node that dies uncleanly instead stops
+counting as live once its heartbeat has been unchanged for `T`, and its
+target entry, if it has one, leaves at the next takeover, as in
+Fencing. There is no command to forget a node's row: nothing reads its
+adapters' GUIDs or configuration hash yet. One comes with the checks that
+will read them, managed nodes' SMs in the fabric checks and configuration
+epochs, since a retired node's adapters, reused elsewhere, would then
+count as a managed node's.
+
 ### Seeing the host's processes
 
 The manager runs in its own PID namespace, under `docker run --init` as
@@ -880,7 +895,13 @@ the OpenStack services do. SQLAlchemy makes the backend a
   than `create_all` at startup.
 - **One instance per name.** An instance registers a UUID on its node row
   at start. A restarted instance takes over its name once the old UUID's
-  heartbeat has been unchanged for `T`.
+  heartbeat has been unchanged for `T`. An instance whose heartbeat finds
+  no row for its node, as after someone deleted it by hand, puts its row
+  back, so that it is never live without one, unseen by the others, but
+  only while it is a candidate or leads, not while it registers a new UUID
+  or once it has stopped. A row that exists is left alone, whichever UUID
+  it holds: one that holds another instance's means that instance
+  registered on the name, and this one logs an error.
 
 All three instances are active HAProxy backends, round robin with no
 session stickiness, and HAProxy checks `/healthz`, which fails while the
@@ -1021,6 +1042,9 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 - [ ] `--confirm-fenced <node>`, with `fence_manual` (see Manual fencing).
 - [ ] A CLI to record configuration epochs,
       confirm or remove expected switches, and force a step-down.
+- [ ] With the managed-SM fabric check and configuration epochs, a
+      command to forget a retired node's row, and the nodes in `--status`
+      (see Retiring a node).
 - [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
       in containers, with faults injected: the leader killed, paused, cut
       off from the database or the network; a winner dying mid-takeover; a

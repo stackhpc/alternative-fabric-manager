@@ -794,6 +794,16 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   If its manager is paused or hung, stop its OpenSM, check that no
   `opensm` process runs on that host, and run `--force-unfreeze`; another
   instance then takes over.
+- **Retiring a controller**: stop AFM's container on it cleanly, with
+  `${ENGINE:-docker} stop alternative_fabric_manager`, before taking it
+  out of service, and unfreeze first if the cluster is frozen. It marks
+  itself stopped, so the others never count it as a candidate, and if it
+  leads, it releases the lease and another instance takes over at once.
+  (If it couldn't verify its OpenSM stopped, or reach the database, the
+  takeover waits for the lease to expire instead.) Its row in AFM's
+  database stays, and is harmless; there is no command to remove it, and
+  don't delete it by hand. Removing the host from the `controllers` group
+  then drops it from HAProxy's backends at the next deploy.
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk
