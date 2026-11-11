@@ -50,29 +50,33 @@ The result:
 
 AFM puts a port in its network's partition by the GUID in the port's DHCP
 client ID, however the port is attached. What differs is who binds the
-port and where the GUID comes from:
+port and where the client ID comes from. Neither needs the user to know a
+GUID:
 
 | | Virtualised instances | Bare metal nodes (Ironic) |
 | --- | --- | --- |
-| The port | `vnic_type` `direct`, on a virtual function | `vnic_type` `baremetal`, on the node's adapter |
+| The port | `vnic_type` `direct`, on a virtual function: create it first, then `openstack server create --port` | `vnic_type` `baremetal`, on the node's adapter: `openstack server create --network` is enough |
 | Bound by | `mlnx_infiniband` (VIF type `ib_hostdev`) | `mlnx_sdn_assist` |
-| Its GUID | The virtual function's, in the client ID `mlnx_infiniband` derives from the port's MAC address | The node's port's, in the client ID of its Ironic port (`--extra client-id=...`) |
-| Hosts need | Virtual functions and `ib_ipoib` on the compute hosts; kolla's SR-IOV and Mellanox agents and physnet mappings | Nothing on the node; Ironic's `neutron` network interface |
-| `[sdn] bind_normal_ports` | `False` | `True`, with `bind_normal_ports_physnets = ibphysnet`, so that the network's DHCP and router ports bind |
+| Its client ID | Derived by `mlnx_infiniband` from the port's MAC address, as the virtual function's GUID is | Copied by Ironic from its port's `extra` `client-id`, which inspection records |
+| Hosts need | Virtual functions and `ib_ipoib` on the compute hosts; kolla's SR-IOV and Mellanox agents | An IPA image with the `mellanox` element; inspection that sets the port's physical network |
 
 Both need `mlnx_sdn_assist`, the controllers' `ib_umad`, and VLAN networks
 on `ibphysnet` for partitioning: a flat network's ports all share one
 partition. One deployment can have both; configure each part below that
 applies.
 
+`mlnx_sdn_assist` only binds a bare metal port that has a client ID, and no
+option turns that off: the client ID is where AFM reads the GUID to put in
+the partition. A port without one is left to the other drivers, and fails
+to bind on `ibphysnet`. Let inspection record it rather than typing it in.
+
 ## InfiniBand hosts
 
 Every controller needs `ib_umad`. The compute hosts need virtual functions
 only for virtualised instances; skip their plays for bare metal alone. The
-in-kernel Mellanox drivers are enough: OFED isn't needed. Load the
-modules, create the virtual functions, and reboot if that needs it, with a
-playbook that runs after `kayobe overcloud provision` and before `kayobe
-overcloud host configure`.
+in-kernel Mellanox drivers are enough: OFED isn't needed, though the
+`sriov` role installs NVIDIA's firmware tools to enable SR-IOV in the
+adapter's firmware.
 
 The virtual functions to create, per device, in
 `etc/kayobe/inventory/group_vars/compute/sriov`:
@@ -88,7 +92,7 @@ sriov_devices:
 Create only as many as you need: many virtual functions break `ip a` (see
 Known limitations).
 
-The playbook's second play runs on a `sriov` group. Add the compute hosts
+The playbook's third play runs on a `sriov` group. Add the compute hosts
 to it in `etc/kayobe/inventory/groups`:
 
 ```ini
@@ -140,11 +144,6 @@ compute
 
 - name: Reboot when required
   hosts: overcloud
-  vars:
-    # This runs after provisioning and before host configure, so Kayobe's
-    # user and virtualenvs may not exist yet: use the image's user.
-    ansible_user: "cloud-user"
-    ansible_python_interpreter: "/usr/bin/python3"
   tags:
     - reboot
   tasks:
@@ -164,11 +163,18 @@ collections:
     version: 1.3.0
 ```
 
-Install it with `kayobe control host bootstrap`, then run the playbook:
+Install it with `kayobe control host bootstrap`. The playbook uses Kayobe's
+user and virtualenv, so run it after `kayobe overcloud host configure`,
+before `kayobe overcloud service deploy`, or as a hook after host
+configure:
 
 ```sh
 kayobe playbook run $KAYOBE_CONFIG_PATH/ansible/sriov.yml
 ```
+
+The last play reboots every host whose virtual functions needed it, all
+at once. On a running cloud, limit it to a few hosts at a time
+(`--limit`), or skip it (`--skip-tags reboot`) and reboot them yourself.
 
 ## Secrets
 
@@ -460,46 +466,79 @@ kolla_neutron_ml2_network_vlan_ranges:
   - physical_network: ibphysnet
 ```
 
-The mechanism drivers, in the same file. ML2 tries them in order when it
-binds a port:
+The mechanism drivers, in the same file. This list replaces kolla's
+defaults, so keep any others the deployment uses, such as `baremetal`.
+ML2 tries them in order when it binds a port:
 
 ```yaml
 kolla_neutron_ml2_mechanism_drivers:
-  # Binds bare metal ports on the InfiniBand network, ahead of
-  # genericswitch, and sends every network and port to AFM.
-  - mlnx_sdn_assist
-  # ovn must come before mlnx_infiniband, or mlnx_infiniband sets
-  # extra_dhcp_opts on ports that ovn binds.
   - ovn
   # Binds virtualised instances' direct ports on the InfiniBand network to
-  # virtual functions, and gives them the client ID that holds the GUID.
+  # virtual functions. ovn doesn't bind direct ports without switchdev, so
+  # the two don't compete.
   - mlnx_infiniband
+  # Binds bare metal ports that have a client ID, and sends each network on
+  # ibphysnet, and each bound port with a client ID, to AFM. Before
+  # genericswitch, which binds bare metal ports too.
+  - mlnx_sdn_assist
   # Only with Ironic on Ethernet switches.
   - genericswitch
-  # Only for virtualised instances.
+  # Only for virtualised instances: kolla enables the SR-IOV agent for
+  # Nova's PCI passthrough list. After mlnx_infiniband, which must bind
+  # InfiniBand direct ports.
   - sriovnicswitch
 ```
 
-Point `mlnx_sdn_assist` at AFM's VIP in
-`etc/kayobe/kolla/config/neutron/ml2_conf.ini`:
+`mlnx_infiniband` must only add client IDs to InfiniBand ports: that needs
+networking-mlnx with "Only add client-id to InfiniBand ports".
+
+Point `mlnx_sdn_assist` at AFM's VIP, and give `ibphysnet` its MTU, in
+`etc/kayobe/kolla/config/neutron/ml2_conf.ini`. Kayobe templates this
+file with its own variables, so the token is Kayobe's secret:
 
 ```ini
+[ml2]
+# Neutron caps every network's MTU at global_physnet_mtu, 1500 by default.
+# Raise that (see neutron.conf below), and keep the Ethernet networks at
+# their own MTU.
+path_mtu = 1500
+physical_network_mtus = physnet1:1500,ibphysnet:2044
+
 [sdn]
 url = http://{{ kolla_internal_fqdn }}:8090/ufmRestV3
 domain = cloudx
-token = {{ afm_api_token }}
+token = {{ secrets_afm_api_token }}
 sync_enabled = True
 physical_networks = ibphysnet
-# Virtualised instances only. With bare metal nodes, set:
-# bind_normal_ports = True
-# bind_normal_ports_physnets = ibphysnet
 bind_normal_ports = False
 ```
 
-kolla-ansible renders `{{ afm_api_token }}` from `passwords.yml`. Leave
-`[sdn] retry_count` at its default, -1: a port deletion that runs out of
-retries holds every port with the same GUID in `ERROR` until an operator
-clears it, and AFM answers 503 to every request while frozen.
+and `etc/kayobe/kolla/config/neutron.conf`, unless `global_physnet_mtu` is
+already 2044 or more:
+
+```ini
+[DEFAULT]
+global_physnet_mtu = 2044
+```
+
+2044 is IPoIB's datagram-mode MTU on a 2048-byte InfiniBand MTU. Use the
+deployment's real Ethernet MTUs in place of 1500.
+
+Leave `bind_normal_ports` off: it lets `mlnx_sdn_assist` bind DHCP and
+router ports on `ibphysnet`, which AFM never puts in a partition, so they
+couldn't reach the instances anyway (see Known limitations). Leave `[sdn]
+retry_count` at its default, -1: AFM answers 503 to every request while
+frozen, and with a finite count a long freeze would put new ports in
+`ERROR`, and a port deletion that runs out of retries holds every port
+with the same GUID in `ERROR` until an operator clears it.
+
+Without Ironic, kolla only allows flat networks on the physical networks
+it knows of. For a flat InfiniBand network, add to `ml2_conf.ini`:
+
+```ini
+[ml2_type_flat]
+flat_networks = physnet1,ibphysnet
+```
 
 ### For virtualised instances
 
@@ -511,7 +550,8 @@ kolla_enable_neutron_mlnx: true
 ```
 
 Map the InfiniBand physical network to the compute hosts' device in
-`etc/kayobe/kolla/globals.yml`:
+`etc/kayobe/kolla/globals.yml`. kolla also builds Nova's PCI passthrough
+list from the SR-IOV mapping:
 
 ```yaml
 neutron_sriov_physnet_mappings:
@@ -520,30 +560,88 @@ neutron_mlnx_physnet_mappings:
   ibphysnet: ibs4f0
 ```
 
-A takeover can hold a port's job for up to the job timeout, 300 s, so Nova
-must wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
+Nova must schedule instances only to hosts with a free virtual function,
+and, since a takeover can hold a port's job for up to the job timeout,
+300 s, wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
 
 ```ini
 [DEFAULT]
 vif_plugging_timeout = 420
+
+[filter_scheduler]
+# Nova's default filters, and PciPassthroughFilter
+enabled_filters = ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter,PciPassthroughFilter
 ```
+
+Check `enabled_filters` against your Nova release's default and any
+filters the deployment already adds.
 
 ### For bare metal nodes
 
 Ironic needs the `neutron` network interface, and must fail a deployment
 whose port fails to bind: keep `[neutron] fail_on_port_binding_failure =
-True`, the default. Its wait for ports needs the same margin as Nova's,
-over the 300 s job timeout.
+True`, the default. Its wait for ports, `[agent]
+neutron_agent_max_attempts` × `neutron_agent_status_retry_interval`, is
+1000 s by default, longer than a takeover's 300 s.
 
-Give each node's InfiniBand port its client ID and physical network when
-you enroll it. The client ID is 20 octets, of which the last 8 are the
-port's GUID:
+Inspection records each InfiniBand port's client ID in the Ironic port's
+`extra` `client-id`, if the inspection image can see the port. Add the
+Mellanox drivers to IPA in `etc/kayobe/ipa.yml`:
+
+```yaml
+ipa_build_dib_elements_extra:
+  # Installs packages and loads the drivers that Mellanox adapters need.
+  - "mellanox"
+```
+
+The port also needs `ibphysnet` as its physical network. With
+ironic-inspector and
+[stackhpc-inspector-plugins](https://github.com/stackhpc/stackhpc-inspector-plugins),
+the `ib_physnet` hook sets it on InfiniBand ports, in
+`etc/kayobe/inspector.yml`:
+
+```yaml
+inspector_processing_hooks_extra:
+  # Assigns physical_network to InfiniBand ports.
+  - ib_physnet
+  # For Ethernet ports with genericswitch: the switch's name in
+  # local_link_connection, and a physical network from it.
+  - system_name_llc
+  - system_name_physnet
+```
+
+and `etc/kayobe/kolla/config/ironic-inspector.conf`:
+
+```ini
+[port_physnet]
+ib_physnet = ibphysnet
+```
+
+After inspection, the node's InfiniBand port looks like this, its client ID
+ending in its GUID:
+
+```
+$ openstack baremetal port list --node <node> --long -f yaml
+...
+- Address: 0c:42:a1:06:68:f6
+  Extra: client-id='ff:00:00:00:00:00:02:00:00:02:c9:00:0c:42:a1:03:00:06:68:f6'
+  Local Link Connection: {}
+  Physical Network: ibphysnet
+  PXE boot enabled: false
+```
+
+To enroll a port by hand instead, set both: the client ID is 20 octets,
+the last 8 the port's GUID.
 
 ```sh
 openstack baremetal port create <MAC address> --node <node UUID> \
   --physical-network ibphysnet \
   --extra client-id=ff:00:00:00:00:00:02:00:00:02:c9:00:<GUID, 8 octets>
 ```
+
+On ConnectX adapters the port's GUID is usually its MAC address with
+`03:00` in the middle, as above, but read it from `ibstat` on the node
+rather than assume it.
 
 ## The InfiniBand network
 
@@ -568,19 +666,20 @@ openstack subnet create infiniband-100 \
   --no-dhcp
 ```
 
-2044 is IPoIB's datagram-mode MTU on a 2048-byte InfiniBand MTU. For bare
-metal nodes that get their IPoIB addresses by DHCP, use `--dhcp` instead.
-`--project` gives the network to one project; to share it with several,
-leave it out and add `openstack network rbac create --type network --action
-access_as_shared --target-project <project ID> <network ID>` for each.
+Instances get their IPoIB addresses from the config drive, or statically:
+nothing serves DHCP inside a partition. `--project` gives the network to
+one project; to share it with several, leave it out and add `openstack
+network rbac create --type network --action access_as_shared
+--target-project <project ID> <network ID>` for each. The ports inherit
+the network's disabled port security.
 
 A flat network on `ibphysnet` has no partition of its own: AFM puts the
 ports of every flat network in one shared partition, `[opensm] flat_pkey`,
 so they can all reach each other. It also needs networking-mlnx's "Send
 flat network creation to the SDN controller"
-(https://review.opendev.org/c/x/networking-mlnx/+/1014376). With Kayobe's
-`openstack_networks`, in `etc/kayobe/openstack-config.yml` or wherever the
-deployment keeps them:
+(https://review.opendev.org/c/x/networking-mlnx/+/1014376), and, without
+Ironic, `flat_networks` (above). With Kayobe's `openstack_networks`, in
+`etc/kayobe/openstack-config.yml` or wherever the deployment keeps them:
 
 ```yaml
 openstack_networks:
@@ -602,9 +701,8 @@ openstack_subnet_infiniband:
   name: "{{ openstack_network_infiniband_name }}"
   cidr: "172.26.0.0/24"
   enable_dhcp: false
-  # disable_gateway_ip alone leaves a gateway, so set an unusable one too.
-  gateway_ip: 0.0.0.0
-  disable_gateway_ip: true
+  # Without gateway_ip, the os_networks role creates the subnet without a
+  # gateway.
   allocation_pool_start: "172.26.0.10"
   allocation_pool_end: "172.26.0.250"
 ```
@@ -613,8 +711,29 @@ Share it with `openstack network rbac create` as above:
 `openstack_networks_rbac` fails when it finds more than one matching RBAC
 policy.
 
-A virtualised instance gets a virtual function from a port with
-`vnic_type` `direct`, for example in Terraform:
+### Booting instances
+
+A bare metal instance just names the network. Nova creates its port, and
+Ironic binds it as `baremetal` with the client ID from the node's Ironic
+port:
+
+```sh
+openstack server create --flavor baremetal --image <image> \
+  --network <Ethernet network> --network infiniband-100 <name>
+```
+
+A virtualised instance needs a `direct` port, created first: with
+`--network`, Nova creates a `normal` port, which nothing binds on
+`ibphysnet`, and the instance fails to boot. `mlnx_infiniband` derives the
+port's client ID from its MAC address.
+
+```sh
+openstack port create --network infiniband-100 --vnic-type direct ib0
+openstack server create --flavor <flavor> --image <image> \
+  --network <Ethernet network> --port ib0 <name>
+```
+
+or in Terraform:
 
 ```hcl
 data "openstack_networking_network_v2" "infiniband" {
@@ -622,10 +741,9 @@ data "openstack_networking_network_v2" "infiniband" {
 }
 
 resource "openstack_networking_port_v2" "infiniband" {
-  name                  = "infiniband-0"
-  network_id            = data.openstack_networking_network_v2.infiniband.id
-  admin_state_up        = true
-  port_security_enabled = false
+  name           = "ib0"
+  network_id     = data.openstack_networking_network_v2.infiniband.id
+  admin_state_up = true
   binding {
     vnic_type = "direct"
   }
@@ -639,11 +757,9 @@ resource "openstack_compute_instance_v2" "instance" {
 }
 ```
 
-or `openstack port create --network infiniband-100 --vnic-type direct
---disable-port-security <name>`. A bare metal instance just names the
-network: Nova and Ironic create its port, with the Ironic port's client ID.
-Either way the port stays `DOWN` until AFM has put its GUID in the
-network's partition.
+On a VLAN network, either kind of port stays `DOWN` until AFM has put its
+GUID in the network's partition. On a flat network it goes `ACTIVE` without
+waiting.
 
 ## A deployment check, as a hook
 
@@ -742,6 +858,11 @@ See specs/ha.md. In short: a paused node can resume as a stale master
 until its watchdog kills it, and Ask (SMInfo DISABLE) isn't sent yet; in
 both cases the new leader's fabric checks find the other master, and no job
 completes meanwhile.
+
+Nothing serves DHCP on a partitioned InfiniBand network: AFM only puts
+ports with a client ID in a partition, so a DHCP agent's port is never in
+one, and kolla's DHCP agent has no IPoIB interface driver. Use the config
+drive or static addresses.
 
 With many virtual functions on a device, such as 127, `ip a` fails with
 "Error: Buffer too small for object." (an
