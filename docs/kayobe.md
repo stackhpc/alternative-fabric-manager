@@ -58,7 +58,7 @@ GUID:
 | The port | `vnic_type` `direct`, on a virtual function: create it first, then `openstack server create --port` | `vnic_type` `baremetal`, on the node's adapter: `openstack server create --network` is enough |
 | Bound by | `mlnx_infiniband` (VIF type `ib_hostdev`) | `mlnx_sdn_assist` |
 | Its client ID | Derived by `mlnx_infiniband` from the port's MAC address, as the virtual function's GUID is | Copied by Ironic from its port's `extra` `client-id`, which inspection records |
-| Hosts need | Virtual functions and `ib_ipoib` on the compute hosts; kolla's SR-IOV and Mellanox agents | An IPA image with the `mellanox` element; inspection that sets the port's physical network |
+| Hosts need | Virtual functions and `ib_ipoib` on the compute hosts; kolla's SR-IOV and Mellanox agents | An IPA image with the Mellanox drivers; Ironic ports for the InfiniBand interfaces, with `ibphysnet` as their physical network |
 
 Both need `mlnx_sdn_assist`, the controllers' `ib_umad`, and VLAN networks
 on `ibphysnet` for partitioning: a flat network's ports all share one
@@ -203,30 +203,58 @@ reconfigure`) writes them to `$KOLLA_CONFIG_PATH/passwords.yml`.
 
 ## Variables
 
-`etc/kayobe/alternative-fabric-manager.yml`:
+`etc/kayobe/alternative-fabric-manager.yml`, laid out like Kayobe's own
+configuration files:
 
 ```yaml
-# The AFM image, and OpenSM's, which AFM starts
+---
+###############################################################################
+# Alternative fabric manager (AFM) images.
+
+# AFM's image, built from this repository's Dockerfile.
 afm_image: "ghcr.io/stackhpc/alternative-fabric-manager"
+
+# AFM's image tag.
 afm_tag: "<release>"
+
+# OpenSM's image, which AFM starts on the leader. Pin it by digest. It must
+# have python3, which runs the watchdog.
 afm_opensm_image: "ghcr.io/stackhpc/docker-opensm@sha256:<digest>"
-# The API port on each controller; HAProxy listens on the same port on the
-# internal VIP
+
+###############################################################################
+# AFM API.
+
+# The API port on each controller. HAProxy listens on the same port on the
+# internal VIP.
 afm_api_port: 8090
-# networking-mlnx's [sdn] domain
+
+# networking-mlnx's [sdn] domain.
 afm_domain: "cloudx"
-# The container's name: OpenSM's container joins its PID namespace
+
+###############################################################################
+# AFM container.
+
+# The container's name. OpenSM's container joins its PID namespace, so this
+# must match [opensm] manager_container in AFM's configuration.
 afm_container_name: "alternative_fabric_manager"
+
+# AFM's configuration directory on the host.
 afm_config_dir: "/etc/alternative-fabric-manager"
+
+# The directory the manager and OpenSM's watchdog share.
 afm_state_dir: "/run/alternative-fabric-manager"
+
 # The container API AFM uses to run OpenSM's container: Docker's socket, or,
-# with container_engine: podman, Podman's Docker-compatible one,
-# /run/podman/podman.sock (untested)
+# with container_engine: podman, Podman's Docker-compatible one (untested).
 afm_container_socket: >-
   {{ '/run/podman/podman.sock' if container_engine == 'podman'
      else '/var/run/docker.sock' }}
-# Where AFM's database is created: a host kolla-ansible manages, which has
-# the kolla_toolbox container
+
+###############################################################################
+# AFM database.
+
+# The host on which AFM's database is created: one that kolla-ansible
+# manages, so that it has the kolla_toolbox container.
 afm_database_host: "{{ groups['controllers'][0] }}"
 ```
 
@@ -494,7 +522,8 @@ networking-mlnx with "Only add client-id to InfiniBand ports".
 
 Point `mlnx_sdn_assist` at AFM's VIP, and give `ibphysnet` its MTU, in
 `etc/kayobe/kolla/config/neutron/ml2_conf.ini`. Kayobe templates this
-file with its own variables, so the token is Kayobe's secret:
+file with its own variables, so it can use `alternative-fabric-manager.yml`'s,
+and the token is Kayobe's secret:
 
 ```ini
 [ml2]
@@ -505,8 +534,8 @@ path_mtu = 1500
 physical_network_mtus = physnet1:1500,ibphysnet:2044
 
 [sdn]
-url = http://{{ kolla_internal_fqdn }}:8090/ufmRestV3
-domain = cloudx
+url = http://{{ kolla_internal_fqdn }}:{{ afm_api_port }}/ufmRestV3
+domain = {{ afm_domain }}
 token = {{ secrets_afm_api_token }}
 sync_enabled = True
 physical_networks = ibphysnet
@@ -521,8 +550,9 @@ already 2044 or more:
 global_physnet_mtu = 2044
 ```
 
-2044 is IPoIB's datagram-mode MTU on a 2048-byte InfiniBand MTU. Use the
-deployment's real Ethernet MTUs in place of 1500.
+2044 is IPoIB's datagram-mode MTU on a 2048-byte InfiniBand MTU. List
+every physical network in `physical_network_mtus`, with the deployment's
+real MTUs in place of 1500: one left out gets 2044.
 
 Leave `bind_normal_ports` off: it lets `mlnx_sdn_assist` bind DHCP and
 router ports on `ibphysnet`, which AFM never puts in a partition, so they
@@ -585,8 +615,9 @@ neutron_agent_max_attempts` × `neutron_agent_status_retry_interval`, is
 1000 s by default, longer than a takeover's 300 s.
 
 Inspection records each InfiniBand port's client ID in the Ironic port's
-`extra` `client-id`, if the inspection image can see the port. Add the
-Mellanox drivers to IPA in `etc/kayobe/ipa.yml`:
+`extra` `client-id`, if the inspection image can see the port. When Kayobe
+builds IPA (`ipa_build_images: true`), add the Mellanox drivers in
+`etc/kayobe/ipa.yml`; with a prebuilt IPA image, make sure it has them:
 
 ```yaml
 ipa_build_dib_elements_extra:
@@ -594,28 +625,49 @@ ipa_build_dib_elements_extra:
   - "mellanox"
 ```
 
-The port also needs `ibphysnet` as its physical network. With
-ironic-inspector and
-[stackhpc-inspector-plugins](https://github.com/stackhpc/stackhpc-inspector-plugins),
-the `ib_physnet` hook sets it on InfiniBand ports, in
+Inspection must also create a port for the InfiniBand interface. Kayobe's
+default only adds the interface that PXE booted, so in
 `etc/kayobe/inspector.yml`:
 
 ```yaml
-inspector_processing_hooks_extra:
-  # Assigns physical_network to InfiniBand ports.
-  - ib_physnet
-  # For Ethernet ports with genericswitch: the switch's name in
-  # local_link_connection, and a physical network from it.
-  - system_name_llc
-  - system_name_physnet
+# Add a port for every interface, including InfiniBand ones, which don't
+# PXE boot and have no IP address during inspection.
+inspector_add_ports: "all"
 ```
 
-and `etc/kayobe/kolla/config/ironic-inspector.conf`:
+The port also needs `ibphysnet` as its physical network. Without one,
+Ironic lets any network use it, so an Ethernet network's port could land
+on it. How to set it depends on the Kayobe release:
 
-```ini
-[port_physnet]
-ib_physnet = ibphysnet
-```
+- **Kayobe 19 (2025.1) and later** use Ironic's built-in inspection, whose
+  `physical-network` hook maps by IP address, which an InfiniBand interface
+  doesn't have during inspection. Set it on each InfiniBand port after
+  inspection, the ports whose `extra` has a `client-id`:
+
+  ```sh
+  openstack baremetal port set --physical-network ibphysnet <port UUID>
+  ```
+
+- **Kayobe 18 (2024.1) and earlier**, with standalone ironic-inspector and
+  [stackhpc-inspector-plugins](https://github.com/stackhpc/stackhpc-inspector-plugins),
+  can have the `ib_physnet` hook set it, in `etc/kayobe/inspector.yml`:
+
+  ```yaml
+  inspector_processing_hooks_extra:
+    # Assigns physical_network to InfiniBand ports.
+    - ib_physnet
+    # For Ethernet ports with genericswitch: the switch's name in
+    # local_link_connection, and a physical network from it.
+    - system_name_llc
+    - system_name_physnet
+  ```
+
+  and `etc/kayobe/kolla/config/ironic-inspector.conf`:
+
+  ```ini
+  [port_physnet]
+  ib_physnet = ibphysnet
+  ```
 
 After inspection, the node's InfiniBand port looks like this, its client ID
 ending in its GUID:
