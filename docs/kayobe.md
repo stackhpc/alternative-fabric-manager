@@ -14,7 +14,10 @@ The result:
   internal VIP; one of them, the leader, runs OpenSM under its watchdog;
 - AFM's database in kolla's MariaDB (Galera), created idempotently with
   the root credentials from kolla's `passwords.yml`;
-- networking-mlnx's `mlnx_sdn_assist` pointing at the VIP.
+- networking-mlnx's `mlnx_sdn_assist` pointing at the VIP, so that each
+  InfiniBand network's ports are put in its partition, for virtualised
+  instances, bare metal nodes, or both (see
+  [Virtualised and bare metal](#virtualised-and-bare-metal)).
 
 ## Requirements
 
@@ -22,6 +25,9 @@ The result:
   any instance may become leader and run OpenSM there. If the controllers
   have none, use another group's containers, such as `infra_vm_containers`,
   on hosts that do, and the same files.
+- **The `ib_umad` module on every controller**, which OpenSM uses to reach
+  the fabric, and, for virtualised instances, **virtual functions on the
+  compute hosts**: see [InfiniBand hosts](#infiniband-hosts).
 - **Docker.** AFM runs OpenSM's container through the Docker API. Podman
   is untested, and support for it is a future improvement (see below).
 - **Kayobe's own OpenSM is off**: `opensm_enabled: false`, the default. AFM
@@ -39,6 +45,130 @@ The result:
   `m_key` and `sm_key` hardening groups. Read
   [opensm-hardening.md](opensm-hardening.md) before enabling them on a
   fabric shared with hosts outside OpenStack.
+
+## Virtualised and bare metal
+
+AFM puts a port in its network's partition by the GUID in the port's DHCP
+client ID, however the port is attached. What differs is who binds the
+port and where the GUID comes from:
+
+| | Virtualised instances | Bare metal nodes (Ironic) |
+| --- | --- | --- |
+| The port | `vnic_type` `direct`, on a virtual function | `vnic_type` `baremetal`, on the node's adapter |
+| Bound by | `mlnx_infiniband` (VIF type `ib_hostdev`) | `mlnx_sdn_assist` |
+| Its GUID | The virtual function's, in the client ID `mlnx_infiniband` derives from the port's MAC address | The node's port's, in the client ID of its Ironic port (`--extra client-id=...`) |
+| Hosts need | Virtual functions and `ib_ipoib` on the compute hosts; kolla's SR-IOV and Mellanox agents and physnet mappings | Nothing on the node; Ironic's `neutron` network interface |
+| `[sdn] bind_normal_ports` | `False` | `True`, with `bind_normal_ports_physnets = ibphysnet`, so that the network's DHCP and router ports bind |
+
+Both need `mlnx_sdn_assist`, the controllers' `ib_umad`, and VLAN networks
+on `ibphysnet` for partitioning: a flat network's ports all share one
+partition. One deployment can have both; configure each part below that
+applies.
+
+## InfiniBand hosts
+
+Every controller needs `ib_umad`. The compute hosts need virtual functions
+only for virtualised instances; skip their plays for bare metal alone. The
+in-kernel Mellanox drivers are enough: OFED isn't needed. Load the
+modules, create the virtual functions, and reboot if that needs it, with a
+playbook that runs after `kayobe overcloud provision` and before `kayobe
+overcloud host configure`.
+
+The virtual functions to create, per device, in
+`etc/kayobe/inventory/group_vars/compute/sriov`:
+
+```yaml
+---
+sriov_devices:
+  # InfiniBand
+  - name: ibs4f0
+    numvfs: 16
+```
+
+Create only as many as you need: many virtual functions break `ip a` (see
+Known limitations).
+
+The playbook's second play runs on a `sriov` group. Add the compute hosts
+to it in `etc/kayobe/inventory/groups`:
+
+```ini
+[sriov:children]
+compute
+```
+
+`etc/kayobe/ansible/sriov.yml`:
+
+```yaml
+---
+- name: Ensure the compute hosts' InfiniBand modules are loaded
+  hosts: compute
+  gather_facts: false
+  tasks:
+    - name: Ensure ib_ipoib is loaded, which the sriov role needs
+      community.general.modprobe:
+        name: ib_ipoib
+        state: present
+        persistent: present
+      become: true
+
+- name: Ensure the controllers' InfiniBand modules are loaded
+  hosts: controllers
+  gather_facts: false
+  tasks:
+    # Any controller may become leader and run OpenSM.
+    - name: Ensure ib_umad is loaded, which OpenSM needs
+      community.general.modprobe:
+        name: ib_umad
+        state: present
+        persistent: present
+      become: true
+
+- name: Ensure the virtual functions exist
+  hosts: sriov
+  tags:
+    - sriov
+  vars:
+    sriov_numvfs_required_by:
+      - docker.service
+  tasks:
+    - ansible.builtin.import_role:
+        name: stackhpc.linux.sriov
+  handlers:
+    - name: reboot
+      ansible.builtin.set_fact:
+        kayobe_needs_reboot: true
+
+- name: Reboot when required
+  hosts: overcloud
+  vars:
+    # This runs after provisioning and before host configure, so Kayobe's
+    # user and virtualenvs may not exist yet: use the image's user.
+    ansible_user: "cloud-user"
+    ansible_python_interpreter: "/usr/bin/python3"
+  tags:
+    - reboot
+  tasks:
+    - name: Reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 3600
+      become: true
+      when: kayobe_needs_reboot | default(false) | bool
+```
+
+The `sriov` role needs stackhpc.linux 1.3.0 or later, in
+`etc/kayobe/ansible/requirements.yml`:
+
+```yaml
+collections:
+  - name: stackhpc.linux
+    version: 1.3.0
+```
+
+Install it with `kayobe control host bootstrap`, then run the playbook:
+
+```sh
+kayobe playbook run $KAYOBE_CONFIG_PATH/ansible/sriov.yml
+```
 
 ## Secrets
 
@@ -313,24 +443,82 @@ backend alternative_fabric_manager_backend
 {% endraw %}
 ```
 
-## networking-mlnx and Nova
+## Neutron, Nova and Ironic
 
+### For both
+
+The InfiniBand physical network, for VLAN networks, in
+`etc/kayobe/neutron.yml`, beside the deployment's existing physical
+networks:
+
+```yaml
+kolla_neutron_ml2_network_vlan_ranges:
+  - physical_network: physnet1
+  # Without a range, only an administrator can create a VLAN network here,
+  # choosing its VLAN ID, and so its partition key. Add, for example,
+  # range: "100:199" to let projects have one allocated.
+  - physical_network: ibphysnet
+```
+
+The mechanism drivers, in the same file. ML2 tries them in order when it
+binds a port:
+
+```yaml
+kolla_neutron_ml2_mechanism_drivers:
+  # Binds bare metal ports on the InfiniBand network, ahead of
+  # genericswitch, and sends every network and port to AFM.
+  - mlnx_sdn_assist
+  # ovn must come before mlnx_infiniband, or mlnx_infiniband sets
+  # extra_dhcp_opts on ports that ovn binds.
+  - ovn
+  # Binds virtualised instances' direct ports on the InfiniBand network to
+  # virtual functions, and gives them the client ID that holds the GUID.
+  - mlnx_infiniband
+  # Only with Ironic on Ethernet switches.
+  - genericswitch
+  # Only for virtualised instances.
+  - sriovnicswitch
+```
+
+Point `mlnx_sdn_assist` at AFM's VIP in
 `etc/kayobe/kolla/config/neutron/ml2_conf.ini`:
 
 ```ini
-[ml2]
-mechanism_drivers = ovn,mlnx_infiniband,mlnx_sdn_assist
-
 [sdn]
 url = http://{{ kolla_internal_fqdn }}:8090/ufmRestV3
 domain = cloudx
 token = {{ afm_api_token }}
 sync_enabled = True
-bind_normal_ports = False
 physical_networks = ibphysnet
+# Virtualised instances only. With bare metal nodes, set:
+# bind_normal_ports = True
+# bind_normal_ports_physnets = ibphysnet
+bind_normal_ports = False
 ```
 
-kolla-ansible renders `{{ afm_api_token }}` from `passwords.yml`.
+kolla-ansible renders `{{ afm_api_token }}` from `passwords.yml`. Leave
+`[sdn] retry_count` at its default, -1: a port deletion that runs out of
+retries holds every port with the same GUID in `ERROR` until an operator
+clears it, and AFM answers 503 to every request while frozen.
+
+### For virtualised instances
+
+Enable kolla-ansible's SR-IOV and Mellanox agents in `etc/kayobe/kolla.yml`:
+
+```yaml
+kolla_enable_neutron_sriov: true
+kolla_enable_neutron_mlnx: true
+```
+
+Map the InfiniBand physical network to the compute hosts' device in
+`etc/kayobe/kolla/globals.yml`:
+
+```yaml
+neutron_sriov_physnet_mappings:
+  ibphysnet: ibs4f0
+neutron_mlnx_physnet_mappings:
+  ibphysnet: ibs4f0
+```
 
 A takeover can hold a port's job for up to the job timeout, 300 s, so Nova
 must wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
@@ -340,7 +528,122 @@ must wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
 vif_plugging_timeout = 420
 ```
 
-Ironic's wait for ports needs the same.
+### For bare metal nodes
+
+Ironic needs the `neutron` network interface, and must fail a deployment
+whose port fails to bind: keep `[neutron] fail_on_port_binding_failure =
+True`, the default. Its wait for ports needs the same margin as Nova's,
+over the 300 s job timeout.
+
+Give each node's InfiniBand port its client ID and physical network when
+you enroll it. The client ID is 20 octets, of which the last 8 are the
+port's GUID:
+
+```sh
+openstack baremetal port create <MAC address> --node <node UUID> \
+  --physical-network ibphysnet \
+  --extra client-id=ff:00:00:00:00:00:02:00:00:02:c9:00:<GUID, 8 octets>
+```
+
+## The InfiniBand network
+
+With partitioning, each VLAN network on `ibphysnet` gets a partition of
+its own, whose partition key is its VLAN ID, and only that network's ports
+are full members of it. Create one per group of hosts that should reach
+each other, as an administrator:
+
+```sh
+openstack network create infiniband-100 \
+  --provider-network-type vlan \
+  --provider-physical-network ibphysnet \
+  --provider-segment 100 \
+  --mtu 2044 \
+  --disable-port-security \
+  --project <project ID>
+openstack subnet create infiniband-100 \
+  --network infiniband-100 \
+  --subnet-range 172.26.0.0/24 \
+  --allocation-pool start=172.26.0.10,end=172.26.0.250 \
+  --gateway none \
+  --no-dhcp
+```
+
+2044 is IPoIB's datagram-mode MTU on a 2048-byte InfiniBand MTU. For bare
+metal nodes that get their IPoIB addresses by DHCP, use `--dhcp` instead.
+`--project` gives the network to one project; to share it with several,
+leave it out and add `openstack network rbac create --type network --action
+access_as_shared --target-project <project ID> <network ID>` for each.
+
+A flat network on `ibphysnet` has no partition of its own: AFM puts the
+ports of every flat network in one shared partition, `[opensm] flat_pkey`,
+so they can all reach each other. It also needs networking-mlnx's "Send
+flat network creation to the SDN controller"
+(https://review.opendev.org/c/x/networking-mlnx/+/1014376). With Kayobe's
+`openstack_networks`, in `etc/kayobe/openstack-config.yml` or wherever the
+deployment keeps them:
+
+```yaml
+openstack_networks:
+  - "{{ openstack_network_infiniband }}"
+
+openstack_network_infiniband_name: "infiniband"
+
+openstack_network_infiniband:
+  name: "{{ openstack_network_infiniband_name }}"
+  provider_network_type: "flat"
+  provider_physical_network: "ibphysnet"
+  shared: false
+  mtu: 2044
+  port_security_enabled: false
+  subnets:
+    - "{{ openstack_subnet_infiniband }}"
+
+openstack_subnet_infiniband:
+  name: "{{ openstack_network_infiniband_name }}"
+  cidr: "172.26.0.0/24"
+  enable_dhcp: false
+  # disable_gateway_ip alone leaves a gateway, so set an unusable one too.
+  gateway_ip: 0.0.0.0
+  disable_gateway_ip: true
+  allocation_pool_start: "172.26.0.10"
+  allocation_pool_end: "172.26.0.250"
+```
+
+Share it with `openstack network rbac create` as above:
+`openstack_networks_rbac` fails when it finds more than one matching RBAC
+policy.
+
+A virtualised instance gets a virtual function from a port with
+`vnic_type` `direct`, for example in Terraform:
+
+```hcl
+data "openstack_networking_network_v2" "infiniband" {
+  name = "infiniband-100"
+}
+
+resource "openstack_networking_port_v2" "infiniband" {
+  name                  = "infiniband-0"
+  network_id            = data.openstack_networking_network_v2.infiniband.id
+  admin_state_up        = true
+  port_security_enabled = false
+  binding {
+    vnic_type = "direct"
+  }
+}
+
+resource "openstack_compute_instance_v2" "instance" {
+  # ...
+  network {
+    port = openstack_networking_port_v2.infiniband.id
+  }
+}
+```
+
+or `openstack port create --network infiniband-100 --vnic-type direct
+--disable-port-security <name>`. A bare metal instance just names the
+network: Nova and Ironic create its port, with the Ironic port's client ID.
+Either way the port stays `DOWN` until AFM has put its GUID in the
+network's partition.
 
 ## A deployment check, as a hook
 
@@ -399,7 +702,6 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 
 ## Upgrades and maintenance
 
-
 - **Upgrade AFM** by changing `afm_tag` and running
   `kayobe overcloud service deploy`. Its `pre.yml` upgrades the schema
   first; each schema change is compatible with the version before. The
@@ -440,6 +742,11 @@ See specs/ha.md. In short: a paused node can resume as a stale master
 until its watchdog kills it, and Ask (SMInfo DISABLE) isn't sent yet; in
 both cases the new leader's fabric checks find the other master, and no job
 completes meanwhile.
+
+With many virtual functions on a device, such as 127, `ip a` fails with
+"Error: Buffer too small for object." (an
+[iproute2 bug](https://bugs.launchpad.net/ubuntu/+source/iproute2/+bug/1849856)).
+Create fewer virtual functions.
 
 ## Future improvements
 
