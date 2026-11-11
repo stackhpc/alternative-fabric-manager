@@ -8,8 +8,9 @@ From the moment it starts, before it registers, it also appends a
 heartbeat to life-<pid>.log every 0.1 s, with whether it is active (not
 disabled), on the system's monotonic clock. A real OpenSM acts on the
 fabric from its first sweep, before it is master, and a sampling monitor
-can miss a short overlap, so the tests check these logs for any two
-OpenSMs active at once (see Cluster.check_lifetimes). A paused fake writes
+can miss a short overlap, so the tests also check these logs, to within
+a heartbeat, for any two OpenSMs active at once (see
+Cluster.check_lifetimes). A paused fake writes
 nothing, as it can't act. With --partitions, each sweep appends the
 generation of the partitions file it read to generations-<node>.log.
 """

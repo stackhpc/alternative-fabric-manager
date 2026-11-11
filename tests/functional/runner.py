@@ -125,11 +125,25 @@ class ProcessRunner:
     def _own_sms(self):
         return list(processes("fake", self.fabric_dir, self.node))
 
+    def _fault(self, name):
+        return os.path.exists(os.path.join(self.fabric_dir, f"{name}-{self.node}"))
+
+    def switches(self):
+        """The switches this node's port reaches: a test's switches-<node>
+        file, for a split fabric, or else its fabric-wide switches file, or
+        else the one switch. Comma-separated hex GUIDs."""
+        for name in (f"switches-{self.node}", "switches"):
+            path = os.path.join(self.fabric_dir, name)
+            if os.path.exists(path):
+                with open(path) as f:
+                    return {int(g, 16) for g in f.read().split(",") if g.strip()}
+        return {SWITCH}
+
     def reach(self):
-        """The one switch, unless a test cut this node's link"""
-        if os.path.exists(os.path.join(self.fabric_dir, f"linkdown-{self.node}")):
+        """The switches it reaches, unless a test cut this node's link"""
+        if self._fault("linkdown"):
             return None
-        return 1
+        return len(self.switches())
 
     def _unstoppable(self):
         """A test's fault: this node's OpenSM can't be stopped, nor its stop
@@ -224,6 +238,10 @@ class ProcessRunner:
         pids = self._own_sms()
         if not pids or self.watchdog is None:
             raise ReloadError("OpenSM isn't running")
+        # A test's fault: the call to OpenSM hangs, as a wedged container's
+        # docker exec might, until the test removes the file.
+        while self._fault("hang"):
+            time.sleep(0.1)
         before = self._sweeps() or 0
         # To the watchdog, as Docker signals a container's first process,
         # which passes it on to OpenSM
@@ -236,8 +254,14 @@ class ProcessRunner:
         raise ReloadError("No sweep")
 
     def fabric(self, m_key=None, sa_key=None):
+        # A paused OpenSM's SA doesn't answer.
+        if any(
+            state in ("T", "t")
+            for state in processes("fake", self.fabric_dir, self.node).values()
+        ):
+            raise ReloadError("The SA doesn't answer")
         return Fabric(
-            {SWITCH},
+            self.switches(),
             [(int(entry["guid"]), 3) for entry in masters(self.fabric_dir)],
             {self.guid},
         )

@@ -200,10 +200,17 @@ class Cluster:
     def _watch(self):
         while not self._stop.is_set():
             try:
+                before = time.monotonic()
                 found = self.active()
-                now = time.monotonic()
-                if len(found) > 1 and not self._allowed(now):
-                    self.violations.append((now, found))
+                after = time.monotonic()
+                # The scan saw them at some time between: allowed if either
+                # end of it was
+                if (
+                    len(found) > 1
+                    and not self._allowed(before)
+                    and not self._allowed(after)
+                ):
+                    self.violations.append((after, found))
             except Exception as e:  # noqa: BLE001 - reported at teardown
                 self.monitor_errors.append(repr(e))
             time.sleep(0.05)
@@ -233,8 +240,13 @@ class Cluster:
         return sorted(runs)
 
     def check_lifetimes(self):
-        """Overlaps of two fakes' active runs outside an allowed window: an
-        exact check, where the monitor only samples"""
+        """Overlaps of two fakes' active runs outside an allowed window. The
+        runs are known to within a heartbeat: one ends at its last active
+        heartbeat, up to 0.1 s before the fake died or was disabled, and the
+        first heartbeat follows its exec by a few ms. So this misses an
+        overlap shorter than that, which only the monitor's samples might
+        catch, but catches any longer one, however brief the monitor's
+        view of it."""
         runs = self.lifetimes()
         overlaps = []
         for i, (_a0, a1, apid, anode) in enumerate(runs):
@@ -523,12 +535,12 @@ def test_without_galera_the_leader_stops_and_comes_back(cluster):
     apply_change(cluster, leader, 5)
 
 
-def _operator(cluster):
+def _operator(cluster, node=1):
     from alternative_fabric_manager import config as config_mod
     from alternative_fabric_manager.ha import lease as lease_mod
 
     config = config_mod.Config(
-        token=TOKEN, connection=url(1, cluster.password), **cluster.timings
+        token=TOKEN, connection=url(node, cluster.password), **cluster.timings
     )
     sessionmaker = db.make_sessionmaker(config.connection, config.call_timeout)
     return config, lease_mod.GaleraLease(sessionmaker), sessionmaker
@@ -603,11 +615,24 @@ def test_an_unfreeze_the_leader_never_acknowledges_needs_an_operator(cluster):
 
 
 def test_a_candidate_whose_link_is_down_doesnt_take_over(cluster):
+    # Both candidates' links down: neither may take over, even once T_reach
+    # has passed, so a broken eligibility check can't pass by luck.
     leader = cluster.wait_leader()
     down, up = (i for i in NODES if i != leader)
-    with open(os.path.join(cluster.fabric, f"linkdown-node-{down}"), "w") as f:
-        f.write("down")
+    for i in (down, up):
+        with open(os.path.join(cluster.fabric, f"linkdown-node-{i}"), "w") as f:
+            f.write("down")
     cluster.signal(leader, signal.SIGKILL)
+    end = time.monotonic() + (
+        cluster.timings["lease_timeout"]
+        + cluster.timings["reach_timeout"]
+        + cluster.timings["watchdog_timeout"]
+        + 5
+    )
+    while time.monotonic() < end:
+        assert not cluster.fake_pids(down) and not cluster.fake_pids(up)
+        time.sleep(0.5)
+    os.unlink(os.path.join(cluster.fabric, f"linkdown-node-{up}"))
     assert cluster.wait_leader(other_than=leader) == up
 
 
@@ -693,7 +718,9 @@ def test_a_job_in_flight_completes_on_the_successors_sweep(cluster):
     with sessionmaker() as session:
         generation = session.scalar(sa.select(sa.func.max(db.Job.generation)))
     # No OpenSM can sweep it until the successor's starts.
+    end = time.monotonic() + cluster.timings["lease_timeout"] + 20
     while lease.read().term == term:
+        assert time.monotonic() < end, "no takeover"
         _not_completed(cluster, follower, job)
         time.sleep(0.5)
     successor = cluster.wait_leader(other_than=leader)
@@ -752,7 +779,12 @@ def test_an_opensm_that_cant_be_stopped_holds_every_job(cluster):
             TAKEOVER + 30,
             "the successor's OpenSM",
         )
-        started = cluster.first_active(f"node-{successor}", after=0)
+        # Its first heartbeat follows the process's exec by some ms.
+        started = wait_for(
+            lambda: cluster.first_active(f"node-{successor}", after=0),
+            5,
+            "the successor's first heartbeat",
+        )
         timings = cluster.timings
         assert started - isolated >= (
             timings["lease_timeout"]
@@ -765,6 +797,10 @@ def test_an_opensm_that_cant_be_stopped_holds_every_job(cluster):
         while time.monotonic() < end:
             _not_completed(cluster, successor, job)
             time.sleep(0.5)
+        # Held because the fabric check finds the other master
+        _config, _lease, sessionmaker = _operator(cluster, successor)
+        with sessionmaker() as session:
+            assert session.get(db.Applied, 1).contested
         # The old node rejoins Galera, and its watchdog resumes, finds its
         # lease lapsed, and kills OpenSM.
         _isolate(cluster, leader, False)
@@ -778,7 +814,9 @@ def test_an_opensm_that_cant_be_stopped_holds_every_job(cluster):
 @pytest.mark.env(AFM_FAKE_HONOURS_ASK="1")
 def test_an_opensm_that_cant_be_stopped_honours_the_ask(cluster):
     # The same fault, with an OpenSM that honours SMInfo DISABLE: the
-    # successor's ask makes it NOT-ACTIVE, so two never act at once.
+    # successor's ask makes it NOT-ACTIVE, so two never act at once. This
+    # exercises the coordinator's ask, through the harness's runner; the
+    # production driver doesn't send it yet (see specs/ha.md, Fencing).
     leader = cluster.wait_leader()
     watchdogs, fakes = cluster.watchdog_pids(leader), cluster.fake_pids(leader)
     for pid in watchdogs:
@@ -792,7 +830,19 @@ def test_an_opensm_that_cant_be_stopped_honours_the_ask(cluster):
     _isolate(cluster, leader, False)
     for pid in watchdogs:
         os.kill(pid, signal.SIGCONT)
+    # Its watchdog resumes, finds its lease lapsed, and kills it.
+    wait_for(lambda: not _paused_or_alive(fakes), 10, "the old OpenSM killed")
     _unstoppable(cluster, leader, False)
+    assert cluster.leader() == successor
+
+
+def _taken_after(lease, term, timeout):
+    """When the lease's term first exceeds a term, as the test sees it"""
+    return wait_for(
+        lambda: time.monotonic() if lease.read().term > term else None,
+        timeout,
+        f"a term after {term}",
+    )
 
 
 def _winner(lease, term):
@@ -816,8 +866,13 @@ def test_a_winner_that_dies_mid_takeover_is_waited_for(cluster):
     cluster.signal(winner, signal.SIGKILL)
     assert not cluster.fake_pids(winner), "the winner started OpenSM already"
     third = next(i for i in NODES if i not in (leader, winner))
+    taken = _taken_after(lease, winner_term, TAKEOVER + 30)
     assert cluster.wait_leader(other_than=leader) == third
     assert lease.read().term == winner_term + 1
+    # The third node waited out the unconfirmed wait for both targets,
+    # though neither had a live OpenSM, which nothing else here would show.
+    started = cluster.first_active(f"node-{third}", after=0)
+    assert started - taken >= cluster.timings["watchdog_timeout"] - 1
     assert cluster.first_active(f"node-{winner}", after=0) is None
     apply_change(cluster, third, 1)
 
@@ -835,11 +890,390 @@ def test_a_winner_paused_mid_takeover_doesnt_start_opensm_later(cluster):
     cluster.signal(winner, signal.SIGSTOP)
     assert not cluster.fake_pids(winner), "the winner started OpenSM already"
     third = next(i for i in NODES if i not in (leader, winner))
+    taken = _taken_after(lease, winner_term, TAKEOVER + 30)
     assert cluster.wait_leader(other_than=leader) == third
     assert lease.read().term == winner_term + 1
+    # The third node waited out the unconfirmed wait for both targets,
+    # though neither had a live OpenSM, which nothing else here would show.
+    started = cluster.first_active(f"node-{third}", after=0)
+    assert started - taken >= cluster.timings["watchdog_timeout"] - 1
     cluster.signal(winner, signal.SIGCONT)
     # Past its start timeout and a few periods: it never starts one.
     time.sleep(cluster.timings["start_timeout"] + 5)
     assert cluster.first_active(f"node-{winner}", after=0) is None
     assert cluster.leader() == third
     apply_change(cluster, winner, 1)
+
+
+def test_opensm_exiting_moves_the_lease_at_once(cluster):
+    # OpenSM exits under a leader that isn't frozen: it steps down and
+    # releases, so a successor takes over without waiting for expiry.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    started = time.monotonic()
+    for pid in cluster.fake_pids(leader):
+        os.kill(pid, signal.SIGKILL)
+    successor = cluster.wait_leader(other_than=leader)
+    assert time.monotonic() - started < cluster.timings["lease_timeout"]
+    assert lease.read().term > term
+    apply_change(cluster, successor, 1)
+
+
+def _exits_within(cluster, i, seconds):
+    try:
+        cluster.processes[i].wait(seconds)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"node-{i}'s manager didn't exit in {seconds} s") from None
+
+
+def test_sigterm_with_the_database_unreachable_stops_opensm_in_bound(cluster):
+    # SIGTERM while the leader's Galera node hangs: the step-down is bounded
+    # by shutdown_timeout, OpenSM is stopped and verified, but the lease
+    # isn't released, so the successor waits for expiry.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(
+        cluster, next(i for i in NODES if i != leader)
+    )
+    term = lease.read().term
+    docker("pause", f"afm-galera-{leader}")
+    started = time.monotonic()
+    cluster.signal(leader, signal.SIGTERM)
+    _exits_within(cluster, leader, cluster.timings["shutdown_timeout"] + 5)
+    assert not cluster.fake_pids(leader), "OpenSM outlived its manager"
+    docker("unpause", f"afm-galera-{leader}")
+    successor = cluster.wait_leader(other_than=leader)
+    assert lease.read().term > term
+    # Not released: the successor waited for the lease to expire.
+    assert time.monotonic() - started >= cluster.timings["lease_timeout"] - 1
+    apply_change(cluster, successor, 1)
+
+
+def test_sigterm_to_a_candidate_marks_it_stopped(cluster):
+    leader = cluster.wait_leader()
+    candidate = next(i for i in NODES if i != leader)
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    cluster.signal(candidate, signal.SIGTERM)
+    _exits_within(cluster, candidate, cluster.timings["shutdown_timeout"] + 5)
+    rows = {name: stopped for name, _uuid, _hb, _reach, stopped in lease.nodes()}
+    assert rows[f"node-{candidate}"]
+    # The leader is undisturbed.
+    assert cluster.leader() == leader and lease.read().term == term
+
+
+def test_sigterm_during_a_takeover_releases_without_starting_opensm(cluster):
+    # A winner told to stop during its unconfirmed wait steps down: it
+    # releases, never starting OpenSM, and the third node still waits for
+    # the dead leader's entry.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGKILL)
+    winner, winner_term = wait_for(
+        lambda: _winner(lease, term), cluster.timings["lease_timeout"] + 20, "a winner"
+    )
+    stopped = time.monotonic()
+    cluster.signal(winner, signal.SIGTERM)
+    _exits_within(cluster, winner, cluster.timings["shutdown_timeout"] + 5)
+    third = next(i for i in NODES if i not in (leader, winner))
+    assert cluster.wait_leader(other_than=leader) == third
+    assert cluster.first_active(f"node-{winner}", after=0) is None
+    assert lease.read().term == winner_term + 1
+    # The dead leader's entry still took the unconfirmed wait.
+    started = cluster.first_active(f"node-{third}", after=0)
+    assert started - stopped >= cluster.timings["watchdog_timeout"] - 1
+    apply_change(cluster, third, 1)
+
+
+def test_a_galera_blip_shorter_than_self_stop_keeps_opensm(cluster):
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    pids = cluster.sm_pids(leader)
+    for i in NODES:
+        docker("pause", f"afm-galera-{i}")
+    time.sleep(cluster.timings["self_stop_timeout"] / 2)
+    for i in NODES:
+        docker("unpause", f"afm-galera-{i}")
+    time.sleep(cluster.timings["lease_timeout"])
+    assert cluster.sm_pids(leader) == pids
+    assert lease.read().term == term
+    apply_change(cluster, leader, 1)
+
+
+def test_two_galera_nodes_down_stops_every_opensm(cluster):
+    # The survivor isn't a Primary component: nobody may lead.
+    leader = cluster.wait_leader()
+    survivor = leader
+    down = [i for i in NODES if i != survivor]
+    for i in down:
+        docker("pause", f"afm-galera-{i}")
+    wait_for(
+        lambda: not cluster.active(),
+        cluster.timings["lease_timeout"] + 10,
+        "every OpenSM stopped",
+    )
+    # And none starts while it lasts.
+    end = time.monotonic() + cluster.timings["lease_timeout"] + 5
+    while time.monotonic() < end:
+        assert not cluster.active()
+        time.sleep(0.5)
+    for i in down:
+        docker("unpause", f"afm-galera-{i}")
+    leader = cluster.wait_leader()
+    apply_change(cluster, leader, 1)
+
+
+# Losing any Galera node blocks every node's commits until the survivors
+# evict it, after evs.suspect_timeout, 5 s, so T_self must outlast that (see
+# specs/ha.md, Timeouts); the other tests' 4 s doesn't.
+@pytest.mark.timings(lease_timeout=14.0, self_stop_timeout=10.0)
+def test_a_candidate_cut_off_from_galera_disturbs_nothing(cluster):
+    leader = cluster.wait_leader()
+    candidate = next(i for i in NODES if i != leader)
+    _config, lease, _sessionmaker = _operator(cluster, leader)
+    term = lease.read().term
+    pids = cluster.sm_pids(leader)
+    _isolate(cluster, candidate, True)
+    time.sleep(cluster.timings["lease_timeout"] + cluster.timings["watchdog_timeout"])
+    assert cluster.sm_pids(leader) == pids and lease.read().term == term
+    assert not cluster.fake_pids(candidate)
+    _isolate(cluster, candidate, False)
+    time.sleep(cluster.timings["lease_timeout"])
+    assert cluster.sm_pids(leader) == pids and lease.read().term == term
+    apply_change(cluster, candidate, 1)
+
+
+def test_a_killed_leader_rejoins_and_leads_again(cluster):
+    # A killed manager leaves its watchdog's lease and start request
+    # behind; restarted, it must not start OpenSM from them, and leads
+    # again once it is the only candidate.
+    leader = cluster.wait_leader()
+    cluster.signal(leader, signal.SIGKILL)
+    successor = cluster.wait_leader(other_than=leader)
+    state = cluster.tmp / f"state-{leader}"
+    assert any(state.iterdir()), "no watchdog files were left behind"
+    cluster.start(leader)
+    time.sleep(cluster.timings["lease_timeout"])
+    assert not cluster.fake_pids(leader)
+    assert cluster.leader() == successor
+    for i in NODES:
+        if i != leader:
+            cluster.signal(i, signal.SIGKILL)
+    assert cluster.wait_leader(other_than=successor) == leader
+    apply_change(cluster, leader, 1)
+
+
+def _fault(cluster, name, i, on=True):
+    path = os.path.join(cluster.fabric, f"{name}-node-{i}")
+    if on:
+        with open(path, "w") as f:
+            f.write("fault")
+    elif os.path.exists(path):
+        os.unlink(path)
+
+
+def _switches(cluster, guids, node=None):
+    """The switches every node, or one node, reaches"""
+    name = f"switches-node-{node}" if node else "switches"
+    with open(os.path.join(cluster.fabric, name), "w") as f:
+        f.write(",".join(f"{g:x}" for g in guids))
+
+
+def _expect_switches(cluster, guids):
+    _switches(cluster, guids)
+    _config, _lease, sessionmaker = _operator(cluster)
+    with sessionmaker() as session:
+        for guid in guids:
+            if session.get(db.ExpectedSwitch, f"{guid:016x}") is None:
+                session.add(db.ExpectedSwitch(guid=f"{guid:016x}"))
+        session.commit()
+
+
+def test_a_wedged_opensm_hands_over_to_a_live_candidate(cluster):
+    # OpenSM paused, its manager healthy: the SA doesn't answer, and after
+    # three unanswered checks the leader hands over, without the cooldown.
+    leader = cluster.wait_leader()
+    _config, lease, _sessionmaker = _operator(cluster)
+    term = lease.read().term
+    wedged = cluster.fake_pids(leader)
+    for pid in wedged:
+        os.kill(pid, signal.SIGSTOP)
+    wait_for(
+        lambda: not _paused_or_alive(wedged),
+        TAKEOVER + 30,
+        "the wedged OpenSM stopped",
+    )
+    new = wait_for(
+        lambda: cluster.leader() if lease.read().term > term else None,
+        TAKEOVER + 30,
+        "a new leadership",
+    )
+    apply_change(cluster, new, 1)
+
+
+def test_a_hung_apply_loop_loses_the_lease(cluster):
+    # A sweep that never returns: the liveness condition fails after the
+    # apply loop's bound, renewals stop, the watchdog kills OpenSM, and a
+    # successor takes over and completes the job.
+    leader = cluster.wait_leader()
+    _fault(cluster, "hang", leader)
+    job = _send(cluster, leader, "/cloudx/Network", network(1, 101))
+    successor = cluster.wait_leader(other_than=leader, timeout=TAKEOVER + 60)
+    _fault(cluster, "hang", leader, on=False)
+    cluster.job_completes(successor, job, TAKEOVER + 60)
+
+
+def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
+    # Every node misses the switch, so nobody reaches more, leadership
+    # stays, and no job completes until an operator removes it.
+    leader = cluster.wait_leader()
+    _expect_switches(cluster, [runner_mod.SWITCH, 2])
+    apply_change(cluster, leader, 1)
+    _config, lease, sessionmaker = _operator(cluster)
+    term = lease.read().term
+    _switches(cluster, [runner_mod.SWITCH])
+    job = _send(cluster, leader, "/cloudx/Network", network(2, 102))
+    end = time.monotonic() + 10 * cluster.timings["check_interval"]
+    while time.monotonic() < end:
+        _not_completed(cluster, leader, job)
+        time.sleep(0.5)
+    assert cluster.leader() == leader and lease.read().term == term
+    with sessionmaker() as session:
+        session.execute(
+            sa.delete(db.ExpectedSwitch).where(db.ExpectedSwitch.guid == f"{2:016x}")
+        )
+        session.commit()
+    cluster.job_completes(leader, job, 60)
+    assert lease.read().term == term
+
+
+@pytest.mark.timings(step_down_cooldown=0.0)
+def test_a_leader_on_a_fragment_hands_over_to_a_node_reaching_more(cluster):
+    # A split fabric: the leader's port reaches one switch of two, the
+    # others both. It hands over, and the successor completes jobs.
+    leader = cluster.wait_leader()
+    _expect_switches(cluster, [runner_mod.SWITCH, 2])
+    apply_change(cluster, leader, 1)
+    _switches(cluster, [runner_mod.SWITCH], node=leader)
+    successor = cluster.wait_leader(other_than=leader, timeout=TAKEOVER + 60)
+    apply_change(cluster, successor, 2)
+
+
+def _freeze(cluster, node=1):
+    from alternative_fabric_manager.ha import operator
+
+    config, lease, sessionmaker = _operator(cluster, node)
+
+    def frozen():
+        try:
+            return operator.freeze(config, lease, sessionmaker)
+        except operator.OperatorError:
+            # Until the leader's first fabric check passes
+            return None
+
+    wait_for(frozen, 30, "a freeze")
+    return config, lease
+
+
+def _unfreeze(cluster, config, lease):
+    from alternative_fabric_manager.ha import operator
+
+    assert operator.unfreeze(config, lease, 30)
+
+
+def _holds(cluster, leader, lease, term, seconds, same_pids=True):
+    """Through a time: the term stays, no other node runs OpenSM, and,
+    if asked, the leader keeps the same OpenSM"""
+    pids = cluster.sm_pids(leader)
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        assert lease.read().term == term
+        for i in NODES:
+            if i != leader:
+                assert not cluster.fake_pids(i), f"node-{i} started OpenSM"
+        if same_pids:
+            assert cluster.sm_pids(leader) == pids
+        time.sleep(0.5)
+
+
+def _past_expiry(cluster):
+    return cluster.timings["lease_timeout"] + cluster.timings["watchdog_timeout"] + 2
+
+
+def test_a_frozen_leaders_paused_manager_keeps_opensm(cluster):
+    leader = cluster.wait_leader()
+    config, lease = _freeze(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGSTOP)
+    # Its watchdog's lease is held: OpenSM stays, and nobody takes over.
+    _holds(cluster, leader, lease, term, _past_expiry(cluster))
+    cluster.signal(leader, signal.SIGCONT)
+    _unfreeze(cluster, config, lease)
+    apply_change(cluster, leader, 1)
+
+
+def test_a_frozen_leader_cut_off_from_galera_keeps_opensm(cluster):
+    leader = cluster.wait_leader()
+    # Through a Galera node that stays in the majority
+    config, lease = _freeze(cluster, next(i for i in NODES if i != leader))
+    term = lease.read().term
+    _isolate(cluster, leader, True)
+    # The majority sees no renewals, but the freeze is in Galera.
+    _holds(cluster, leader, lease, term, _past_expiry(cluster))
+    _isolate(cluster, leader, False)
+    _holds(cluster, leader, lease, term, cluster.timings["lease_timeout"])
+    _unfreeze(cluster, config, lease)
+    apply_change(cluster, leader, 1)
+
+
+def test_a_frozen_leaders_restarted_manager_restarts_opensm_there(cluster):
+    # OpenSM dies with its manager; the restarted manager adopts the frozen
+    # lease, in the same term, and starts OpenSM again on the same node.
+    leader = cluster.wait_leader()
+    config, lease = _freeze(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGKILL)
+    cluster.processes[leader].wait()
+    wait_for(lambda: not cluster.fake_pids(leader), 10, "OpenSM dead")
+    _holds(cluster, leader, lease, term, 3, same_pids=False)
+    cluster.start(leader)
+    wait_for(lambda: cluster.leader() == leader, TAKEOVER, "OpenSM restarted")
+    _holds(cluster, leader, lease, term, 3)
+    _unfreeze(cluster, config, lease)
+    apply_change(cluster, leader, 1)
+
+
+def test_opensm_exiting_while_frozen_restarts_on_the_frozen_node(cluster):
+    leader = cluster.wait_leader()
+    config, lease = _freeze(cluster)
+    term = lease.read().term
+    old = cluster.fake_pids(leader)
+    for pid in old:
+        os.kill(pid, signal.SIGKILL)
+    wait_for(
+        lambda: cluster.leader() == leader and cluster.sm_pids(leader) != old,
+        TAKEOVER,
+        "OpenSM restarted on the frozen node",
+    )
+    _holds(cluster, leader, lease, term, 3)
+    _unfreeze(cluster, config, lease)
+    apply_change(cluster, leader, 1)
+
+
+def test_sigterm_while_frozen_keeps_the_lease_for_the_node(cluster):
+    # SIGTERM stops OpenSM but doesn't release the frozen lease: nobody
+    # takes over, and the node's manager starts OpenSM again when it's back.
+    leader = cluster.wait_leader()
+    config, lease = _freeze(cluster)
+    term = lease.read().term
+    cluster.signal(leader, signal.SIGTERM)
+    _exits_within(cluster, leader, cluster.timings["shutdown_timeout"] + 5)
+    assert not cluster.fake_pids(leader)
+    assert not lease.read().released
+    _holds(cluster, leader, lease, term, _past_expiry(cluster), same_pids=False)
+    cluster.start(leader)
+    wait_for(lambda: cluster.leader() == leader, TAKEOVER, "OpenSM restarted")
+    _unfreeze(cluster, config, lease)
+    apply_change(cluster, leader, 1)
