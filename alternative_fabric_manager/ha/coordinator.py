@@ -309,18 +309,26 @@ class Coordinator:
             renewed = self.lease.renew(self.uuid, self.term)
         except Exception as e:  # noqa: BLE001 - not Primary, or unreachable
             LOG.warning("Renewal failed: %s", e)
-            return
-        if not renewed:
+            renewed = None
+        if renewed is False:
             LOG.error("Lost the lease of term %s", self.term)
             self._step_down("lost the lease", release=False)
             return
-        self.t0 = now
-        if self.opensm_started:
+        if renewed:
+            self.t0 = now
+        # The watchdog's lease follows the liveness condition, not each
+        # renewal: a Galera stall shorter than T_self, such as while the
+        # survivors evict a lost node, mustn't kill OpenSM. Its deadline
+        # stays bounded by t0 + T_self + T_watchdog, and self-stop ends it
+        # at T_self (see The watchdog).
+        if self.opensm_started and self.t0 is not None:
             self.runner.write_lease(
                 self.uuid,
                 self.term,
                 None if self.held else self._watchdog_deadline(now),
             )
+        if renewed is None:
+            return
         if self._opensm_gone and self.held:
             self._restart_frozen()
         self._freeze_step()

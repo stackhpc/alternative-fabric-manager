@@ -392,3 +392,26 @@ def test_unanswered_checks_dont_wait_for_the_cooldown(lease, clock):
     a.manager.unanswered_checks = 3
     a._lead()
     assert a.role == coordinator_mod.Role.STARTING
+
+
+def test_a_failed_renewal_still_renews_the_watchdogs_lease(lease, clock, monkeypatch):
+    # A Galera stall shorter than T_self, as while the survivors evict a
+    # lost node, mustn't let the watchdog's lease lapse; its deadline stays
+    # bounded by the last renewal that succeeded (see The watchdog).
+    a = make(lease, "a")
+    lead(a)
+    t0 = a.t0
+    a.runner.leases.clear()
+
+    def renew(*_args):
+        raise lease_mod.NotPrimary("stalled")
+
+    monkeypatch.setattr(lease, "renew", renew)
+    clock.now += TIMINGS["self_stop_timeout"] / 2
+    a._tick()
+    assert a.role == coordinator_mod.Role.LEADER
+    assert a.t0 == t0
+    (term, deadline), *_ = a.runner.leases
+    assert term == a.term
+    assert clock.now < deadline
+    assert deadline <= t0 + TIMINGS["self_stop_timeout"] + TIMINGS["watchdog_timeout"]

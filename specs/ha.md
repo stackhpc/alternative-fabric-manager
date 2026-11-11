@@ -772,7 +772,11 @@ older version, is ignored. So:
   pkey errors) + a fabric check;
 - `T_self` + the liveness thread's period + a lease call's timeout < `T`;
 - `T_self` > the deployment's MariaDB failover time, so that losing one
-  Galera node, or the VIP moving, doesn't stop OpenSM;
+  Galera node, or the VIP moving, doesn't stop OpenSM. That includes the
+  time the surviving Galera nodes take to evict a lost one,
+  `evs.suspect_timeout`, 5 s by default, plus a view change, during which
+  every node's commits block, whichever node was lost: a leader whose own
+  Galera node is healthy still can't renew meanwhile;
 - Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
   sync interval + its retry backoff + the job timeout.
 
