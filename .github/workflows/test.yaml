@@ -39,3 +39,10 @@ jobs:
         with:
           check_name: Pytest
           report_paths: pytest.xml
+
+  image:
+    name: Image
+    permissions:
+      contents: read
+      checks: write
+    uses: ./.github/workflows/image-test.yaml

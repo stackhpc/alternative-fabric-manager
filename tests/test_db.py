@@ -6,6 +6,15 @@ from alternative_fabric_manager import db
 from tests import conftest
 
 
+def test_the_package_ships_its_migrations():
+    # Only server databases run them, so without this the SQLite suite
+    # passes against an installed package that has lost them.
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(db._alembic_config("sqlite://"))
+    assert script.get_current_head() is not None
+
+
 def test_an_old_database_is_upgraded_in_place(tmp_path):
     path = tmp_path / "afm.sqlite"
     # The first release's jobs table, with an open job, and a key to keep

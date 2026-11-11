@@ -11,8 +11,17 @@ on:
 permissions: {}
 
 jobs:
+  # Publish only an image whose amd64 build passes the tests.
+  test:
+    name: Test image
+    permissions:
+      contents: read
+      checks: write
+    uses: ./.github/workflows/image-test.yaml
+
   build_push_image:
     name: Build and push image
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -71,6 +80,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: runtime
           platforms: linux/amd64,linux/arm64
           pull: true
           push: true
@@ -78,5 +88,7 @@ jobs:
             UV_VERSION=${{ steps.uv_version.outputs.version }}
           tags: ${{ steps.image_meta.outputs.tags }}
           labels: ${{ steps.image_meta.outputs.labels }}
-          cache-from: type=gha,scope=alternative-fabric-manager
+          cache-from: |
+            type=gha,scope=alternative-fabric-manager
+            type=gha,scope=alternative-fabric-manager-test
           cache-to: type=gha,mode=max,scope=alternative-fabric-manager

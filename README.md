@@ -207,6 +207,17 @@ uv run ruff format --check .
 uv run pytest
 ```
 
+CI also runs the tests inside the image, against the installed package,
+on SQLite and on MariaDB, and smoke-tests the runtime image. To do the same
+locally:
+
+```sh
+docker build --build-arg UV_VERSION="$(<.uv-version)" --target test -t afm-test .
+docker run --rm afm-test -q
+docker build --build-arg UV_VERSION="$(<.uv-version)" -t afm .
+.github/scripts/smoke-test.sh afm
+```
+
 ## Limitations
 
 - High availability, with `[ha] ha = true`, is described in
@@ -225,7 +236,8 @@ release and builds its image: see [docs/releasing.md](docs/releasing.md).
 
 Every build also receives an immutable `sha-<commit>` tag and a
 `build-<run-id>-<attempt>` tag. The latter distinguishes rebuilds of the
-same commit. Do not deploy a mutable convenience tag; pin deployments to the
+same commit. An image is published only once its amd64 build passes the
+image tests. Do not deploy a mutable convenience tag; pin deployments to the
 release image digest.
 
 The uv version is recorded in `.uv-version`. Pass it to local Docker builds
@@ -233,4 +245,5 @@ with `docker build --build-arg UV_VERSION="$(<.uv-version)" .`.
 
 The weekly dependency workflow opens a fresh pull request when updates are
 available. It updates the uv image version and digest, Python base-image
-digest, and all dependencies in `uv.lock`, then runs the full test suite.
+digest, and all dependencies in `uv.lock`, then runs the full test suite,
+and the image tests on the proposed commit.
