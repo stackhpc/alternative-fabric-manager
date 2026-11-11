@@ -69,6 +69,8 @@ class Coordinator:
         self.node = config.node
         self.uuid = str(uuid.uuid4())
         self.role = Role.STARTING
+        # Whether another instance has registered on this node's row
+        self._displaced = False
         self.term = None
         # When the last renewal that succeeded was sent
         self.t0 = None
@@ -190,7 +192,11 @@ class Coordinator:
         if self.role in (Role.LEADER, Role.TAKING_OVER) and self._self_stop_due():
             return
         try:
-            if not self.lease.heartbeat(self.node, self.uuid, self._reach()):
+            if self.lease.heartbeat(self.node, self.uuid, self._reach()):
+                self._displaced = False
+            elif self.role in (Role.CANDIDATE, Role.TAKING_OVER, Role.LEADER):
+                # Not while starting, when _rejoin hasn't yet registered a
+                # new UUID, nor once stopped, which mustn't look live again
                 self._restore_row()
         except Exception as e:  # noqa: BLE001
             LOG.debug("Heartbeat failed: %s", e)
@@ -206,8 +212,11 @@ class Coordinator:
         name)"""
         if self.lease.restore(self.node, self.uuid, self.config_hash, self.adapters):
             LOG.warning("This node's row was missing; restored it")
-        else:
+            self._displaced = False
+        elif not self._displaced:
+            # Once, rather than at every tick
             LOG.error("Another instance has registered on node %s's row", self.node)
+            self._displaced = True
 
     def _probe_reach(self):
         reach = getattr(self.runner, "reach", None)

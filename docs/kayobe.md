@@ -901,10 +901,11 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   instance then takes over.
 - **Retiring a controller**: stop AFM's container on it cleanly, with
   `${ENGINE:-docker} stop alternative_fabric_manager`, before taking it
-  out of service, and unfreeze first if the cluster is frozen. If it
-  leads, it releases the lease and another instance takes over at once,
-  and it marks itself stopped, so the others never count it as a
-  candidate. Its row in AFM's database stays, and is harmless; there is
+  out of service, and unfreeze first if the cluster is frozen. It marks
+  itself stopped, so the others never count it as a candidate, and if it
+  leads, it releases the lease and another instance takes over at once.
+  (If it couldn't verify its OpenSM stopped, or reach the database, the
+  takeover waits for the lease to expire instead.) Its row in AFM's database stays, and is harmless; there is
   no command to remove it, and don't delete it by hand. Removing the host
   from the `controllers` group then drops it from HAProxy's backends at
   the next deploy.

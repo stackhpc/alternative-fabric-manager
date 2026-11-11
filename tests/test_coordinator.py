@@ -410,10 +410,41 @@ def test_a_deleted_node_row_is_put_back_at_the_next_heartbeat(lease, clock):
     assert lease.heartbeat("a", a.uuid, 0)
 
 
-def test_a_heartbeat_never_takes_the_name_back_from_another_instance(lease, clock):
+def test_a_heartbeat_never_takes_the_name_back_from_another_instance(
+    lease, clock, caplog
+):
     a = make(lease, "a")
     a._rejoin()
     lease.register("a", "newer", "hash", [])
     a._tick()
+    a._tick()
     rows = {name: instance for name, instance, *_rest in lease.nodes()}
     assert rows["a"] == "newer"
+    # Reported, once rather than at every tick
+    assert caplog.text.count("Another instance has registered") == 1
+
+
+def test_a_new_uuid_not_yet_registered_isnt_reported_as_displaced(lease, clock, caplog):
+    a = make(lease, "a")
+    lead(a)
+    old = a.uuid
+    # As in the window after a step-down, before _rejoin registers the new
+    # UUID: the row still holds this process's own old one.
+    a.uuid = "new"
+    a.role = coordinator_mod.Role.STARTING
+    a._tick()
+    rows = {name: instance for name, instance, *_rest in lease.nodes()}
+    assert rows["a"] == old
+    assert "Another instance" not in caplog.text
+
+
+def test_a_candidate_puts_back_its_deleted_row(lease, clock):
+    a = make(lease, "a")
+    a._rejoin()
+    assert a.role == coordinator_mod.Role.CANDIDATE
+    with lease.sessionmaker() as session:
+        session.execute(sa.delete(db.Node).where(db.Node.name == "a"))
+        session.commit()
+    a._tick()
+    rows = {name: instance for name, instance, *_rest in lease.nodes()}
+    assert rows["a"] == a.uuid

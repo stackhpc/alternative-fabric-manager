@@ -351,8 +351,8 @@ class GaleraLease:
 
     def restore(self, node, instance_uuid, config_hash, adapters):
         """Put back this instance's node row if none exists, as after someone
-        deleted it by hand, and return whether it did. A row that holds
-        another instance's UUID is left alone (see One instance per name)."""
+        deleted it by hand, and return whether it did. A row that exists is
+        left alone, whichever UUID it holds (see One instance per name)."""
         with self._session() as session:
             if session.get(db.Node, node) is not None:
                 session.rollback()
