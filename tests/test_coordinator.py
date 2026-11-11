@@ -8,6 +8,7 @@ tests/functional runs the same code against Galera and processes.
 import threading
 
 import pytest
+import sqlalchemy as sa
 
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
@@ -392,3 +393,27 @@ def test_unanswered_checks_dont_wait_for_the_cooldown(lease, clock):
     a.manager.unanswered_checks = 3
     a._lead()
     assert a.role == coordinator_mod.Role.STARTING
+
+
+def test_a_deleted_node_row_is_put_back_at_the_next_heartbeat(lease, clock):
+    a = make(lease, "a")
+    lead(a)
+    b = make(lease, "b")
+    b._rejoin()
+    with lease.sessionmaker() as session:
+        session.execute(sa.delete(db.Node).where(db.Node.name == "a"))
+        session.commit()
+    a._tick()
+    # Without its row, a would be live but unseen by every other instance.
+    rows = {name: instance for name, instance, *_rest in b.lease.nodes()}
+    assert rows["a"] == a.uuid
+    assert lease.heartbeat("a", a.uuid, 0)
+
+
+def test_a_heartbeat_never_takes_the_name_back_from_another_instance(lease, clock):
+    a = make(lease, "a")
+    a._rejoin()
+    lease.register("a", "newer", "hash", [])
+    a._tick()
+    rows = {name: instance for name, instance, *_rest in lease.nodes()}
+    assert rows["a"] == "newer"

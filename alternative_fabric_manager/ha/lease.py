@@ -349,6 +349,25 @@ class GaleraLease:
             session.commit()
             return result.rowcount == 1
 
+    def restore(self, node, instance_uuid, config_hash, adapters):
+        """Put back this instance's node row if none exists, as after someone
+        deleted it by hand, and return whether it did. A row that holds
+        another instance's UUID is left alone (see One instance per name)."""
+        with self._session() as session:
+            if session.get(db.Node, node) is not None:
+                session.rollback()
+                return False
+            session.add(
+                db.Node(
+                    name=node,
+                    instance_uuid=instance_uuid,
+                    config_hash=config_hash,
+                    adapters=json.dumps(sorted(adapters)),
+                )
+            )
+            session.commit()
+            return True
+
     def record_verified_stop(self, node, instance_uuid):
         """Record that this instance verified its node runs no OpenSM, at the
         lease term read in the same transaction"""

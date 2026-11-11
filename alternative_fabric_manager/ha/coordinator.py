@@ -190,13 +190,24 @@ class Coordinator:
         if self.role in (Role.LEADER, Role.TAKING_OVER) and self._self_stop_due():
             return
         try:
-            self.lease.heartbeat(self.node, self.uuid, self._reach())
+            if not self.lease.heartbeat(self.node, self.uuid, self._reach()):
+                self._restore_row()
         except Exception as e:  # noqa: BLE001
             LOG.debug("Heartbeat failed: %s", e)
         if self.role in (Role.LEADER, Role.TAKING_OVER):
             self._lead()
         elif self.role == Role.CANDIDATE:
             self._watch()
+
+    def _restore_row(self):
+        """A heartbeat matched no row: put this instance's row back if it is
+        missing, so that it is never live unseen by the others, but never
+        take the name back from another instance (see One instance per
+        name)"""
+        if self.lease.restore(self.node, self.uuid, self.config_hash, self.adapters):
+            LOG.warning("This node's row was missing; restored it")
+        else:
+            LOG.error("Another instance has registered on node %s's row", self.node)
 
     def _probe_reach(self):
         reach = getattr(self.runner, "reach", None)

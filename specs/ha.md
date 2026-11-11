@@ -894,7 +894,11 @@ the OpenStack services do. SQLAlchemy makes the backend a
   than `create_all` at startup.
 - **One instance per name.** An instance registers a UUID on its node row
   at start. A restarted instance takes over its name once the old UUID's
-  heartbeat has been unchanged for `T`.
+  heartbeat has been unchanged for `T`. An instance whose heartbeat finds
+  no row for its node, as after someone deleted it by hand, puts its row
+  back, so that it is never live without one, unseen by the others. A
+  row that holds another instance's UUID is left alone: that instance has
+  taken over the name, and this one logs an error.
 
 All three instances are active HAProxy backends, round robin with no
 session stickiness, and HAProxy checks `/healthz`, which fails while the
