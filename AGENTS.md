@@ -18,7 +18,8 @@ anything under `alternative_fabric_manager/ha/`.
 | `alternative_fabric_manager/ha/` | HA: `lease.py` (Galera driver), `watchdog.py`, `coordinator.py`, `operator.py` |
 | `specs/ha.md` | The accepted HA design: the source of truth for HA behaviour |
 | `docs/opensm-hardening.md` | The hardened OpenSM defaults and their rationale |
-| `docs/kayobe.md` | Deploying HA mode with Kayobe's `controller_containers` |
+| `docs/kayobe.md` | Deploying HA mode with Kayobe's `controller_containers`, and configuring InfiniBand hosts, Neutron, Nova and Ironic |
+| `docs/infiniband-networks.md` | Creating InfiniBand networks and booting virtualised and bare metal instances on them |
 | `tests/` | Unit tests; `tests/functional/` is the failover harness |
 
 ## Commands
