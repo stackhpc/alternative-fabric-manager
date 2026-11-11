@@ -639,7 +639,7 @@ The port also needs `ibphysnet` as its physical network. Without one,
 Ironic lets any network use it, so an Ethernet network's port could land
 on it. How to set it depends on the Kayobe release:
 
-- **Kayobe 19 (2025.1) and later** use Ironic's built-in inspection, whose
+- **Kayobe 19 (2025.2) and later** use Ironic's built-in inspection, whose
   `physical-network` hook maps by IP address, which an InfiniBand interface
   doesn't have during inspection. Set it on each InfiniBand port after
   inspection, the ports whose `extra` has a `client-id`:
@@ -648,7 +648,7 @@ on it. How to set it depends on the Kayobe release:
   openstack baremetal port set --physical-network ibphysnet <port UUID>
   ```
 
-- **Kayobe 18 (2024.1) and earlier**, with standalone ironic-inspector and
+- **Kayobe 18 (2025.1) and earlier**, with standalone ironic-inspector and
   [stackhpc-inspector-plugins](https://github.com/stackhpc/stackhpc-inspector-plugins),
   can have the `ib_physnet` hook set it, in `etc/kayobe/inspector.yml`:
 
