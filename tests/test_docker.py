@@ -1,3 +1,4 @@
+import threading
 import types
 
 import pytest
@@ -391,3 +392,59 @@ def test_more_pkey_manager_errors_fail_closed(line):
     docker_driver._note_pkey_error(report, line)
     assert report.unattributed
     assert not docker_driver._is_partitions_error(line)
+
+
+class FakeImages:
+    def __init__(self, present=False, failures=0):
+        self.present = present
+        self.failures = failures
+        self.pulls = []
+
+    def get(self, name):
+        if not self.present:
+            raise docker_driver.docker.errors.ImageNotFound("no image")
+
+    def pull(self, name):
+        self.pulls.append(name)
+        if self.failures:
+            self.failures -= 1
+            raise docker_driver.docker.errors.APIError("registry down")
+        self.present = True
+
+
+def _image_client(images):
+    client = FakeManagedClient()
+    client.images = images
+    return client
+
+
+def test_ensure_image_pulls_a_missing_image(managed_config):
+    images = FakeImages()
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    driver.ensure_image()
+    assert images.pulls == [managed_config.image]
+
+
+def test_ensure_image_never_pulls_one_already_here(managed_config):
+    # A moving tag mustn't change which OpenSM runs from one start to the next.
+    images = FakeImages(present=True)
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    driver.ensure_image()
+    assert images.pulls == []
+
+
+def test_keep_image_retries_until_the_pull_succeeds(managed_config):
+    images = FakeImages(failures=2)
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    driver.keep_image(threading.Event(), interval=0)
+    assert len(images.pulls) == 3
+    assert images.present
+
+
+def test_keep_image_stops_when_asked(managed_config):
+    images = FakeImages(failures=1000)
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    stop = threading.Event()
+    stop.set()
+    driver.keep_image(stop, interval=0)
+    assert images.pulls == []

@@ -77,6 +77,8 @@ _PORT_GUID = re.compile(r"(?:of port|VPort|guid \()\s*0x([0-9a-fA-F]{1,16})")
 _SWITCH_PORT = re.compile(r"switch 0x([0-9a-fA-F]{1,16}) port (\d+)")
 _PARSE_LINE = re.compile(r"PARSE ERROR: line (\d+)")
 POLL_INTERVAL = 0.5
+# Seconds between attempts to pull OpenSM's image that failed
+PULL_RETRY = 60.0
 
 
 def _is_partitions_error(line):
@@ -290,6 +292,39 @@ class ManagedDocker(DockerReloader):
                 "running if the manager stops"
             )
         return kwargs
+
+    def ensure_image(self):
+        """Pull OpenSM's image if this host doesn't have it
+
+        A start, or a takeover in HA mode, then doesn't wait on a registry,
+        nor fail because one is down (see specs/ha.md, Timeouts). An image
+        already here is never pulled again: with a tag that moves, that would
+        change which OpenSM runs from one start to the next. Raises
+        DockerException if the pull fails."""
+        try:
+            self.client.images.get(self.config.image)
+            return
+        except docker.errors.ImageNotFound:
+            pass
+        LOG.info("Pulling OpenSM's image %s", self.config.image)
+        self.client.images.pull(self.config.image)
+        LOG.info("Pulled OpenSM's image %s", self.config.image)
+
+    def keep_image(self, stop, interval=PULL_RETRY):
+        """ensure_image(), retried every interval until it succeeds or stop
+        is set: for a thread of its own, since a pull may take minutes"""
+        while not stop.is_set():
+            try:
+                self.ensure_image()
+                return
+            except docker.errors.DockerException as e:
+                LOG.error(
+                    "Can't pull OpenSM's image %s, retrying in %d s: %s",
+                    self.config.image,
+                    interval,
+                    e,
+                )
+            stop.wait(interval)
 
     def _remove(self):
         with contextlib.suppress(docker.errors.NotFound):

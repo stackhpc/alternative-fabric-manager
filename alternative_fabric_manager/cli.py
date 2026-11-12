@@ -213,6 +213,14 @@ def main(argv=None):
         drivers.make_driver(config),
     )
     app = api.create_app(config, manager)
+    if hasattr(manager.driver, "ensure_image"):
+        import docker.errors
+
+        try:
+            manager.driver.ensure_image()
+        except docker.errors.DockerException as e:
+            # The start below tries again, and reports what fails.
+            logging.getLogger(__name__).error("Can't pull OpenSM's image: %s", e)
     manager.start()
     try:
         uvicorn.run(
@@ -261,6 +269,11 @@ def _serve_ha(config, args):
             log_level="debug" if args.debug else "info",
         )
     )
+    # Before any takeover needs it, and on every instance, so that a
+    # takeover doesn't wait on a registry (see specs/ha.md, Timeouts)
+    threading.Thread(
+        target=driver.keep_image, args=(threading.Event(),), name="image", daemon=True
+    ).start()
     threading.Thread(target=coordinator.start, name="coordinator", daemon=True).start()
     server.run()
 

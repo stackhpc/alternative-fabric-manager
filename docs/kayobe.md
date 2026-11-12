@@ -307,6 +307,18 @@ lease before Docker kills it.
     - { path: "{{ afm_state_dir }}", mode: "0700" }
   become: true
 
+# On every controller, so that a takeover never waits on the registry (see
+# specs/ha.md, Timeouts). AFM pulls it too if it's missing.
+- name: Ensure OpenSM's image is present
+  ansible.builtin.command:
+    argv:
+      - "{{ container_engine }}"
+      - pull
+      - "{{ afm_opensm_image }}"
+  register: afm_opensm_pull
+  changed_when: "'Downloaded newer image' in afm_opensm_pull.stdout"
+  become: true
+
 - name: Read kolla's passwords
   ansible.builtin.set_fact:
     afm_kolla_passwords: >-
