@@ -46,6 +46,7 @@ from tests.functional.test_failover import (
     _operator,
     cluster_size,
     docker,
+    galera_name,
     wait_for,
 )
 
@@ -80,8 +81,10 @@ class Client:
     """One worker: its own networks and ports, one request at a time, as
     networking-mlnx orders them per object"""
 
-    def __init__(self, cluster, history, w, rng, stop):
+    def __init__(self, cluster, history, w, rng, stop, interval=0.0):
         self.cluster = cluster
+        # A pause after each completed request, for a steady trickle
+        self.interval = interval
         self.history = history
         self.w = w
         self.rng = rng
@@ -166,6 +169,8 @@ class Client:
                 return False
             if self._wait(job) == "Completed":
                 self.completed += 1
+                if self.interval:
+                    self.stop.wait(self.interval)
                 return True
         raise AssertionError(f"{method} {path} failed 20 times")
 
@@ -338,10 +343,10 @@ class Nemesis:
         return heal
 
     def pause_galera(self, i):
-        docker("pause", f"afm-galera-{i}")
+        docker("pause", galera_name(i))
 
         def heal():
-            docker("unpause", f"afm-galera-{i}", check=False)
+            docker("unpause", galera_name(i), check=False)
             self._whole(i)
 
         return heal
@@ -555,7 +560,7 @@ def test_nemesis(cluster, tmp_path):
             if name.split("-")[0] in ("hang", "linkdown"):
                 os.unlink(os.path.join(cluster.fabric, name))
         for i in NODES:
-            docker("unpause", f"afm-galera-{i}", check=False)
+            docker("unpause", galera_name(i), check=False)
             try:
                 _isolate(cluster, i, False, wait=False)
             except AssertionError:

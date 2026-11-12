@@ -47,7 +47,15 @@ AFM_FUNCTIONAL=1 timeout 2400 uv run pytest -q tests/functional/test_failover.py
   seed; the Functional workflow can also be run by hand, with a seed to
   replay.
 - The Galera containers are shared by every session on the host: check
-  `docker ps` for `afm-galera-*` before starting, and take turns.
+  `docker ps` for `afm-galera-*` before starting, and take turns, or set
+  `AFM_FUNCTIONAL_OFFSET` (such as 100) to run on other ports and
+  containers (`afm-galera100-*`) beside the usual ones.
+- The soak, `tests/functional/test_soak.py`, needs `AFM_SOAK=1` and runs
+  for `AFM_SOAK_SECONDS`, 12 hours by default, with the production
+  timings and a steady trickle of requests, and checks that one leader,
+  term and OpenSM process last throughout, no job fails, and memory and
+  descriptors don't grow. Run it in the background with an offset; it
+  writes `soak.json`, a sample a minute, as it goes.
 
 ## Diagnose
 
