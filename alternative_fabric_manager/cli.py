@@ -251,9 +251,11 @@ def _serve_ha(config, args):
         config, lease_mod.GaleraLease(sessionmaker), driver, manager
     )
     app = api.create_app(config, manager, coordinator)
+    image_stop = threading.Event()
 
     class Server(uvicorn.Server):
         def handle_exit(self, sig, frame):
+            image_stop.set()
             # Step down before uvicorn stops: it raises the signal again once
             # it has, which ends the process.
             coordinator.shutdown()
@@ -270,7 +272,7 @@ def _serve_ha(config, args):
     # Before any takeover needs it, and on every instance, so that a
     # takeover doesn't wait on a registry (see specs/ha.md, Timeouts)
     threading.Thread(
-        target=driver.keep_image, args=(threading.Event(),), name="image", daemon=True
+        target=driver.keep_image, args=(image_stop,), name="image", daemon=True
     ).start()
     threading.Thread(target=coordinator.start, name="coordinator", daemon=True).start()
     server.run()

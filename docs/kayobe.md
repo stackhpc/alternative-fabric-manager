@@ -308,18 +308,29 @@ lease before Docker kills it.
   become: true
 
 # On every controller, so that a takeover never waits on the registry (see
-# specs/ha.md, Timeouts). AFM pulls it too if it's missing.
+# specs/ha.md, Timeouts). Only when it's missing, so that a deploy doesn't
+# need the registry, nor move a tag under AFM. AFM pulls it too if it's
+# missing, with the credentials in its own container: for a private
+# registry, mount a Docker config.json into it as well.
+- name: Check whether OpenSM's image is present
+  ansible.builtin.command:
+    argv:
+      - "{{ container_engine }}"
+      - image
+      - inspect
+      - "{{ afm_opensm_image }}"
+  register: afm_opensm_inspect
+  changed_when: false
+  failed_when: false
+  become: true
+
 - name: Ensure OpenSM's image is present
   ansible.builtin.command:
     argv:
       - "{{ container_engine }}"
       - pull
       - "{{ afm_opensm_image }}"
-  register: afm_opensm_pull
-  # Docker reports a download on stdout, Podman on stderr
-  changed_when: >-
-    'Downloaded newer image' in afm_opensm_pull.stdout
-    or 'Copying blob' in afm_opensm_pull.stderr
+  when: afm_opensm_inspect.rc != 0
   become: true
 
 - name: Read kolla's passwords

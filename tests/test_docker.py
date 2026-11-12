@@ -518,3 +518,32 @@ def test_keep_image_stops_when_asked(managed_config):
     stop.set()
     driver.keep_image(stop, interval=0)
     assert images.pulls == []
+
+
+def test_ensure_image_pulls_latest_for_an_untagged_name(managed_config):
+    managed_config.image = "ghcr.io/stackhpc/docker-opensm"
+    images = FakeImages()
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    driver.ensure_image()
+    assert images.pulls == ["ghcr.io/stackhpc/docker-opensm:latest"]
+
+
+def test_ensure_image_fails_if_the_pull_leaves_no_image(managed_config):
+    images = FakeImages()
+    client = _image_client(images)
+    client.api = types.SimpleNamespace(pull=lambda *a, **k: iter([{"status": "?"}]))
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    with pytest.raises(docker_driver.docker.errors.ImageNotFound):
+        driver.ensure_image()
+
+
+def test_has_image_takes_any_404_as_absent(managed_config):
+    # docker-py makes a 404 ImageNotFound only by its wording.
+    class Images:
+        def get(self, _name):
+            raise docker_driver.docker.errors.NotFound("image not known")
+
+    client = FakeManagedClient()
+    client.images = Images()
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    assert driver.has_image() is False

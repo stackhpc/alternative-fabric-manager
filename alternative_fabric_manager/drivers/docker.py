@@ -299,7 +299,9 @@ class ManagedDocker(DockerReloader):
         try:
             self.client.images.get(self.config.image)
             return True
-        except docker.errors.ImageNotFound:
+        # docker-py makes a 404 ImageNotFound only by its message's wording,
+        # which another API, such as Podman's, may not match
+        except docker.errors.NotFound:
             return False
 
     def ensure_image(self):

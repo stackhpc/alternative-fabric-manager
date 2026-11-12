@@ -49,6 +49,7 @@ class Client:
         self.runs = []
         self.probe = probe
         self.images = Images()
+        self.api = self.images
 
     def get(self, _name):
         if self.existing is None:
@@ -217,4 +218,36 @@ def test_reach_is_none_without_the_image_and_never_pulls_it(driver):
     driver.client.images.present = False
     driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
     assert driver.reach() is None
+    assert driver.client.runs == []
+
+
+def test_reach_is_none_if_docker_cant_say_whether_the_image_is_here(driver):
+    def get(_name):
+        raise ha_docker.docker.errors.APIError("daemon unhappy")
+
+    driver.client.images.get = get
+    assert driver.reach() is None
+    assert driver.client.runs == []
+
+
+def test_a_missing_image_is_logged_once_until_it_returns(driver, caplog):
+    caplog.set_level("INFO")
+    driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
+    driver.client.images.present = False
+    for _ in range(3):
+        assert driver._probe_reach() is None
+    assert caplog.text.count("No OpenSM image here") == 1
+    driver.client.images.present = True
+    assert driver._probe_reach() == 1
+    assert caplog.text.count("OpenSM's image is here") == 1
+
+
+def test_start_fails_rather_than_pull_a_missing_image(driver):
+    # A takeover then steps down rather than wait on a registry holding the
+    # lease (see specs/ha.md, Timeouts).
+    driver.prepare("u", 3, 1e12)
+    driver.write_lease("u", 3, 1e12)
+    driver.client.images.present = False
+    with pytest.raises(ha_docker.docker_driver.ReloadError, match="isn't on this node"):
+        driver.start()
     assert driver.client.runs == []

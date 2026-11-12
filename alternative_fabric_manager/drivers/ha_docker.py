@@ -72,6 +72,8 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         self.m_key = m_key or (lambda: None)
         self._start = None
         self._reach = (None, -REACH_CACHE)
+        # Whether the last probe found no image, to log only the change
+        self._image_missing = False
 
     def _run_kwargs(self):
         kwargs = super()._run_kwargs()
@@ -120,6 +122,19 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         }
 
     def start(self):
+        # A reach probed before the image went, or a frozen node's restart,
+        # mustn't make containers.run() pull it: the start would wait on the
+        # registry, holding the lease (see specs/ha.md, Timeouts). Failing
+        # instead, a takeover steps down for another candidate, and a frozen
+        # node retries once keep_image() has pulled it.
+        try:
+            present = self.has_image()
+        except docker.errors.DockerException as e:
+            raise docker_driver.ReloadError(f"Docker: {e}") from e
+        if not present:
+            raise docker_driver.ReloadError(
+                f"OpenSM's image {self.config.image} isn't on this node"
+            )
         instance, term, deadline = self._start
         wd.write_atomically(
             self.state_dir,
@@ -209,11 +224,17 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # A node without the image can't start OpenSM either, so it reports
         # nothing reached until keep_image() has pulled it.
         try:
-            if not self.has_image():
-                LOG.warning("No OpenSM image here yet, so this node isn't eligible")
-                return None
+            present = self.has_image()
         except docker.errors.DockerException as e:
             LOG.warning("Can't probe this node's reach: %s", e)
+            return None
+        if present != (not self._image_missing):
+            self._image_missing = not present
+            if present:
+                LOG.info("OpenSM's image is here, so this node can be eligible")
+            else:
+                LOG.warning("No OpenSM image here, so this node isn't eligible")
+        if not present:
             return None
         key = self.m_key()
         command = [
