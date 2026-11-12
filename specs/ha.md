@@ -70,8 +70,9 @@ would stop itself. The deployment role checks this.
 
 | Table | Holds |
 | --- | --- |
-| `networks` | Network ID, type, pkey (unique, NULL for flat networks), name |
-| `ports` | Port ID, network (foreign key), GUID (unique), host |
+| `networks` | Network ID, type, pkey (unique, NULL for flat networks), name, the highest revision it was set at (see Late requests) |
+| `ports` | Port ID, network (foreign key), GUID (unique), host, the highest revision it was set at |
+| `tombstones` | Deleted objects' kind, ID, the highest revision they were set at and were deleted at, and the deletion time, for 7 days (see Late requests) |
 | `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), when leadership last moved, and the **freeze**: whether it is frozen, the frozen leader's node, instance UUID and term, who froze it, when, and when it expires (see Freeze) |
@@ -79,7 +80,7 @@ would stop itself. The deployment role checks this.
 | `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
-| `deferred` | A request whose pkey or GUID another object still holds, or a port on a network that waits or is quarantined, its values and its job |
+| `deferred` | A request whose pkey or GUID another object still holds, or a port on a network that waits or is quarantined, its values, revision and job |
 
 networking-mlnx orders requests per object only, so a network reusing a
 deleted network's VLAN, or a port taking over a deleted port's GUID, can
@@ -293,6 +294,79 @@ attempt counter, so that a retry still changes the file and OpenSM runs a
 pkey sweep. Every `check_interval`, the leader also reconciles: if its file
 isn't what it last applied, or the state rendered at that generation
 differs, it applies again.
+
+### Late requests
+
+With more than one instance, a request can run after a later one for the
+same object. An instance that is paused, as a container or a host can be,
+holds the requests the kernel had already accepted for it, for as long as
+it is paused: HAProxy, which keeps routing to it for about 10 s, bounds
+nothing once a request is in its socket. networking-mlnx times out, after
+10 s by default, sends the same request again through HAProxy to another
+instance, and then the object's next requests; the paused instance runs
+the first one when it resumes, whatever happened since. A port's create
+or update that runs after the port's deletion would put a deleted port's
+GUID back in a tenant's partition, and networking-mlnx has no full sync
+that would remove it. One instance can't do this: networking-mlnx sends an
+object's requests one at a time, and a resent one queues behind the first.
+
+So every request is checked against what the database holds for its
+object, using the `revision_number` that networking-mlnx sends in each
+object's dict, deletions included, as Neutron has it. The check runs in
+the request's own transaction, after the generation bump, which serialises
+requests, so that a late request queued behind a deletion sees its
+tombstone; a refusal rolls the transaction back.
+
+- **What networking-mlnx sends.** Neutron's revision for an object only
+  ever rises, in each transaction that changes it. A port's create, on
+  binding, carries the revision before the binding's bump, and its update
+  the revision after its own; an update that changed nothing carries the
+  same revision as the last. A host move, as in a live migration, sends the
+  port's deletion and its create in one transaction, at the same revision,
+  above any earlier one. A deletion of the port, rather than an unbind,
+  carries a revision read before the deletion's transaction, which may be
+  below one already sent. A resent request carries the same revision as
+  the first. A network is never created again under the same ID, and a port
+  is created again under its ID when it is bound again or moved.
+- **Live objects, and deferred requests, record the highest revision they
+  were set at.** A create or update below it is refused with a 400: no
+  sender is waiting for it, and it can never succeed. An equal one is a
+  resend: applied again if the object is live, and, if its request is
+  deferred and its job still open, answered with that request's job,
+  without superseding it, so
+  that the job networking-mlnx polls still ends as it should. A deferred
+  request records its revision when it is applied later.
+- **A deletion leaves a tombstone**, whether or not the object was live or
+  deferred, with `s`, the highest of the live object's revision, its
+  deferred request's, and an earlier tombstone's `s`, and `d`, the highest
+  deletion revision seen. A port's create or update after it passes only
+  if its revision is above `s` and at least `d`, and removes the tombstone
+  once the port is set, then or when a deferred request is applied later;
+  while it waits, the tombstone stays, so that if its job fails, a late
+  request from before the deletion is still refused: a host move's create, at the deletion's revision and
+  above any earlier one, passes, as does a create after an unbind, while a
+  late update that changed nothing, at `s`, is refused. Any create or update
+  of a tombstoned network is refused, whatever its revision, or without
+  one: a network that was never updated is created and deleted at the same
+  revision.
+- **A deletion is always applied, unchecked.** A deletion of the port
+  carries a revision read before its own transaction, possibly below one
+  already sent, so a late deletion can't be told from a current one. It
+  only ever removes a GUID from a partition, so it can't break isolation,
+  but a late deletion after a host move removes a live port, which Neutron
+  shows ACTIVE, from its partition until its next update that changes it,
+  or its next binding, which may never come; a resend at the same revision
+  doesn't restore it. This is a known limitation. A deletion at or below a live port's
+  revision logs a warning naming it.
+- **A request with no `revision_number`** is neither checked nor recorded,
+  except against a network's tombstone; a deletion without one leaves a
+  tombstone with no `d`. Objects from before revisions were recorded have
+  none until their next request.
+- **Tombstones are kept for 7 days** and then removed by the leader's
+  reconcile; the single-node manager records and removes them alike. After
+  Neutron's database is restored from a backup, its revisions go back and
+  deleted IDs return, so `--forget-revisions` clears the tombstones and
+  the revisions recorded on objects and deferred requests.
 
 ### Quarantine
 
@@ -968,6 +1042,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
 | Any one Galera node lost, even a candidate's | Every node's commits block until the survivors evict it, after `evs.suspect_timeout`, 5 s by default, and a view change; the leader's renewals fail meanwhile, but its liveness thread keeps the watchdog's lease | Within `T_self`, nothing happens |
 | A MariaDB failover | Failed reads reset the candidates' timers, and the leader's renewals fail meanwhile | Within `T_self`, nothing happens. Longer, the leader stops its OpenSM, and a leader is elected once a Primary component is back, so the SA is down meanwhile, and jobs in flight can time out and are resent |
+| A request runs late, from an instance paused after accepting it, after the object's later requests | A create or update below the object's revision, or not past its tombstone's, or of a deleted network, is refused; a deletion is applied (see Late requests) | No deleted port comes back to its partition; a late deletion after a host move can leave a live port out of its partition, with a warning |
 | A managed node's SM appears | The fabric checks find it; the leader asks it to stop | No job completes until it is gone; alarm |
 | A tenant runs an SM | It has no keys, so it can't master or set ports | An alarm; jobs carry on unless it is master |
 | Galera unavailable, or no Primary component | Requests and `/healthz` fail; no takeover is possible, and the leader stops its OpenSM within `T_self` | The fabric runs without a subnet manager: forwarding carries on with the switches' tables, but SA queries, multicast joins and link changes go unhandled until the database is back. networking-mlnx retries its requests |
