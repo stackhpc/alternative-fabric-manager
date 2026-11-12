@@ -174,8 +174,8 @@ the target set, self-stop and the waits in Fencing.
   on these reads, though: a read from a lagging node could show a stale
   counter and so a false expiry, but the takeover's compare-and-set
   includes the counter it saw, so it matches no row, or Galera's
-  certification aborts it. Lease reads use `wsrep_sync_wait = 1`, as every
-  session does, so false expiries are rare.
+  certification aborts it. Lease reads wait causally, as every session's
+  statements do (see Galera specifics), so false expiries are rare.
 - **The target set** holds an entry for every instance that may have run
   OpenSM since the last stop that was released or verified: its node, its
   instance UUID, and the term in which it was added. A takeover never
@@ -976,21 +976,18 @@ the OpenStack services do. SQLAlchemy makes the backend a
   included, as oslo.db does for OpenStack services.
 - **Map constraint errors.** A pkey or GUID clash that reaches a unique
   constraint, or a port whose network is gone, is a 400, not a 500.
-- **Read your own writes.** Every manager session sets
-  `wsrep_sync_wait = 1`, so a read waits for writes already committed on
-  other Galera nodes; Kolla's VIP fails over between Galera nodes.
-- **Only a caught-up node serves.** A Galera node that rejoins after an
-  outage, Joining or Joined, answers queries from its own state before it
-  has caught up with the cluster's, which `wsrep_sync_wait` doesn't hold
-  back: a request it served could be refused with a final 400 for state it
-  hasn't received yet, such as a port on a network created meanwhile, as
-  the nemesis found. So a request, the leader's read of the state it
-  renders, and every lease read and write first check that their node is
-  Primary, ready, and Synced or Donor/Desynced, which a donor is while it
-  sends a joiner its state, which it has in full. Otherwise a request gets
-  503, which networking-mlnx retries; the leader renders nothing; and a
-  lease call fails, as when the node isn't Primary, so `/healthz` fails
-  too.
+- **Read what the cluster committed.** Every manager session sets
+  `wsrep_sync_wait = 7`, so that every statement, reads, updates, deletes
+  and inserts alike, waits until its Galera node has applied what the
+  cluster had committed when it began; Kolla's VIP fails over between
+  Galera nodes. Reads alone, `1`, aren't enough: a request's transaction
+  begins with the generation bump, an `UPDATE`, and no read after it in
+  the transaction waits, so a node that lags the cluster, by apply lag or
+  while it rejoins after an outage, would answer from its older state, and
+  could refuse a valid request with a final 400 for state it hasn't
+  applied yet, such as a port on a network created meanwhile, as the
+  nemesis found. A request whose node isn't in a Primary component, or
+  isn't ready, gets 503, which networking-mlnx retries.
 - **UTC.** Timestamps and deadlines are `DATETIME(6)` values set and
   compared with `UTC_TIMESTAMP(6)`, so that no session's timezone or
   daylight saving change can age a job. SQLite uses its own UTC functions.

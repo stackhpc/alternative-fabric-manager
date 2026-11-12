@@ -1396,12 +1396,14 @@ def _try(cluster, i, method, path, body):
         pass
 
 
-def test_a_rejoining_galera_node_refuses_nothing_it_hasnt_caught_up_with(cluster):
+def test_a_lagging_galera_node_refuses_nothing_the_cluster_committed(cluster):
     # A Galera node paused until the others evict it misses a network
-    # created meanwhile. While it rejoins, it answers from its older state,
-    # so its instance must not refuse a port on that network with a final
-    # 400, only 503 or 500, until it has caught up (see specs/ha.md, Galera
-    # specifics).
+    # created meanwhile, and lags the cluster while it rejoins. A port on
+    # that network through its instance must wait for the node to catch up,
+    # through the causal wait every statement makes, the generation bump's
+    # UPDATE first, or get 503 or 500, never a final 400 for a network it
+    # hasn't applied yet (see specs/ha.md, Galera specifics). With reads
+    # alone waiting, the old setting, it got a 400 in each of three runs.
     leader = cluster.wait_leader()
     rejoining = next(i for i in NODES if i != leader)
     other = next(i for i in NODES if i not in (leader, rejoining))

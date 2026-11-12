@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+import sqlalchemy as sa
 
 from alternative_fabric_manager import db
 from tests import conftest
@@ -116,23 +117,51 @@ def _galera(state, comment, cluster="Primary", ready="ON"):
 
 @pytest.mark.parametrize(
     "session",
-    [_galera("4", "Synced"), _galera("2", "Donor/Desynced"), _GaleraSession({}, 0)],
+    [
+        _galera("4", "Synced"),
+        _galera("2", "Donor/Desynced"),
+        # Whether it has caught up is the causal wait's job, not this check's
+        _galera("3", "Joined"),
+        _GaleraSession({}, 0),
+    ],
 )
-def test_a_caught_up_node_serves(session):
+def test_a_primary_ready_node_serves(session):
     db.check_serving(session)
 
 
 @pytest.mark.parametrize(
     "session",
     [
-        # Rejoining: it answers from its own, older state (see specs/ha.md,
-        # Galera specifics)
-        _galera("1", "Joining"),
-        _galera("3", "Joined"),
         _galera("4", "Synced", cluster="non-Primary"),
         _galera("4", "Synced", ready="OFF"),
     ],
 )
-def test_a_node_not_caught_up_doesnt_serve(session):
+def test_a_node_not_primary_or_not_ready_doesnt_serve(session):
     with pytest.raises(db.NotServing):
         db.check_serving(session)
+
+
+def test_a_failed_status_query_doesnt_serve():
+    class Failing(_GaleraSession):
+        def execute(self, _statement):
+            raise sa.exc.OperationalError("SHOW STATUS", {}, Exception("lost"))
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(db.NotServing):
+        db.check_serving(Failing({}))
+
+
+def test_every_statement_waits_causally(config):
+    # A request's transaction begins with an UPDATE, the generation bump, so
+    # reads alone (1) wouldn't make it wait (see specs/ha.md, Galera
+    # specifics).
+    if not config.connection:
+        pytest.skip("needs a server database: AFM_TEST_DATABASE_URL")
+    session = db.make_sessionmaker(config.database_url)()
+    try:
+        value = session.scalar(sa.text("SELECT @@session.wsrep_sync_wait"))
+    except sa.exc.DBAPIError:
+        pytest.skip("a server without wsrep")
+    assert value == db.SYNC_WAIT == 7

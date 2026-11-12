@@ -67,8 +67,8 @@ def _age(when, now):
 
 
 def _check_primary(session):
-    """A lease call runs only on a Galera node that is Primary, ready and
-    caught up (see The lease, Galera specifics)"""
+    """A lease call runs only on a Galera node in a Primary component, and
+    ready (see The lease, Galera specifics)"""
     try:
         db.check_serving(session)
     except db.NotServing as e:
