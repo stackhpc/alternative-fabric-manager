@@ -55,10 +55,14 @@ Changing a shared DevStack's configuration needs its owner's agreement.
 
 1. **Back up the database.** Single-node:
    `sudo cp -a /var/lib/docker/volumes/afm_data/_data/afm.sqlite <backup>`.
-   HA: `mariadb-dump` of AFM's database, with its own credentials.
+   HA: `mariadb-dump` of AFM's database, with its own credentials, read
+   from `[database] connection` into a variable, never printed. Either way
+   the backup holds the fabric's keys: keep it in a root-only directory,
+   mode 600, such as `/var/backups/afm`.
 2. **Build**, with `--network host` if the host's Docker has no bridge:
    ```sh
-   sudo docker build -q --network host -t alternative-fabric-manager:<tag> .
+   sudo docker build -q --network host \
+     --build-arg UV_VERSION="$(<.uv-version)" -t alternative-fabric-manager:<tag> .
    ```
 3. **HA only: create or upgrade the schema**, on a new database, or if
    the branch adds an Alembic revision:
@@ -75,7 +79,8 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    `[opensm] manager_container` says:
    ```sh
    sudo docker stop -t 30 alternative-fabric-manager
-   sudo docker rm alternative-fabric-manager
+   # Renamed rather than removed, to roll back by starting it again
+   sudo docker rename alternative-fabric-manager alternative-fabric-manager-<old tag>
    sudo docker run -d --init --name alternative-fabric-manager \
      --restart unless-stopped --stop-timeout 30 --network host \
      -v /etc/alternative-fabric-manager:/etc/alternative-fabric-manager:ro \
