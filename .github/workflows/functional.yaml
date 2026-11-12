@@ -1,0 +1,141 @@
+# The HA functional tests (see the functional-tests skill): three AFM
+# instances against a three-node Galera cluster in containers, with a fake
+# OpenSM under the real watchdog.
+#
+# - Pull requests that touch HA code run the failover suite.
+# - Every night, the nemesis runs for longer, with a random seed: each run
+#   tries new interleavings of faults.
+# - The release workflow calls it with the nemesis as a gate, so that no
+#   version is tagged without a passing run.
+# - Either can be run by hand.
+#
+# A failed run uploads every test's instance logs, fabric directory and,
+# for the nemesis, history.json, and its summary names the nemesis seed,
+# for AFM_NEMESIS_SEED to replay the schedule.
+name: Functional
+
+on:
+  pull_request:
+    paths:
+      - "alternative_fabric_manager/ha/**"
+      - "alternative_fabric_manager/manager.py"
+      - "alternative_fabric_manager/drivers/**"
+      - "alternative_fabric_manager/db.py"
+      - "alternative_fabric_manager/migrations/**"
+      - "alternative_fabric_manager/api.py"
+      - "tests/functional/**"
+      - ".github/workflows/functional.yaml"
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "failover or nemesis"
+        required: true
+        default: failover
+        type: choice
+        options: [failover, nemesis]
+      nemesis_seconds:
+        description: "How long the nemesis injects faults"
+        default: "300"
+        type: string
+      nemesis_seed:
+        description: "A seed to replay, or empty for a random one"
+        default: ""
+        type: string
+  workflow_call:
+    inputs:
+      suite:
+        required: true
+        type: string
+      nemesis_seconds:
+        default: "300"
+        type: string
+      nemesis_seed:
+        default: ""
+        type: string
+      ref:
+        description: "What to check out, such as main for a release"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: functional-${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  functional:
+    name: >-
+      ${{ (inputs.suite || (github.event_name == 'schedule' && 'nemesis') || 'failover') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SUITE: ${{ inputs.suite || (github.event_name == 'schedule' && 'nemesis') || 'failover' }}
+      # Nightly runs are longer, to find what short ones miss.
+      AFM_NEMESIS_SECONDS: >-
+        ${{ inputs.nemesis_seconds || (github.event_name == 'schedule' && '1800') || '300' }}
+      AFM_NEMESIS_SEED: ${{ inputs.nemesis_seed }}
+      # The runner's user can use Docker without sudo.
+      AFM_DOCKER: docker
+      AFM_FUNCTIONAL: "1"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Pull MariaDB's image
+        run: docker pull docker.io/library/mariadb:10.11
+
+      - name: Run the failover suite
+        if: env.SUITE == 'failover'
+        run: >-
+          uv run pytest -q tests/functional/test_failover.py
+          --basetemp="$RUNNER_TEMP/functional"
+
+      - name: Run the nemesis
+        if: env.SUITE == 'nemesis'
+        env:
+          AFM_NEMESIS: "1"
+        run: |
+          set -o pipefail
+          uv run pytest -q -s tests/functional/test_nemesis.py \
+            --basetemp="$RUNNER_TEMP/functional" | tee "$RUNNER_TEMP/nemesis.txt"
+
+      - name: Summarise the nemesis
+        if: always() && env.SUITE == 'nemesis'
+        run: |
+          {
+            echo "## Nemesis"
+            echo
+            grep -E "AFM_NEMESIS_SEED=|faults,|NOTE:" "$RUNNER_TEMP/nemesis.txt" \
+              | sed 's/^/    /' || echo "No summary: see the log."
+            echo
+            echo "Replay with \`AFM_NEMESIS_SEED=<seed>\`, by hand or with this"
+            echo "workflow's nemesis_seed input."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: functional-${{ env.SUITE }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/functional
+            ${{ runner.temp }}/nemesis.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Remove the Galera containers
+        if: always()
+        run: docker rm -f afm-galera-1 afm-galera-2 afm-galera-3 || true

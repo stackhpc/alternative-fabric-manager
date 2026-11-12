@@ -38,6 +38,13 @@ AFM_FUNCTIONAL=1 timeout 2400 uv run pytest -q tests/functional/test_failover.py
   lines, and read `history.json` in its test directory after a failure.
 - Run in the background if it may outlast a tool call's timeout.
 - Run it twice after a timing-sensitive change: one pass can hide a race.
+- CI (`.github/workflows/functional.yaml`) runs the failover suite on pull
+  requests that touch HA code, the nemesis nightly for 30 minutes, and the
+  nemesis before every release. A failed run uploads the logs and
+  `history.json` as an artifact, and its summary names the seed; the
+  workflow can also be run by hand, with a seed to replay.
+- The Galera containers are shared by every session on the host: check
+  `docker ps` for `afm-galera-*` before starting, and take turns.
 
 ## Diagnose
 

@@ -1,6 +1,7 @@
-# Release a version: bump it in pyproject.toml and uv.lock, commit that to
-# main, tag the commit once pushed, open a draft release with generated
-# notes, and build the release's image.
+# Release a version: run the nemesis on main, bump the version in
+# pyproject.toml and uv.lock, commit that to main, tag the commit once
+# pushed, open a draft release with generated notes, and build the
+# release's image.
 name: Release
 
 on:
@@ -18,8 +19,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # No version is tagged without a passing nemesis on main (see
+  # functional.yaml): a randomized run of HA faults against live requests,
+  # with the history checked afterwards.
+  nemesis:
+    name: Nemesis
+    permissions:
+      contents: read
+    uses: ./.github/workflows/functional.yaml
+    with:
+      suite: nemesis
+      ref: main
+
   release:
     name: Release ${{ inputs.version }}
+    needs: nemesis
     runs-on: ubuntu-latest
     permissions:
       # Push the commit and the tag, and create the release
