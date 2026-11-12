@@ -113,7 +113,10 @@ class Coordinator:
     def healthy(self):
         """Whether HAProxy should send this instance requests, and why not:
         not while it stops, nor while it can't reach a Primary component,
-        as seen by its heartbeat every period (see Galera specifics)"""
+        as seen by its heartbeat every period (see Galera specifics). A
+        lease thread held up, as by a step-down waiting for the applier, or
+        a leader whose stop can't be verified, also skips heartbeats, and so
+        leaves rotation while the others serve."""
         if self.role in (Role.STOPPING, Role.STOPPED):
             return False, "Stopping"
         seen = self._database_seen

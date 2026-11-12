@@ -176,7 +176,7 @@ class Client:
             net = str(uuid.uuid4())
             # Never reused within a run, so that an object a delayed request
             # brings back can't clash with a later one's pkey or GUID
-            vlan = 300 + self.w * 1000 + cycle
+            vlan = 300 + self.w * 1000 + cycle % 1000
             ok = self._do(
                 "POST",
                 "/cloudx/Network",
