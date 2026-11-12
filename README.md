@@ -46,6 +46,10 @@ the SDN controller" (https://review.opendev.org/c/x/networking-mlnx/+/1014376)
 for the manager to learn of a flat network when it is created; until then its
 ports are rejected. A port's GUID can be in only one network's partition.
 
+[docs/infiniband-networks.md](docs/infiniband-networks.md) shows how to
+create InfiniBand networks and boot virtualised and bare metal instances on
+them.
+
 ## Running it
 
 By default (`[opensm] driver = managed`) the manager runs OpenSM itself, in
