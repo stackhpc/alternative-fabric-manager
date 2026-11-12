@@ -39,9 +39,21 @@ LOG = logging.getLogger(__name__)
 
 JOB_PATH = "app/jobs/%d"
 JsonBody = Annotated[dict[str, Any], fastapi.Body()]
-# networking-mlnx sends the object's dict with a DELETE too, whose
-# revision_number the manager records (see specs/ha.md, Late requests)
-OptionalJsonBody = Annotated[dict[str, Any] | None, fastapi.Body()]
+
+
+async def _lenient_body(request: fastapi.Request):
+    """A DELETE's body: networking-mlnx sends the object's dict, whose
+    revision_number the manager records (see specs/ha.md, Late requests).
+    Anything but a JSON object counts as no body, so that a DELETE always
+    gets a job."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 - empty, or not JSON
+        return None
+    return data if isinstance(data, dict) else None
+
+
+OptionalJsonBody = Annotated[dict[str, Any] | None, fastapi.Depends(_lenient_body)]
 
 
 def create_app(config, manager, coordinator=None):
@@ -100,7 +112,7 @@ def create_app(config, manager, coordinator=None):
         return accepted(manager.put_network(network_id, data))
 
     @router.delete("/{domain}/Network/{network_id}", status_code=202)
-    def delete_network(domain: str, network_id: str, data: OptionalJsonBody = None):
+    def delete_network(domain: str, network_id: str, data: OptionalJsonBody):
         check_domain(domain)
         return accepted(manager.delete_network(network_id, data))
 
@@ -115,7 +127,7 @@ def create_app(config, manager, coordinator=None):
         return accepted(manager.put_port(port_id, data))
 
     @router.delete("/{domain}/Port/{port_id}", status_code=202)
-    def delete_port(domain: str, port_id: str, data: OptionalJsonBody = None):
+    def delete_port(domain: str, port_id: str, data: OptionalJsonBody):
         check_domain(domain)
         return accepted(manager.delete_port(port_id, data))
 

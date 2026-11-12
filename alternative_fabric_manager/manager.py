@@ -189,7 +189,9 @@ class Manager:
     @staticmethod
     def revision_of(data):
         """Neutron's revision_number in a request's dict, or None"""
-        value = (data or {}).get("revision_number")
+        if not isinstance(data, dict):
+            return None
+        value = data.get("revision_number")
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
         return value
@@ -273,7 +275,8 @@ class Manager:
         tombstone.deleted_revision = max(deleted, default=None)
         tombstone.deleted_at = _now()
         if (
-            live is not None
+            kind == "port"
+            and live is not None
             and live.revision is not None
             and revision is not None
             and revision <= live.revision

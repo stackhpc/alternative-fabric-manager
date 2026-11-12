@@ -778,7 +778,11 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   `kayobe overcloud service deploy`. Its `pre.yml` upgrades the schema
   first; each schema change is compatible with the version before. The
   leader steps down when its container is replaced, releasing the lease,
-  and another instance takes over at once.
+  and another instance takes over at once. A schema change that rebuilds a
+  table, such as widening the jobs table's counters, blocks every commit in
+  the Galera cluster while it runs, so upgrade at a quiet time: if it took
+  longer than `self_stop_timeout`, the leader would stop OpenSM until it
+  ends.
 - **Upgrading from a version with `[ha] manual_takeover`**: if you set it
   to true, set it to false and deploy that first. During a rolling upgrade
   an old instance that leads would otherwise wait for a confirmation that

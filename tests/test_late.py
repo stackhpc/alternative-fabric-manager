@@ -206,3 +206,41 @@ def test_the_api_reads_a_deletions_revision_and_refuses_late_requests(client):
     # A deletion without a body still gets a job.
     response = client.delete(f"{URL}/Port/{PORT_ID}", headers=AUTH)
     assert response.status_code == 202
+
+
+def test_a_deferred_host_move_create_and_its_resend(with_network):
+    # A host move's create waits for the GUID, another port's meanwhile; its
+    # resend keeps the waiting job, without a bump, a late update from before
+    # the move is refused, and once applied the tombstone goes.
+    m = with_network
+    m.put_port(PORT_ID, prt(5))
+    m.delete_port(PORT_ID, prt(8))
+    m.put_port(OTHER_PORT, prt(3, port_id=OTHER_PORT))
+    job = m.put_port(PORT_ID, prt(8))
+    generation = _generation(m)
+    assert m.put_port(PORT_ID, prt(8)) == job
+    assert _generation(m) == generation
+    with pytest.raises(partitions.InvalidRequest, match="late"):
+        m.put_port(PORT_ID, prt(5))
+    m.delete_port(OTHER_PORT, prt(4, port_id=OTHER_PORT))
+    m.retry_deferred()
+    assert _port(m).revision == 8
+    assert _tombstone(m, "port", PORT_ID) is None
+
+
+def test_a_network_deletion_at_its_revision_doesnt_warn(with_network, caplog):
+    # A network never updated is deleted at its creation's revision.
+    with caplog.at_level(logging.WARNING):
+        with_network.delete_network(NETWORK_ID, net(1))
+    assert "Neutron still has it" not in caplog.text
+
+
+def test_a_deletion_with_an_odd_body_still_gets_a_job(client):
+    for body in (b"not json", b"[1, 2]", b""):
+        response = client.request(
+            "DELETE",
+            f"{URL}/Port/{PORT_ID}",
+            content=body,
+            headers=dict(AUTH, **{"Content-Type": "application/json"}),
+        )
+        assert response.status_code == 202, body
