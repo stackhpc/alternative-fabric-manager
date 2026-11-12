@@ -31,11 +31,24 @@ uv run pytest -q                          # unit tests, SQLite
 AFM_TEST_DATABASE_URL=mysql+pymysql://root:<pw>@127.0.0.1:<port>/afm_test \
   uv run pytest -q                        # unit tests against MariaDB
 AFM_FUNCTIONAL=1 uv run pytest tests/functional   # failover tests (Docker)
+AFM_FUNCTIONAL=1 AFM_NEMESIS=1 uv run pytest -s \
+  tests/functional/test_nemesis.py        # randomized faults (Docker)
 ```
 
-Run ruff and the unit tests before every commit. Run the functional suite
-after any change under `ha/`, to `manager.py`'s HA hooks, or to the driver
-interface; see the `functional-tests` skill.
+Run ruff and the unit tests before every commit. Run the failover suite
+and the nemesis after any change under `ha/`, to `manager.py`'s request
+handling or HA hooks, to the driver interface, or to the schema, and quote
+the nemesis seed it printed in the commit message or PR; see the
+`functional-tests` skill. Run the unit tests against MariaDB too after a
+schema change. CI runs the failover suite on pull requests that touch HA
+code, the nemesis nightly and before every release (see
+`.github/workflows/functional.yaml`), but those don't replace running them
+first.
+
+The functional tests' Galera containers (`afm-galera-1..3`, ports
+3401-3403) are shared by every session on the host: before starting a
+run, check that none is running (`docker ps`), and if another session is
+working here, agree with it who runs when.
 
 ## The invariants
 
