@@ -362,6 +362,18 @@ class Cluster:
         except urllib.error.HTTPError as e:
             return e.code, None
 
+    def health(self, i):
+        """Instance i's /healthz status, or None if it doesn't answer"""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{8190 + i}/healthz", timeout=5
+            ) as response:
+                return response.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except (urllib.error.URLError, OSError):
+            return None
+
     def job_completes(self, i, job_path, timeout):
         def done():
             status, body = self.request(i, "GET", "/" + job_path)
@@ -1068,10 +1080,15 @@ def test_a_candidate_cut_off_from_galera_disturbs_nothing(cluster):
     # The eviction stalled every node's commits for longer than T_watchdog,
     # so the leader's OpenSM lived through it on the liveness thread.
     assert time.monotonic() - started > cluster.timings["watchdog_timeout"]
+    # HAProxy would stop sending the cut-off candidate requests, but not the
+    # leader, whose Galera node is in the majority (see Galera specifics).
+    wait_for(lambda: cluster.health(candidate) == 503, 30, "the candidate unhealthy")
+    wait_for(lambda: cluster.health(leader) == 200, 30, "the leader healthy")
     time.sleep(cluster.timings["lease_timeout"] + cluster.timings["watchdog_timeout"])
     assert cluster.sm_pids(leader) == pids and lease.read().term == term
     assert not cluster.fake_pids(candidate)
     _isolate(cluster, candidate, False)
+    wait_for(lambda: cluster.health(candidate) == 200, 30, "the candidate healthy")
     time.sleep(cluster.timings["lease_timeout"])
     assert cluster.sm_pids(leader) == pids and lease.read().term == term
     apply_change(cluster, candidate, 1)

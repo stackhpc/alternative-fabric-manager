@@ -131,9 +131,12 @@ def create_app(config, manager, coordinator=None):
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():
-        if coordinator is not None and coordinator.role in ("stopping", "stopped"):
-            # Shutting down: HAProxy stops sending requests here.
-            raise fastapi.HTTPException(status_code=503, detail="Stopping")
+        if coordinator is not None:
+            # Shutting down, or cut off from Galera: HAProxy stops sending
+            # requests here, and answers 503 itself if no instance is healthy.
+            ok, why = coordinator.healthy()
+            if not ok:
+                raise fastapi.HTTPException(status_code=503, detail=why)
         return {"status": "ok"}
 
     app.include_router(router)

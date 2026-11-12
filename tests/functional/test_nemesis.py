@@ -174,7 +174,9 @@ class Client:
         while not self.stop.is_set():
             cycle += 1
             net = str(uuid.uuid4())
-            vlan = 300 + self.w * 50 + cycle % 50
+            # Never reused within a run, so that an object a delayed request
+            # brings back can't clash with a later one's pkey or GUID
+            vlan = 300 + self.w * 1000 + cycle
             ok = self._do(
                 "POST",
                 "/cloudx/Network",
@@ -193,7 +195,7 @@ class Client:
             if self.stop.is_set():
                 return
             port = str(uuid.uuid4())
-            a, b = self.w, cycle % 256
+            a, b = self.w, cycle
             ok = self._do(
                 "POST",
                 "/cloudx/Port",
@@ -201,11 +203,13 @@ class Client:
                     "id": port,
                     "network_id": net,
                     "binding:host_id": "compute-0",
-                    "mac_address": f"12:34:57:{a:02x}:{b:02x}:01",
+                    "mac_address": f"12:34:57:{a:02x}:{b >> 8:02x}:{b & 255:02x}",
                     "extra_dhcp_opts": [
                         {
                             "opt_name": "client-id",
-                            "opt_value": f"20:12:34:57:00:00:{a:02x}:{b:02x}:01",
+                            "opt_value": (
+                                f"20:12:34:57:00:00:{a:02x}:{b >> 8:02x}:{b & 255:02x}"
+                            ),
                         }
                     ],
                 },

@@ -103,9 +103,24 @@ class Coordinator:
         # of a large fabric mustn't hold up renewals
         self._reach_value = None
         self._moved_age = 0.0
+        # When a database call last succeeded on a Primary component, for
+        # /healthz
+        self._database_seen = None
         manager.on_opensm_stopped = self._opensm_stopped
 
     # Lifecycle
+
+    def healthy(self):
+        """Whether HAProxy should send this instance requests, and why not:
+        not while it stops, nor while it can't reach a Primary component,
+        as seen by its heartbeat every period (see Galera specifics)"""
+        if self.role in (Role.STOPPING, Role.STOPPED):
+            return False, "Stopping"
+        seen = self._database_seen
+        window = 2 * self.config.ha_period + self.config.call_timeout
+        if seen is None or _now() - seen > window:
+            return False, "Can't reach a Primary component of the database"
+        return True, ""
 
     def start(self):
         if getattr(self.runner, "reach", None) is not None:
@@ -125,6 +140,7 @@ class Coordinator:
                 self.lease.register(
                     self.node, self.uuid, self.config_hash, self.adapters
                 )
+                self._database_seen = _now()
                 if not self.lease.agree_settings(config_mod.ha_settings(self.config)):
                     LOG.error(
                         "This instance's [ha] settings differ from the cluster's: "
@@ -199,6 +215,7 @@ class Coordinator:
             return
         try:
             self.lease.heartbeat(self.node, self.uuid, self._reach())
+            self._database_seen = _now()
         except Exception as e:  # noqa: BLE001
             LOG.debug("Heartbeat failed: %s", e)
         if self.role in (Role.LEADER, Role.TAKING_OVER):
@@ -378,12 +395,16 @@ class Coordinator:
         # stays bounded by t0 + T_self + T_watchdog, and self-stop ends it
         # at T_self (see The watchdog).
         if self.opensm_started and self.t0 is not None:
-            # A fresh reading: now was read before this tick's database
-            # calls, and a stale one would shorten the liveness thread's
-            # deadline. The bound, t0 + T_self + T_watchdog, is the same.
-            self._write_watchdog_lease(
-                None if self.held else self._watchdog_deadline(_now())
-            )
+            # A fresh reading, since now was read before this tick's database
+            # calls and would shorten the liveness thread's deadline; and the
+            # T_self check against the same reading, as the liveness thread
+            # makes it, so that a manager paused past T_self writes nothing
+            # (see The watchdog).
+            fresh = _now()
+            if self.held:
+                self._write_watchdog_lease(None)
+            elif fresh - self.t0 < self.config.self_stop_timeout:
+                self._write_watchdog_lease(self._watchdog_deadline(fresh))
         if renewed is None:
             return
         if self._opensm_gone and self.held:

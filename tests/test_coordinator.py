@@ -470,3 +470,47 @@ def test_the_liveness_thread_stops_when_a_loop_overruns(lease, clock, monkeypatc
     clock.now = t0 + 1
     a._renew_watchdog()
     assert not a.runner.leases
+
+
+def test_health_follows_the_database(lease, clock, monkeypatch):
+    a = make(lease, "a")
+    assert not a.healthy()[0]
+    a._rejoin()
+    assert a.healthy() == (True, "")
+
+    real = lease.heartbeat
+    cut_off = [True]
+
+    def heartbeat(*args):
+        if cut_off[0]:
+            raise lease_mod.NotPrimary("cut off")
+        return real(*args)
+
+    monkeypatch.setattr(lease, "heartbeat", heartbeat)
+    clock.now += 2 * TIMINGS["ha_period"] + TIMINGS["call_timeout"] + 0.1
+    a._tick()
+    ok, why = a.healthy()
+    assert not ok and "Primary" in why
+    cut_off[0] = False
+    a._tick()
+    assert a.healthy()[0]
+    a.role = coordinator_mod.Role.STOPPING
+    assert a.healthy() == (False, "Stopping")
+
+
+def test_a_manager_paused_past_t_self_in_a_renewal_writes_no_lease(
+    lease, clock, monkeypatch
+):
+    a = make(lease, "a")
+    lead(a)
+    a.runner.leases.clear()
+    real = lease.renew
+
+    def slow(*args):
+        # Paused inside the call, past T_self from the tick's start
+        clock.now += TIMINGS["self_stop_timeout"] + 1
+        return real(*args)
+
+    monkeypatch.setattr(lease, "renew", slow)
+    a._lead()
+    assert not a.runner.leases
