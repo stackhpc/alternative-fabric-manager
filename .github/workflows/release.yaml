@@ -1,7 +1,12 @@
 # Release a version: run the nemesis on main, bump the version in
 # pyproject.toml and uv.lock, commit that to main, tag the commit once
-# pushed, open a draft release with generated notes, and build the
-# release's image.
+# pushed, and open a draft release with generated notes. The tag's push
+# starts the image build.
+#
+# The commit and the tag are pushed with a deploy key, the
+# RELEASE_DEPLOY_KEY secret, because main's ruleset can let deploy keys
+# bypass its pull request and status check rules, and can't let
+# GITHUB_TOKEN (see docs/releasing.md).
 name: Release
 
 on:
@@ -36,14 +41,20 @@ jobs:
     needs: nemesis
     runs-on: ubuntu-latest
     permissions:
-      # Push the commit and the tag, and create the release
+      # Create the release; the deploy key pushes
       contents: write
-      # Dispatch the image build: a tag pushed with GITHUB_TOKEN doesn't
-      # trigger workflows itself
-      actions: write
     env:
       VERSION: ${{ inputs.version }}
     steps:
+      - name: Check that the deploy key is set
+        env:
+          DEPLOY_KEY_SET: ${{ secrets.RELEASE_DEPLOY_KEY != '' }}
+        run: |
+          if [[ "$DEPLOY_KEY_SET" != true ]]; then
+            echo "Set the RELEASE_DEPLOY_KEY secret: see docs/releasing.md" >&2
+            exit 1
+          fi
+
       - name: Check that this runs on main
         if: github.ref != 'refs/heads/main'
         run: |
@@ -56,7 +67,8 @@ jobs:
           ref: main
           # Every tag, to compare with
           fetch-depth: 0
-          # To push the commit and the tag
+          # To push the commit and the tag, over SSH, past main's ruleset
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
           persist-credentials: true
 
       - name: Validate the version
@@ -129,9 +141,3 @@ jobs:
             --verify-tag \
             --title "$VERSION" \
             --generate-notes
-
-      - name: Build the release's image
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run build-push-image.yaml --repo "$GITHUB_REPOSITORY" --ref "$VERSION"

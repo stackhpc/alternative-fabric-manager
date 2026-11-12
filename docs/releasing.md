@@ -18,9 +18,21 @@ them (see [Upgrades](#after-publishing)).
 - **Choose the version.** It must be newer than both `pyproject.toml`'s
   version and the latest tag.
 - **The workflow can push to `main`.** It commits the version bump to
-  `main` as `github-actions[bot]`. If `main`'s ruleset requires pull
-  requests, reviews or status checks, add GitHub Actions to its bypass
-  list, or the push fails (see Branch protection).
+  `main` and pushes it, and the tag, with a deploy key, since `main`'s
+  ruleset can let deploy keys bypass it but not the workflow's own token.
+  Once, set it up:
+
+  ```sh
+  ssh-keygen -t ed25519 -N "" -C "afm release" -f afm-release
+  ```
+
+  In the repository's **Settings** → **Deploy keys**, add `afm-release.pub`
+  as **AFM release**, with **Allow write access**. In **Settings** →
+  **Secrets and variables** → **Actions**, add the contents of
+  `afm-release`, the private key, as the secret `RELEASE_DEPLOY_KEY`. Then
+  delete both files. In `main`'s ruleset, add **Deploy keys** to the bypass
+  list (see Branch protection). Without the secret, the workflow stops
+  before it changes anything.
 
 ## Run the workflow
 
@@ -46,10 +58,11 @@ The workflow:
 6. tags that commit `0.2.0`, an annotated tag, and pushes the tag;
 7. opens a **draft** release for the tag, with GitHub's generated release
    notes;
-8. starts **Build and publish image** on the tag, which builds and pushes
+8. then the tag's push, by the deploy key, starts **Build and publish
+   image** on the tag, which builds and pushes
    `ghcr.io/stackhpc/alternative-fabric-manager:0.2.0` for amd64 and arm64.
-   A tag pushed by a workflow doesn't start other workflows by itself, so
-   the release workflow starts it.
+   The push to `main` starts a build of `main`'s image too, as any merge
+   does.
 
 ## Check the image
 
@@ -114,10 +127,10 @@ starting again:
 | Failed step | State | What to do |
 | --- | --- | --- |
 | Validation, or the bump | Nothing changed | Fix the cause, and run the workflow again |
-| Pushing to `main` | Nothing pushed | Usually branch protection: allow GitHub Actions to bypass it, and run again |
+| Pushing to `main` | Nothing pushed | Usually branch protection: check that the ruleset lets deploy keys bypass it, and that `RELEASE_DEPLOY_KEY` is the AFM release key, with write access; run again |
 | Pushing the tag | The bump is on `main`, untagged | Tag the **Release** commit yourself: `git tag -a 0.2.0 -m "Release 0.2.0" <commit> && git push origin 0.2.0` |
 | Opening the release | The tag is pushed | `gh release create 0.2.0 --draft --verify-tag --title 0.2.0 --generate-notes` |
-| Starting the image build | The release is drafted | **Actions** → **Build and publish image** → **Run workflow**, with the tag `0.2.0` as its ref |
+| The image build, after the workflow | The release is drafted | If the tag's push started no build, or it failed: **Actions** → **Build and publish image** → **Run workflow**, with the tag `0.2.0` as its ref |
 
 Running the workflow again after the bump reached `main` fails its
 validation, since the version is then no longer newer than
@@ -138,8 +151,11 @@ once its release is published: deployments and the image refer to it.
 - leave **require branches to be up to date** off, unless a merge queue is
   in use, or every merge makes each open HA pull request run the 15-minute
   suite again;
-- list **GitHub Actions** as a bypass actor, for the Release workflow's
-  push of the version bump.
+- list **Deploy keys** as a bypass actor, for the Release workflow's push
+  of the version bump and the tag, which uses the AFM release deploy key
+  (see Before you start). GitHub Actions' own token can't be listed. Any
+  deploy key with write access can then push to `main`, so keep that one
+  the only one.
 
 Don't require `Pytest`, which only annotates `Test`'s results, or the
 nemesis, which runs in the release workflow and every night
