@@ -158,12 +158,23 @@ def test_requests_without_a_revision_are_not_checked(with_network):
     assert _port(m) is not None
 
 
-def test_a_deletion_at_a_live_ports_revision_warns(with_network, caplog):
+def test_a_deletion_below_a_live_ports_revision_warns(with_network, caplog):
+    m = with_network
+    m.put_port(PORT_ID, prt(8))
+    with caplog.at_level(logging.WARNING):
+        m.delete_port(PORT_ID, prt(7))
+    assert "Neutron still has it" in caplog.text
+    assert _port(m) is None
+
+
+def test_an_ordinary_deletion_at_the_ports_revision_doesnt_warn(with_network, caplog):
+    # networking-mlnx's ordinary deletion carries the revision of the
+    # port's last request, as tempest's runs show.
     m = with_network
     m.put_port(PORT_ID, prt(8))
     with caplog.at_level(logging.WARNING):
         m.delete_port(PORT_ID, prt(8))
-    assert "Neutron still has it" in caplog.text
+    assert "Neutron still has it" not in caplog.text
     assert _port(m) is None
 
 
