@@ -214,11 +214,9 @@ def main(argv=None):
     )
     app = api.create_app(config, manager)
     if hasattr(manager.driver, "ensure_image"):
-        import docker.errors
-
         try:
             manager.driver.ensure_image()
-        except docker.errors.DockerException as e:
+        except Exception as e:  # noqa: BLE001 - as a daemon restart raises
             # The start below tries again, and reports what fails.
             logging.getLogger(__name__).error("Can't pull OpenSM's image: %s", e)
     manager.start()

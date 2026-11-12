@@ -26,6 +26,7 @@ import time
 
 import docker
 import docker.errors
+import docker.utils
 
 from alternative_fabric_manager import opensm_conf
 from alternative_fabric_manager.drivers import (
@@ -293,6 +294,14 @@ class ManagedDocker(DockerReloader):
             )
         return kwargs
 
+    def has_image(self):
+        """Whether this host has OpenSM's image"""
+        try:
+            self.client.images.get(self.config.image)
+            return True
+        except docker.errors.ImageNotFound:
+            return False
+
     def ensure_image(self):
         """Pull OpenSM's image if this host doesn't have it
 
@@ -301,23 +310,32 @@ class ManagedDocker(DockerReloader):
         already here is never pulled again: with a tag that moves, that would
         change which OpenSM runs from one start to the next. Raises
         DockerException if the pull fails."""
-        try:
-            self.client.images.get(self.config.image)
+        if self.has_image():
             return
-        except docker.errors.ImageNotFound:
-            pass
         LOG.info("Pulling OpenSM's image %s", self.config.image)
-        self.client.images.pull(self.config.image)
+        repository, tag = docker.utils.parse_repository_tag(self.config.image)
+        # The low-level pull, since the high-level one discards the stream,
+        # and with it the registry's reason for a pull that fails part way
+        for chunk in self.client.api.pull(
+            repository, tag=tag or "latest", stream=True, decode=True
+        ):
+            if "error" in chunk:
+                raise docker.errors.APIError(chunk["error"])
+        if not self.has_image():
+            raise docker.errors.ImageNotFound(
+                f"{self.config.image} isn't here after pulling it"
+            )
         LOG.info("Pulled OpenSM's image %s", self.config.image)
 
     def keep_image(self, stop, interval=PULL_RETRY):
-        """ensure_image(), retried every interval until it succeeds or stop
-        is set: for a thread of its own, since a pull may take minutes"""
+        """ensure_image() every interval until stop is set: for a thread of
+        its own, since a pull may take minutes. It keeps checking after a
+        pull succeeds, so that a node whose image is removed, as by a prune,
+        gets it back before it's needed."""
         while not stop.is_set():
             try:
                 self.ensure_image()
-                return
-            except docker.errors.DockerException as e:
+            except Exception as e:  # noqa: BLE001 - as a daemon restart raises
                 LOG.error(
                     "Can't pull OpenSM's image %s, retrying in %d s: %s",
                     self.config.image,

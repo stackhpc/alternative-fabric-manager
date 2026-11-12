@@ -30,12 +30,25 @@ class Container:
         self.removed = True
 
 
+class Images:
+    def __init__(self):
+        self.present = True
+
+    def get(self, _name):
+        if not self.present:
+            raise ha_docker.docker.errors.ImageNotFound("no image")
+
+    def pull(self, *_args, **_kwargs):
+        raise AssertionError("the reach probe mustn't pull")
+
+
 class Client:
     def __init__(self, probe=b""):
         self.containers = self
         self.existing = None
         self.runs = []
         self.probe = probe
+        self.images = Images()
 
     def get(self, _name):
         if self.existing is None:
@@ -196,3 +209,12 @@ def test_a_zombie_opensm_counts_as_stopped(driver, config):
     with open(os.path.join(config.host_proc, "4243", "stat"), "w") as f:
         f.write("4243 (opensm) Z 1 0 0")
     assert driver.verify_stopped()
+
+
+def test_reach_is_none_without_the_image_and_never_pulls_it(driver):
+    # Its first probe runs on the coordinator's lease thread, which mustn't
+    # wait on a registry; a node without the image can't start OpenSM.
+    driver.client.images.present = False
+    driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
+    assert driver.reach() is None
+    assert driver.client.runs == []

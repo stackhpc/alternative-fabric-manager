@@ -316,7 +316,10 @@ lease before Docker kills it.
       - pull
       - "{{ afm_opensm_image }}"
   register: afm_opensm_pull
-  changed_when: "'Downloaded newer image' in afm_opensm_pull.stdout"
+  # Docker reports a download on stdout, Podman on stderr
+  changed_when: >-
+    'Downloaded newer image' in afm_opensm_pull.stdout
+    or 'Copying blob' in afm_opensm_pull.stderr
   become: true
 
 - name: Read kolla's passwords

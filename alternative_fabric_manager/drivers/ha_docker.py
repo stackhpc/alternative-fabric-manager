@@ -204,6 +204,17 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         return value
 
     def _probe_reach(self):
+        # The probe runs in OpenSM's image, and containers.run() would pull
+        # it, on the coordinator's lease thread when it is the first probe.
+        # A node without the image can't start OpenSM either, so it reports
+        # nothing reached until keep_image() has pulled it.
+        try:
+            if not self.has_image():
+                LOG.warning("No OpenSM image here yet, so this node isn't eligible")
+                return None
+        except docker.errors.DockerException as e:
+            LOG.warning("Can't probe this node's reach: %s", e)
+            return None
         key = self.m_key()
         command = [
             "sh",

@@ -871,14 +871,16 @@ older version, is ignored. So:
 
 Starting OpenSM in that sum assumes its image is already on the node: a
 pull from a registry has no bound, and may fail just when a takeover needs
-it. So every instance, on starting, pulls OpenSM's image if its node
-doesn't have it, on a thread of its own, retrying every minute until it
-has it. An instance still pulling stays in HAProxy's rotation and remains a
-candidate: the API doesn't need the image, and if it does take over, its
-start pulls the image again. An instance never pulls an image its node already
-has, so that a tag that moves can't change OpenSM from one start to the
-next; deployments pin the image by digest and pull it on every node
-themselves too.
+it. So every instance, from its start, checks every minute that its node
+has OpenSM's image, and pulls it, on a thread of its own, if not. A node
+without the image reaches no switches, since the reach scan runs in that
+image, and the scan never pulls it; so it isn't eligible to take the lease
+until the pull completes, and its lease thread never waits on a registry.
+It stays in HAProxy's rotation meanwhile, since the API doesn't need the
+image. An instance only pulls an image its node lacks, so that a tag that
+moves can't change OpenSM between one start and the next, though it can
+after the image is removed; deployments pin the image by digest, and pull
+it on every node themselves too.
 
 With a 2 s poll, `sweep_timeout` 30 s, 5 s for a fabric check, `B` 60 s,
 `T` 30 s, `T_reach` 30 s, 5 s for Ask, `T_watchdog` 45 s, and HA mode's

@@ -395,30 +395,50 @@ def test_more_pkey_manager_errors_fail_closed(line):
 
 
 class FakeImages:
-    def __init__(self, present=False, failures=0):
+    """A host's images, and the low-level pull's stream"""
+
+    def __init__(self, present=False, failures=0, stream_error=None):
         self.present = present
         self.failures = failures
+        self.stream_error = stream_error
         self.pulls = []
+        self.gets = []
 
     def get(self, name):
+        self.gets.append(name)
         if not self.present:
             raise docker_driver.docker.errors.ImageNotFound("no image")
 
-    def pull(self, name):
-        self.pulls.append(name)
+    def pull(self, repository, tag, stream, decode):
+        self.pulls.append(
+            f"{repository}@{tag}" if ":" in tag else f"{repository}:{tag}"
+        )
         if self.failures:
             self.failures -= 1
             raise docker_driver.docker.errors.APIError("registry down")
+        if self.stream_error:
+            return iter([{"status": "Pulling"}, {"error": self.stream_error}])
         self.present = True
+        return iter([{"status": "Downloaded newer image"}])
 
 
 def _image_client(images):
     client = FakeManagedClient()
     client.images = images
+    client.api = images
     return client
 
 
 def test_ensure_image_pulls_a_missing_image(managed_config):
+    images = FakeImages()
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    driver.ensure_image()
+    assert images.pulls == [managed_config.image]
+    assert set(images.gets) == {managed_config.image}
+
+
+def test_ensure_image_pulls_by_digest(managed_config):
+    managed_config.image = "ghcr.io/stackhpc/docker-opensm@sha256:" + "a" * 64
     images = FakeImages()
     driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
     driver.ensure_image()
@@ -433,12 +453,62 @@ def test_ensure_image_never_pulls_one_already_here(managed_config):
     assert images.pulls == []
 
 
+def test_ensure_image_reports_an_error_in_the_pull_stream(managed_config):
+    images = FakeImages(stream_error="unauthorized: authentication required")
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    with pytest.raises(docker_driver.docker.errors.APIError, match="unauthorized"):
+        driver.ensure_image()
+
+
+class _StopAfter(threading.Event):
+    """Set after n waits, so that keep_image's loop ends in a test"""
+
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    def wait(self, timeout=None):
+        self.n -= 1
+        if self.n <= 0:
+            self.set()
+        return self.is_set()
+
+
 def test_keep_image_retries_until_the_pull_succeeds(managed_config):
     images = FakeImages(failures=2)
     driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
-    driver.keep_image(threading.Event(), interval=0)
+    driver.keep_image(_StopAfter(4), interval=0)
     assert len(images.pulls) == 3
     assert images.present
+
+
+def test_keep_image_survives_errors_that_are_not_dockers(managed_config):
+    # A daemon restart mid-pull raises requests' errors, not DockerException.
+    images = FakeImages()
+    calls = []
+
+    def pull(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("daemon restarted")
+        return FakeImages.pull(images, *args, **kwargs)
+
+    client = _image_client(images)
+    client.api = types.SimpleNamespace(pull=pull)
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    driver.keep_image(_StopAfter(3), interval=0)
+    assert images.present
+
+
+def test_keep_image_pulls_again_after_the_image_is_removed(managed_config):
+    images = FakeImages(present=True)
+    driver = docker_driver.ManagedDocker(managed_config, client=_image_client(images))
+    stop = _StopAfter(1)
+    driver.keep_image(stop, interval=0)
+    assert images.pulls == []
+    images.present = False
+    driver.keep_image(_StopAfter(1), interval=0)
+    assert images.pulls == [managed_config.image]
 
 
 def test_keep_image_stops_when_asked(managed_config):
