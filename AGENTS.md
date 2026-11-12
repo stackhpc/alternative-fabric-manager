@@ -42,8 +42,8 @@ the nemesis seed it printed in the commit message or PR; see the
 `functional-tests` skill. Run the unit tests against MariaDB too after a
 schema change. CI runs the failover suite on pull requests that touch HA
 code, the nemesis nightly and before every release (see
-`.github/workflows/functional.yaml`), but those don't replace running them
-first.
+`.github/workflows/functional.yaml`), and the unit tests against MariaDB
+on every pull request, but those don't replace running them first.
 
 The functional tests' Galera containers (`afm-galera-1..3`, ports
 3401-3403) are shared by every session on the host: before starting a

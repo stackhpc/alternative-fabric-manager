@@ -130,7 +130,9 @@ once its release is published: deployments and the image refer to it.
 
 - **require a pull request** before merging, and **block force pushes**;
 - **require these status checks**: `Test` (lint, formatting and unit
-  tests) and `Functional (failover)`, which every pull request gets: it
+  tests), `Test (MariaDB)` (the unit tests against MariaDB, which run the
+  migrations and server-only checks SQLite skips) and `Functional
+  (failover)`, which every pull request gets: it
   runs the failover suite when the pull request touches HA code, the
   schema, the API, the harness or the dependencies, and passes in seconds
   otherwise. A check only appears in the ruleset's search once it has run,
@@ -141,7 +143,8 @@ once its release is published: deployments and the image refer to it.
 - list **GitHub Actions** as a bypass actor, for the Release workflow's
   push of the version bump.
 
-Don't require `Pytest`, which only annotates `Test`'s results, or the
+Don't require `Pytest` or `Pytest (MariaDB)`, which only annotate the
+test jobs' results, or the
 nemesis, which runs in the release workflow and every night
 (`nightly.yaml`), not on pull requests: a nightly failure opens an issue
 naming its seed.
