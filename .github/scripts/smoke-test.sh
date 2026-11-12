@@ -58,7 +58,9 @@ $docker run -d --name "$name" "${network[@]}" \
   -v "$work/afm.conf:/etc/alternative-fabric-manager/afm.conf:ro" \
   "$image" >/dev/null
 
-curl -fsS --retry 30 --retry-connrefused --retry-delay 1 "$base/healthz"
+# Behind a published port, docker-proxy accepts the connection and then
+# resets it until the API listens, so retry every error, not just refusals.
+curl -fsS --retry 30 --retry-all-errors --retry-delay 1 "$base/healthz"
 echo
 
 code="$(curl -sS -o /dev/null -w '%{http_code}' "$base/ufmRestV3/app/jobs/1")"
