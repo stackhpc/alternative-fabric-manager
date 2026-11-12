@@ -666,3 +666,12 @@ def test_healthz_fails_when_the_coordinator_says_so(config, manager):
     response = client.get("/healthz")
     assert response.status_code == 503
     assert "Primary" in response.text
+
+
+def test_a_node_not_serving_answers_503(client, manager, monkeypatch):
+    def not_serving(*_args):
+        raise db.NotServing("Galera node is Joined, still catching up")
+
+    monkeypatch.setattr(manager, "put_port", not_serving)
+    response = client.post(f"{URL}/Port", json=conftest.port(), headers=AUTH)
+    assert response.status_code == 503

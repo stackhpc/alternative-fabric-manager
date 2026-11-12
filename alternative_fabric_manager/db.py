@@ -346,6 +346,54 @@ def _upgrade(engine):
             )
 
 
+class NotServing(Exception):
+    """The Galera node can't serve: not Primary, not ready, or still
+    catching up with the cluster after rejoining (see specs/ha.md, Galera
+    specifics)"""
+
+
+# wsrep_local_state: 1 Joining, 2 Donor/Desynced, 3 Joined, 4 Synced. A
+# donor has the cluster's state in full; a joining or joined node doesn't
+# yet, and answers from what it has.
+_CAUGHT_UP = {"2", "4"}
+
+
+def check_serving(session):
+    """Raise NotServing unless the session's Galera node is Primary, ready
+    and caught up; a single server, or SQLite, always serves"""
+    if session.get_bind().dialect.name == "sqlite":
+        return
+    try:
+        wsrep_on = session.scalar(sa.text("SELECT @@wsrep_on"))
+    except sa.exc.DBAPIError as e:
+        session.rollback()
+        if UNKNOWN_SYSTEM_VARIABLE in getattr(e.orig, "args", ())[:1]:
+            return
+        raise NotServing(f"Can't tell whether the node serves: {e}") from e
+    if not wsrep_on:
+        return
+    rows = dict(
+        session.execute(
+            sa.text(
+                "SHOW STATUS WHERE Variable_name IN ('wsrep_cluster_status', "
+                "'wsrep_ready', 'wsrep_local_state', 'wsrep_local_state_comment')"
+            )
+        ).all()
+    )
+    if not rows:
+        return
+    if rows.get("wsrep_cluster_status") != "Primary" or rows.get("wsrep_ready") != "ON":
+        raise NotServing(
+            f"Galera node is {rows.get('wsrep_cluster_status')}, "
+            f"ready {rows.get('wsrep_ready')}"
+        )
+    if rows.get("wsrep_local_state") not in _CAUGHT_UP:
+        raise NotServing(
+            f"Galera node is {rows.get('wsrep_local_state_comment')}, "
+            "still catching up with the cluster"
+        )
+
+
 class SchemaError(Exception):
     """The database's schema isn't the one this version needs"""
 

@@ -979,6 +979,18 @@ the OpenStack services do. SQLAlchemy makes the backend a
 - **Read your own writes.** Every manager session sets
   `wsrep_sync_wait = 1`, so a read waits for writes already committed on
   other Galera nodes; Kolla's VIP fails over between Galera nodes.
+- **Only a caught-up node serves.** A Galera node that rejoins after an
+  outage, Joining or Joined, answers queries from its own state before it
+  has caught up with the cluster's, which `wsrep_sync_wait` doesn't hold
+  back: a request it served could be refused with a final 400 for state it
+  hasn't received yet, such as a port on a network created meanwhile, as
+  the nemesis found. So a request, the leader's read of the state it
+  renders, and every lease read and write first check that their node is
+  Primary, ready, and Synced or Donor/Desynced, which a donor is while it
+  sends a joiner its state, which it has in full. Otherwise a request gets
+  503, which networking-mlnx retries; the leader renders nothing; and a
+  lease call fails, as when the node isn't Primary, so `/healthz` fails
+  too.
 - **UTC.** Timestamps and deadlines are `DATETIME(6)` values set and
   compared with `UTC_TIMESTAMP(6)`, so that no session's timezone or
   daylight saving change can age a job. SQLite uses its own UTC functions.

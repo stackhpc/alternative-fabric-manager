@@ -1394,3 +1394,36 @@ def _try(cluster, i, method, path, body):
         cluster.request(i, method, path, body)
     except (urllib.error.URLError, OSError, TimeoutError):
         pass
+
+
+def test_a_rejoining_galera_node_refuses_nothing_it_hasnt_caught_up_with(cluster):
+    # A Galera node paused until the others evict it misses a network
+    # created meanwhile. While it rejoins, it answers from its older state,
+    # so its instance must not refuse a port on that network with a final
+    # 400, only 503 or 500, until it has caught up (see specs/ha.md, Galera
+    # specifics).
+    leader = cluster.wait_leader()
+    rejoining = next(i for i in NODES if i != leader)
+    other = next(i for i in NODES if i not in (leader, rejoining))
+    docker("pause", f"afm-galera-{rejoining}")
+    wait_for(lambda: cluster_size(cluster, other) == 2, 60, "the paused node evicted")
+    job = _send(cluster, other, "/cloudx/Network", network(1, 101))
+    cluster.job_completes(other, job, TAKEOVER + 60)
+    # Fill the gap it must catch up on
+    for n in range(2, 9):
+        _send(cluster, other, "/cloudx/Network", network(n, 100 + n))
+    docker("unpause", f"afm-galera-{rejoining}")
+    answers = []
+    end = time.monotonic() + 120
+    while time.monotonic() < end:
+        try:
+            status, job = cluster.request(rejoining, "POST", "/cloudx/Port", port(1, 1))
+        except (urllib.error.URLError, OSError, TimeoutError):
+            status = None
+        answers.append(status)
+        if status == 202:
+            break
+        assert status != 400, f"a final 400 while catching up, after {answers}"
+        time.sleep(0.1)
+    assert answers[-1] == 202, answers
+    cluster.job_completes(rejoining, job, TAKEOVER + 60)

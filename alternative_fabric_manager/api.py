@@ -32,8 +32,8 @@ from typing import Annotated, Any
 import fastapi
 from fastapi import responses
 
+from alternative_fabric_manager import db, partitions
 from alternative_fabric_manager import manager as manager_mod
-from alternative_fabric_manager import partitions
 
 LOG = logging.getLogger(__name__)
 
@@ -84,6 +84,14 @@ def create_app(config, manager, coordinator=None):
     def _invalid(_request, exc):
         LOG.warning("Rejected request: %s", exc)
         return responses.JSONResponse(status_code=400, content={"error": str(exc)})
+
+    @app.exception_handler(db.NotServing)
+    def _not_serving(_request, exc):
+        # The request may succeed later, on this node or another: 503, which
+        # networking-mlnx retries, never a 400 (see specs/ha.md, Galera
+        # specifics)
+        LOG.warning("Not serving a request: %s", exc)
+        return responses.JSONResponse(status_code=503, content={"error": str(exc)})
 
     @app.exception_handler(manager_mod.NotFound)
     def _not_found(_request, exc):
