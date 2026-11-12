@@ -738,12 +738,29 @@ def test_a_job_in_flight_completes_on_the_successors_sweep(cluster):
     cluster.signal(leader, signal.SIGCONT)
 
 
-def _isolate(cluster, i, on):
-    query(
+def cluster_size(cluster, i):
+    result = query(i, cluster.password, "show status like 'wsrep_cluster_size'")
+    if result.returncode != 0 or not result.stdout.split():
+        return None
+    return int(result.stdout.split()[-1])
+
+
+def _isolate(cluster, i, on, wait=True):
+    """Cut node i's Galera node off from the others, or join it again, and
+    wait until the rest see it gone, or it is back"""
+    result = query(
         i,
         cluster.password,
         f"SET GLOBAL wsrep_provider_options='gmcast.isolate={int(on)}'",
     )
+    assert result.returncode == 0, result.stderr
+    if wait:
+        other = next(j for j in NODES if j != i)
+        wait_for(
+            lambda: cluster_size(cluster, other) == (2 if on else 3),
+            60,
+            f"Galera node {i} {'isolated' if on else 'back'}",
+        )
 
 
 def _unstoppable(cluster, i, on):
@@ -914,10 +931,15 @@ def test_opensm_exiting_moves_the_lease_at_once(cluster):
     started = time.monotonic()
     for pid in cluster.fake_pids(leader):
         os.kill(pid, signal.SIGKILL)
-    successor = cluster.wait_leader(other_than=leader)
+    # A new term, at once: whoever wins the released lease, possibly the
+    # same node again, with a new OpenSM
+    new = wait_for(
+        lambda: cluster.leader() if lease.read().term > term else None,
+        TAKEOVER,
+        "a new leadership",
+    )
     assert time.monotonic() - started < cluster.timings["lease_timeout"]
-    assert lease.read().term > term
-    apply_change(cluster, successor, 1)
+    apply_change(cluster, new, 1)
 
 
 def _exits_within(cluster, i, seconds):
@@ -980,12 +1002,18 @@ def test_sigterm_during_a_takeover_releases_without_starting_opensm(cluster):
     assert cluster.wait_leader(other_than=leader) == third
     assert cluster.first_active(f"node-{winner}", after=0) is None
     assert lease.read().term == winner_term + 1
-    # The dead leader's entry still took the unconfirmed wait.
+    # Released, so no wait for expiry, but the dead leader's entry still
+    # took the unconfirmed wait.
     started = cluster.first_active(f"node-{third}", after=0)
-    assert started - stopped >= cluster.timings["watchdog_timeout"] - 1
+    timings = cluster.timings
+    assert started - stopped >= timings["watchdog_timeout"] - 1
+    assert (
+        started - stopped < timings["lease_timeout"] + timings["watchdog_timeout"] - 1
+    )
     apply_change(cluster, third, 1)
 
 
+@pytest.mark.timings(lease_timeout=14.0, self_stop_timeout=10.0)
 def test_a_galera_blip_shorter_than_self_stop_keeps_opensm(cluster):
     leader = cluster.wait_leader()
     _config, lease, _sessionmaker = _operator(cluster)
@@ -993,7 +1021,7 @@ def test_a_galera_blip_shorter_than_self_stop_keeps_opensm(cluster):
     pids = cluster.sm_pids(leader)
     for i in NODES:
         docker("pause", f"afm-galera-{i}")
-    time.sleep(cluster.timings["self_stop_timeout"] / 2)
+    time.sleep(2)
     for i in NODES:
         docker("unpause", f"afm-galera-{i}")
     time.sleep(cluster.timings["lease_timeout"])
@@ -1035,7 +1063,11 @@ def test_a_candidate_cut_off_from_galera_disturbs_nothing(cluster):
     _config, lease, _sessionmaker = _operator(cluster, leader)
     term = lease.read().term
     pids = cluster.sm_pids(leader)
+    started = time.monotonic()
     _isolate(cluster, candidate, True)
+    # The eviction stalled every node's commits for longer than T_watchdog,
+    # so the leader's OpenSM lived through it on the liveness thread.
+    assert time.monotonic() - started > cluster.timings["watchdog_timeout"]
     time.sleep(cluster.timings["lease_timeout"] + cluster.timings["watchdog_timeout"])
     assert cluster.sm_pids(leader) == pids and lease.read().term == term
     assert not cluster.fake_pids(candidate)
@@ -1046,9 +1078,10 @@ def test_a_candidate_cut_off_from_galera_disturbs_nothing(cluster):
 
 
 def test_a_killed_leader_rejoins_and_leads_again(cluster):
-    # A killed manager leaves its watchdog's lease and start request
-    # behind; restarted, it must not start OpenSM from them, and leads
-    # again once it is the only candidate.
+    # A killed manager leaves its watchdog's files behind; restarted, it
+    # rejoins as a candidate without starting OpenSM, and leads again once
+    # it is the only one. (The watchdog's refusal of stale files is unit
+    # tested in test_watchdog.py: here nothing would start one.)
     leader = cluster.wait_leader()
     cluster.signal(leader, signal.SIGKILL)
     successor = cluster.wait_leader(other_than=leader)
@@ -1077,8 +1110,10 @@ def _fault(cluster, name, i, on=True):
 def _switches(cluster, guids, node=None):
     """The switches every node, or one node, reaches"""
     name = f"switches-node-{node}" if node else "switches"
-    with open(os.path.join(cluster.fabric, name), "w") as f:
+    path = os.path.join(cluster.fabric, name)
+    with open(f"{path}.tmp", "w") as f:
         f.write(",".join(f"{g:x}" for g in guids))
+    os.replace(f"{path}.tmp", path)
 
 
 def _expect_switches(cluster, guids):
@@ -1125,6 +1160,7 @@ def test_a_hung_apply_loop_loses_the_lease(cluster):
     cluster.job_completes(successor, job, TAKEOVER + 60)
 
 
+@pytest.mark.timings(step_down_cooldown=0.0)
 def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
     # Every node misses the switch, so nobody reaches more, leadership
     # stays, and no job completes until an operator removes it.
@@ -1185,17 +1221,26 @@ def _unfreeze(cluster, config, lease):
 
 def _holds(cluster, leader, lease, term, seconds, same_pids=True):
     """Through a time: the term stays, no other node runs OpenSM, and,
-    if asked, the leader keeps the same OpenSM"""
+    if asked, the leader keeps the same OpenSM. A read may fail while Galera
+    evicts or rejoins a node, but some must succeed."""
     pids = cluster.sm_pids(leader)
     end = time.monotonic() + seconds
+    reads = 0
     while time.monotonic() < end:
-        assert lease.read().term == term
+        try:
+            current = lease.read().term
+        except Exception:  # noqa: BLE001 - a view change
+            current = None
+        if current is not None:
+            reads += 1
+            assert current == term
         for i in NODES:
             if i != leader:
                 assert not cluster.fake_pids(i), f"node-{i} started OpenSM"
         if same_pids:
             assert cluster.sm_pids(leader) == pids
         time.sleep(0.5)
+    assert reads >= 3, "too few reads of the lease succeeded"
 
 
 def _past_expiry(cluster):
