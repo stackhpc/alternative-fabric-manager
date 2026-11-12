@@ -1354,3 +1354,43 @@ def test_sigterm_while_frozen_keeps_the_lease_for_the_node(cluster):
     wait_for(lambda: cluster.leader() == leader, TAKEOVER, "OpenSM restarted")
     _unfreeze(cluster, config, lease)
     apply_change(cluster, leader, 1)
+
+
+def test_a_late_request_from_a_paused_instance_is_refused(cluster):
+    # An instance paused after the kernel accepted a port's create holds it;
+    # networking-mlnx times out, resends it elsewhere, and deletes the port.
+    # When the paused instance resumes, it must not bring the port back
+    # (see specs/ha.md, Late requests).
+    leader = cluster.wait_leader()
+    paused, other = (i for i in NODES if i != leader)
+    apply_change(cluster, leader, 1)
+    _send(cluster, leader, "/cloudx/Network", dict(network(2, 102), revision_number=1))
+    late = dict(port(2, 2), revision_number=5)
+    cluster.signal(paused, signal.SIGSTOP)
+    held = threading.Thread(
+        target=lambda: _try(cluster, paused, "POST", "/cloudx/Port", late),
+        daemon=True,
+    )
+    held.start()
+    held.join(7)  # the client's timeout, as networking-mlnx's
+    job = _send(cluster, other, "/cloudx/Port", late)
+    cluster.job_completes(other, job, TAKEOVER + 60)
+    status, job = cluster.request(
+        other, "DELETE", f"/cloudx/Port/{PORT.format(2)}", dict(late, revision_number=6)
+    )
+    assert status == 202
+    cluster.job_completes(other, job, TAKEOVER + 60)
+    cluster.signal(paused, signal.SIGCONT)
+    time.sleep(5)
+    _config, _lease, sessionmaker = _operator(cluster, leader)
+    with sessionmaker() as session:
+        assert session.get(db.Port, PORT.format(2)) is None, "the late create ran"
+        assert session.get(db.Tombstone, ("port", PORT.format(2))) is not None
+    assert "a late request" in (cluster.tmp / f"instance-{paused}.log").read_text()
+
+
+def _try(cluster, i, method, path, body):
+    try:
+        cluster.request(i, method, path, body)
+    except (urllib.error.URLError, OSError, TimeoutError):
+        pass

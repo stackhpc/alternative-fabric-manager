@@ -778,7 +778,11 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   `kayobe overcloud service deploy`. Its `pre.yml` upgrades the schema
   first; each schema change is compatible with the version before. The
   leader steps down when its container is replaced, releasing the lease,
-  and another instance takes over at once.
+  and another instance takes over at once. A schema change that rebuilds a
+  table, such as widening the jobs table's counters, blocks every commit in
+  the Galera cluster while it runs, so upgrade at a quiet time: if it took
+  longer than `self_stop_timeout`, the leader would stop OpenSM until it
+  ends.
 - **Upgrading from a version with `[ha] manual_takeover`**: if you set it
   to true, set it to false and deploy that first. During a rolling upgrade
   an old instance that leads would otherwise wait for a confirmation that
@@ -813,6 +817,17 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   database stays, and is harmless; there is no command to remove it, and
   don't delete it by hand. Removing the host from the `controllers` group
   then drops it from HAProxy's backends at the next deploy.
+- **After restoring Neutron's database** from a backup, run
+  `--forget-revisions`. AFM refuses a request that runs late, after a later
+  one for the same object, by Neutron's revision numbers, and keeps deleted
+  objects' for 7 days (see specs/ha.md, Late requests); a restore takes
+  revisions back, and brings deleted IDs back, so their requests would be
+  refused until then:
+
+  ```sh
+  ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
+    --config-file /etc/alternative-fabric-manager/afm.conf --forget-revisions
+  ```
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk

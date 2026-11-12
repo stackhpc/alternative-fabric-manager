@@ -22,6 +22,11 @@ from sqlalchemy.dialects import mysql
 
 # UTC timestamps, to the microsecond on MariaDB too, whose DATETIME has
 # whole seconds unless asked otherwise
+# Counters that every request raises: 64-bit, so that none overflows in a
+# cluster's life (see specs/ha.md). SQLite's INTEGER is 64-bit already, and
+# only an INTEGER primary key autoincrements there.
+Counter = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
+
 Timestamp = sa.DateTime(timezone=True).with_variant(
     mysql.DATETIME(fsp=6), "mysql", "mariadb"
 )
@@ -45,6 +50,9 @@ class Network(Base):
     id: orm.Mapped[str] = orm.mapped_column(sa.String(36), primary_key=True)
     pkey: orm.Mapped[int | None] = orm.mapped_column(unique=True, nullable=True)
     name: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    # Neutron's revision_number, the highest it was set at (see specs/ha.md,
+    # Late requests)
+    revision: orm.Mapped[int | None] = orm.mapped_column(sa.BigInteger, nullable=True)
 
 
 class Port(Base):
@@ -62,6 +70,7 @@ class Port(Base):
     # Unique: a GUID in two networks' partitions would be on both.
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), unique=True)
     host: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
+    revision: orm.Mapped[int | None] = orm.mapped_column(sa.BigInteger, nullable=True)
 
 
 class JobStatus(str, enum.Enum):
@@ -83,7 +92,7 @@ class Job(Base):
 
     __tablename__ = "jobs"
 
-    id: orm.Mapped[int] = orm.mapped_column(primary_key=True)
+    id: orm.Mapped[int] = orm.mapped_column(Counter, primary_key=True)
     status: orm.Mapped[JobStatus] = orm.mapped_column(
         sa.Enum(JobStatus, native_enum=False, length=16),
         default=JobStatus.PENDING,
@@ -92,7 +101,7 @@ class Job(Base):
     operation: orm.Mapped[str] = orm.mapped_column(sa.String(64))
     object_id: orm.Mapped[str] = orm.mapped_column(sa.String(36))
     # The first generation of the state that includes the change
-    generation: orm.Mapped[int] = orm.mapped_column(default=0, index=True)
+    generation: orm.Mapped[int] = orm.mapped_column(Counter, default=0, index=True)
     # What must hold in a swept partitions file for the job to complete, as
     # JSON (see effects.py)
     effect: orm.Mapped[str] = orm.mapped_column(sa.Text, default="{}")
@@ -105,6 +114,27 @@ class Job(Base):
     )
     finished_at: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
         Timestamp, nullable=True
+    )
+
+
+class Tombstone(Base):
+    """A deleted network or port, so that a late request for it is refused
+    (see specs/ha.md, Late requests)"""
+
+    __tablename__ = "tombstones"
+
+    kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
+    # The highest revision it was set at, live or deferred, and the highest
+    # it was deleted at
+    set_revision: orm.Mapped[int | None] = orm.mapped_column(
+        sa.BigInteger, nullable=True
+    )
+    deleted_revision: orm.Mapped[int | None] = orm.mapped_column(
+        sa.BigInteger, nullable=True
+    )
+    deleted_at: orm.Mapped[datetime.datetime] = orm.mapped_column(
+        Timestamp, default=_now, index=True
     )
 
 
@@ -132,7 +162,7 @@ class Deferred(Base):
 
     kind: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
     object_id: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
-    job_id: orm.Mapped[int] = orm.mapped_column(sa.ForeignKey("jobs.id"))
+    job_id: orm.Mapped[int] = orm.mapped_column(Counter, sa.ForeignKey("jobs.id"))
     # The request's values, as JSON
     data: orm.Mapped[str] = orm.mapped_column(sa.Text)
 
@@ -143,7 +173,7 @@ class Applied(Base):
     __tablename__ = "applied"
 
     id: orm.Mapped[int] = orm.mapped_column(primary_key=True, default=1)
-    generation: orm.Mapped[int] = orm.mapped_column(default=0)
+    generation: orm.Mapped[int] = orm.mapped_column(Counter, default=0)
     # The leader's term when it swept, and whether a check since saw another
     # master, so that every instance can judge jobs (see specs/ha.md)
     term: orm.Mapped[int] = orm.mapped_column(default=0)
@@ -256,7 +286,7 @@ class State(Base):
     __tablename__ = "state"
 
     name: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
-    value: orm.Mapped[int] = orm.mapped_column(default=0)
+    value: orm.Mapped[int] = orm.mapped_column(Counter, default=0)
 
 
 # Columns added to existing tables since the first release, until the
@@ -265,6 +295,12 @@ _ADDED_COLUMNS = {
     "applied": {
         "term": "INTEGER NOT NULL DEFAULT 0",
         "contested": "BOOLEAN NOT NULL DEFAULT 0",
+    },
+    "networks": {
+        "revision": "INTEGER",
+    },
+    "ports": {
+        "revision": "INTEGER",
     },
     "jobs": {
         "generation": "INTEGER NOT NULL DEFAULT 0",

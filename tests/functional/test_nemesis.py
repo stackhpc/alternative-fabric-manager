@@ -186,6 +186,8 @@ class Client:
                     "provider:network_type": "vlan",
                     "provider:physical_network": "ibphysnet",
                     "provider:segmentation_id": vlan,
+                    # As Neutron's: the deletion's is above it
+                    "revision_number": 1,
                 },
                 net,
             )
@@ -212,6 +214,8 @@ class Client:
                             ),
                         }
                     ],
+                    # The bind's, before its own bump
+                    "revision_number": 5,
                 },
                 port,
             )
@@ -220,12 +224,16 @@ class Client:
             self.model[net].add(port)
             if self.stop.is_set():
                 return
-            if not self._do("DELETE", f"/cloudx/Port/{port}", None, port):
+            if not self._do(
+                "DELETE", f"/cloudx/Port/{port}", {"revision_number": 6}, port
+            ):
                 return
             self.model[net].discard(port)
             if self.stop.is_set():
                 return
-            if not self._do("DELETE", f"/cloudx/Network/{net}", None, net):
+            if not self._do(
+                "DELETE", f"/cloudx/Network/{net}", {"revision_number": 2}, net
+            ):
                 return
             del self.model[net]
 
@@ -426,11 +434,10 @@ def _swept(cluster):
 
 
 def check(cluster, history, clients):
-    """The invariants over the whole history: (problems, notes). The notes
-    are objects that a request with an unknown outcome, sent before the
-    client moved on, may have brought back after the client deleted them:
-    a hazard of networking-mlnx's resends that the checker reports rather
-    than fails on.
+    """The invariants over the whole history: (problems, notes). The client
+    sends Neutron's revisions, so a request with an unknown outcome that
+    runs late, after the client moved on, must be refused, and nothing may
+    come back after its deletion (see specs/ha.md, Late requests).
 
     The sweep evidence is necessary, not sufficient: it shows that some
     OpenSM swept the job's generation before the job was seen Completed,
@@ -496,13 +503,10 @@ def check(cluster, history, clients):
         ("port", set(ports) - set(expected_ports)),
     ):
         for obj in sorted(extra):
-            if obj in unknown:
-                notes.append(
-                    f"{kind} {obj} came back after its deletion, from a request "
-                    "with an unknown outcome"
-                )
-            else:
-                problems.append(f"{kind} {obj} is unexpected")
+            # With revisions sent, a late request is refused (see specs/ha.md,
+            # Late requests), so nothing may come back after its deletion.
+            how = " from a request with an unknown outcome" if obj in unknown else ""
+            problems.append(f"{kind} {obj} came back after its deletion{how}")
     # The leader's OpenSM swept the latest generation
     if not any(s[3] >= (state_generation or 0) for s in swept):
         problems.append(f"no sweep of the latest generation, {state_generation}")
