@@ -67,35 +67,12 @@ def _age(when, now):
 
 
 def _check_primary(session):
-    if session.get_bind().dialect.name == "sqlite":
-        return
-    # A server with wsrep off, or without it, is its own quorum: a single
-    # MariaDB, as in tests.
+    """A lease call runs only on a Galera node in a Primary component, and
+    ready (see The lease, Galera specifics)"""
     try:
-        wsrep_on = session.scalar(sa.text("SELECT @@wsrep_on"))
-    except sa.exc.DBAPIError as e:
-        session.rollback()
-        if db.UNKNOWN_SYSTEM_VARIABLE in getattr(e.orig, "args", ())[:1]:
-            return
-        raise NotPrimary(f"Can't tell whether the node is Primary: {e}") from e
-    if not wsrep_on:
-        return
-    rows = dict(
-        session.execute(
-            sa.text(
-                "SHOW STATUS WHERE Variable_name IN "
-                "('wsrep_cluster_status', 'wsrep_ready')"
-            )
-        ).all()
-    )
-    if not rows:
-        # A server without wsrep: a single MariaDB is its own quorum.
-        return
-    if rows.get("wsrep_cluster_status") != "Primary" or rows.get("wsrep_ready") != "ON":
-        raise NotPrimary(
-            f"Galera node is {rows.get('wsrep_cluster_status')}, "
-            f"ready {rows.get('wsrep_ready')}"
-        )
+        db.check_serving(session)
+    except db.NotServing as e:
+        raise NotPrimary(str(e)) from e
 
 
 class GaleraLease:

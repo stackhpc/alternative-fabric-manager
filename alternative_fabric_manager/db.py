@@ -346,6 +346,55 @@ def _upgrade(engine):
             )
 
 
+class NotServing(Exception):
+    """The Galera node can't serve: not in a Primary component, or not
+    ready (see specs/ha.md, Galera specifics)"""
+
+
+# wsrep_sync_wait's bits for reads, updates and deletes, and inserts
+SYNC_WAIT = 7
+
+
+def check_serving(session):
+    """Raise NotServing unless the session's Galera node is in a Primary
+    component and ready; a single server, or SQLite, always serves. Whether
+    it has caught up is the causal wait's job (SYNC_WAIT), which every
+    statement makes."""
+    if session.get_bind().dialect.name == "sqlite":
+        return
+    # This SELECT waits causally too, but it is not what keeps a request
+    # from reading a lagging node's older state: every statement's own wait
+    # is, SYNC_WAIT, the generation bump's above all. Neither is removable.
+    try:
+        wsrep_on = session.scalar(sa.text("SELECT @@wsrep_on"))
+    except sa.exc.DBAPIError as e:
+        session.rollback()
+        if UNKNOWN_SYSTEM_VARIABLE in getattr(e.orig, "args", ())[:1]:
+            return
+        raise NotServing(f"Can't tell whether the node serves: {e}") from e
+    if not wsrep_on:
+        return
+    try:
+        rows = dict(
+            session.execute(
+                sa.text(
+                    "SHOW STATUS WHERE Variable_name IN "
+                    "('wsrep_cluster_status', 'wsrep_ready')"
+                )
+            ).all()
+        )
+    except sa.exc.DBAPIError as e:
+        session.rollback()
+        raise NotServing(f"Can't tell whether the node serves: {e}") from e
+    if not rows:
+        return
+    if rows.get("wsrep_cluster_status") != "Primary" or rows.get("wsrep_ready") != "ON":
+        raise NotServing(
+            f"Galera node is {rows.get('wsrep_cluster_status')}, "
+            f"ready {rows.get('wsrep_ready')}"
+        )
+
+
 class SchemaError(Exception):
     """The database's schema isn't the one this version needs"""
 
@@ -404,11 +453,15 @@ def _make_server_engine(url, call_timeout=CALL_TIMEOUT):
     def _session_settings(dbapi_connection, _record):
         cursor = dbapi_connection.cursor()
         cursor.execute("SET SESSION time_zone = '+00:00'")
-        # Read what other Galera nodes have committed (see specs/ha.md). A
-        # server without wsrep has no such variable, but any other failure
-        # must not be hidden.
+        # Every statement waits until this Galera node has applied what the
+        # cluster had committed when it began: reads (1), updates and
+        # deletes (2), and inserts (4). Not reads alone, since a request's
+        # transaction begins with the generation bump, an UPDATE, and no
+        # read after it waits (see specs/ha.md, Galera specifics). A server
+        # without wsrep has no such variable, but any other failure must not
+        # be hidden.
         try:
-            cursor.execute("SET SESSION wsrep_sync_wait = 1")
+            cursor.execute(f"SET SESSION wsrep_sync_wait = {SYNC_WAIT}")
         except Exception as e:
             if UNKNOWN_SYSTEM_VARIABLE not in getattr(e, "args", ())[:1]:
                 raise

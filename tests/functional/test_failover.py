@@ -1394,3 +1394,38 @@ def _try(cluster, i, method, path, body):
         cluster.request(i, method, path, body)
     except (urllib.error.URLError, OSError, TimeoutError):
         pass
+
+
+def test_a_lagging_galera_node_refuses_nothing_the_cluster_committed(cluster):
+    # A Galera node paused until the others evict it misses a network
+    # created meanwhile, and lags the cluster while it rejoins. A port on
+    # that network through its instance must wait for the node to catch up,
+    # through the causal wait every statement makes, the generation bump's
+    # UPDATE first, or get 503 or 500, never a final 400 for a network it
+    # hasn't applied yet (see specs/ha.md, Galera specifics). With reads
+    # alone waiting, the old setting, it got a 400 in each of three runs.
+    leader = cluster.wait_leader()
+    rejoining = next(i for i in NODES if i != leader)
+    other = next(i for i in NODES if i not in (leader, rejoining))
+    docker("pause", f"afm-galera-{rejoining}")
+    wait_for(lambda: cluster_size(cluster, other) == 2, 60, "the paused node evicted")
+    job = _send(cluster, other, "/cloudx/Network", network(1, 101))
+    cluster.job_completes(other, job, TAKEOVER + 60)
+    # Fill the gap it must catch up on
+    for n in range(2, 9):
+        _send(cluster, other, "/cloudx/Network", network(n, 100 + n))
+    docker("unpause", f"afm-galera-{rejoining}")
+    answers = []
+    end = time.monotonic() + 120
+    while time.monotonic() < end:
+        try:
+            status, job = cluster.request(rejoining, "POST", "/cloudx/Port", port(1, 1))
+        except (urllib.error.URLError, OSError, TimeoutError):
+            status = None
+        answers.append(status)
+        if status == 202:
+            break
+        assert status != 400, f"a final 400 while catching up, after {answers}"
+        time.sleep(0.1)
+    assert answers[-1] == 202, answers
+    cluster.job_completes(rejoining, job, TAKEOVER + 60)

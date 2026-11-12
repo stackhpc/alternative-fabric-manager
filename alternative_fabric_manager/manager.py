@@ -425,6 +425,7 @@ class Manager:
             "revision": self.revision_of(data),
         }
         with self._lock, self.sessionmaker() as session:
+            db.check_serving(session)
             generation = self._bump(session)
             resent = self._check_late(
                 session, "network", network_id, values["revision"]
@@ -452,6 +453,7 @@ class Manager:
     def delete_network(self, network_id, data=None):
         partitions.check_id(network_id)
         with self._lock, self.sessionmaker() as session:
+            db.check_serving(session)
             generation = self._bump(session)
             self._bury(
                 session,
@@ -516,6 +518,7 @@ class Manager:
             "revision": self.revision_of(data),
         }
         with self._lock, self.sessionmaker() as session:
+            db.check_serving(session)
             # First, so that every read below sees the requests serialised
             # before this one (see Shared state, Late requests)
             generation = self._bump(session)
@@ -556,6 +559,7 @@ class Manager:
     def delete_port(self, port_id, data=None):
         partitions.check_id(port_id)
         with self._lock, self.sessionmaker() as session:
+            db.check_serving(session)
             generation = self._bump(session)
             self._bury(
                 session,
@@ -891,6 +895,9 @@ class Manager:
         """
         while True:
             with self._lock, self.sessionmaker() as session:
+                # Never from a node still catching up, which would render an
+                # older state (see Galera specifics)
+                db.check_serving(session)
                 generation, networks, ports = self._state(session)
                 try:
                     content, attribution = self._render_state(

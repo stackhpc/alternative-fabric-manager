@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+import sqlalchemy as sa
 
 from alternative_fabric_manager import db
 from tests import conftest
@@ -73,3 +74,94 @@ def test_a_server_database_needs_its_schema_upgraded():
         session.commit()
     with root.begin() as connection:
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+class _GaleraSession:
+    """Just enough of a session on a Galera node for check_serving"""
+
+    def __init__(self, status, wsrep_on=1):
+        self.status = status
+        self.wsrep_on = wsrep_on
+
+    def get_bind(self):
+        class Bind:
+            class dialect:
+                name = "mysql"
+
+        return Bind()
+
+    def scalar(self, _statement):
+        return self.wsrep_on
+
+    def execute(self, _statement):
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
+        return Result(list(self.status.items()))
+
+
+def _galera(state, comment, cluster="Primary", ready="ON"):
+    return _GaleraSession(
+        {
+            "wsrep_cluster_status": cluster,
+            "wsrep_ready": ready,
+            "wsrep_local_state": state,
+            "wsrep_local_state_comment": comment,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        _galera("4", "Synced"),
+        _galera("2", "Donor/Desynced"),
+        # Whether it has caught up is the causal wait's job, not this check's
+        _galera("3", "Joined"),
+        _GaleraSession({}, 0),
+    ],
+)
+def test_a_primary_ready_node_serves(session):
+    db.check_serving(session)
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        _galera("4", "Synced", cluster="non-Primary"),
+        _galera("4", "Synced", ready="OFF"),
+    ],
+)
+def test_a_node_not_primary_or_not_ready_doesnt_serve(session):
+    with pytest.raises(db.NotServing):
+        db.check_serving(session)
+
+
+def test_a_failed_status_query_doesnt_serve():
+    class Failing(_GaleraSession):
+        def execute(self, _statement):
+            raise sa.exc.OperationalError("SHOW STATUS", {}, Exception("lost"))
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(db.NotServing):
+        db.check_serving(Failing({}))
+
+
+def test_every_statement_waits_causally(config):
+    # A request's transaction begins with an UPDATE, the generation bump, so
+    # reads alone (1) wouldn't make it wait (see specs/ha.md, Galera
+    # specifics).
+    if not config.connection:
+        pytest.skip("needs a server database: AFM_TEST_DATABASE_URL")
+    session = db.make_sessionmaker(config.database_url)()
+    try:
+        value = session.scalar(sa.text("SELECT @@session.wsrep_sync_wait"))
+    except sa.exc.DBAPIError:
+        pytest.skip("a server without wsrep")
+    assert value == db.SYNC_WAIT == 7
