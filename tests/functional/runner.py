@@ -33,6 +33,37 @@ def process_state(pid):
         return None
 
 
+def processes(kind, fabric=None, node=None):
+    """Live processes of a kind, "fake" (fake_opensm.py itself) or
+    "watchdog", optionally only those of one fabric directory or node, from
+    /proc, as {pid: state letter}. Paused ones are included."""
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().split(b"\0")
+        except OSError:
+            continue
+        if kind == "fake":
+            # The fake itself, python fake_opensm.py ..., not the watchdog,
+            # whose arguments name it too
+            matches = len(cmdline) > 1 and cmdline[1].endswith(b"fake_opensm.py")
+        else:
+            matches = b"alternative_fabric_manager.ha.watchdog" in cmdline
+        if not matches:
+            continue
+        if fabric is not None and fabric.encode() not in cmdline:
+            continue
+        if node is not None and node.encode() not in cmdline:
+            continue
+        state = process_state(int(pid))
+        if state not in (None, "Z", "X"):
+            found[int(pid)] = state
+    return found
+
+
 def masters(fabric):
     """The fake SMs that can act as master now: alive, not stopped, and not
     disabled. A paused (stopped) one can't act until it resumes."""
@@ -92,35 +123,36 @@ class ProcessRunner:
         )
 
     def _own_sms(self):
-        pids = []
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmdline = f.read().split(b"\0")
-            except OSError:
-                continue
-            # The fake itself, python fake_opensm.py ..., not the watchdog,
-            # whose arguments name it too
-            if (
-                len(cmdline) > 1
-                and cmdline[1].endswith(b"fake_opensm.py")
-                and self.node.encode() in cmdline
-            ):
-                state = process_state(int(pid))
-                if state not in (None, "Z", "X"):
-                    pids.append(int(pid))
-        return pids
+        return list(processes("fake", self.fabric_dir, self.node))
+
+    def _fault(self, name):
+        return os.path.exists(os.path.join(self.fabric_dir, f"{name}-{self.node}"))
+
+    def switches(self):
+        """The switches this node's port reaches: a test's switches-<node>
+        file, for a split fabric, or else its fabric-wide switches file, or
+        else the one switch. Comma-separated hex GUIDs."""
+        for name in (f"switches-{self.node}", "switches"):
+            path = os.path.join(self.fabric_dir, name)
+            if os.path.exists(path):
+                with open(path) as f:
+                    return {int(g, 16) for g in f.read().split(",") if g.strip()}
+        return {SWITCH}
 
     def reach(self):
-        """The one switch, unless a test cut this node's link"""
-        if os.path.exists(os.path.join(self.fabric_dir, f"linkdown-{self.node}")):
+        """The switches it reaches, unless a test cut this node's link"""
+        if self._fault("linkdown"):
             return None
-        return 1
+        return len(self.switches())
+
+    def _unstoppable(self):
+        """A test's fault: this node's OpenSM can't be stopped, nor its stop
+        verified, as when self-stop fails (see Why the unconfirmed wait is
+        enough). Only the watchdog's own kill still works."""
+        return os.path.exists(os.path.join(self.fabric_dir, f"unstoppable-{self.node}"))
 
     def verify_stopped(self):
-        return not self._own_sms()
+        return not self._unstoppable() and not self._own_sms()
 
     def ask(self, node):
         with open(os.path.join(self.fabric_dir, f"ask-{node}"), "w") as f:
@@ -166,6 +198,8 @@ class ProcessRunner:
                 str(self.guid),
                 "--start-delay",
                 os.environ.get("AFM_FAKE_START_DELAY", "1.5"),
+                "--partitions",
+                self.config.partitions_file,
                 *(
                     ["--ignore-ask"]
                     if os.environ.get("AFM_FAKE_HONOURS_ASK") != "1"
@@ -204,6 +238,10 @@ class ProcessRunner:
         pids = self._own_sms()
         if not pids or self.watchdog is None:
             raise ReloadError("OpenSM isn't running")
+        # A test's fault: the call to OpenSM hangs, as a wedged container's
+        # docker exec might, until the test removes the file.
+        while self._fault("hang"):
+            time.sleep(0.1)
         before = self._sweeps() or 0
         # To the watchdog, as Docker signals a container's first process,
         # which passes it on to OpenSM
@@ -216,13 +254,21 @@ class ProcessRunner:
         raise ReloadError("No sweep")
 
     def fabric(self, m_key=None, sa_key=None):
+        # A paused OpenSM's SA doesn't answer.
+        if any(
+            state in ("T", "t")
+            for state in processes("fake", self.fabric_dir, self.node).values()
+        ):
+            raise ReloadError("The SA doesn't answer")
         return Fabric(
-            {SWITCH},
+            self.switches(),
             [(int(entry["guid"]), 3) for entry in masters(self.fabric_dir)],
             {self.guid},
         )
 
     def stop(self):
+        if self._unstoppable():
+            return
         with open(os.path.join(self.state_dir, wd.STOP), "w") as f:
             f.write("stop")
         if self.watchdog is not None:

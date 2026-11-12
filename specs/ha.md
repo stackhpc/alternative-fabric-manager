@@ -787,7 +787,11 @@ older version, is ignored. So:
   pkey errors) + a fabric check;
 - `T_self` + the liveness thread's period + a lease call's timeout < `T`;
 - `T_self` > the deployment's MariaDB failover time, so that losing one
-  Galera node, or the VIP moving, doesn't stop OpenSM;
+  Galera node, or the VIP moving, doesn't stop OpenSM. That includes the
+  time the surviving Galera nodes take to evict a lost one,
+  `evs.suspect_timeout`, 5 s by default, plus a view change, during which
+  every node's commits block, whichever node was lost: a leader whose own
+  Galera node is healthy still can't renew meanwhile;
 - Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
   sync interval + its retry backoff + the job timeout.
 
@@ -962,6 +966,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
+| Any one Galera node lost, even a candidate's | Every node's commits block until the survivors evict it, after `evs.suspect_timeout`, 5 s by default, and a view change; the leader's renewals fail meanwhile, but its liveness thread keeps the watchdog's lease | Within `T_self`, nothing happens |
 | A MariaDB failover | Failed reads reset the candidates' timers, and the leader's renewals fail meanwhile | Within `T_self`, nothing happens. Longer, the leader stops its OpenSM, and a leader is elected once a Primary component is back, so the SA is down meanwhile, and jobs in flight can time out and are resent |
 | A managed node's SM appears | The fabric checks find it; the leader asks it to stop | No job completes until it is gone; alarm |
 | A tenant runs an SM | It has no keys, so it can't master or set ports | An alarm; jobs carry on unless it is master |

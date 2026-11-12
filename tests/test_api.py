@@ -1,8 +1,9 @@
 import pathlib
 
 import pytest
+from fastapi import testclient
 
-from alternative_fabric_manager import db
+from alternative_fabric_manager import api, db
 from tests import conftest
 from tests.conftest import AUTH, GUID, NETWORK_ID, PORT_ID, URL
 
@@ -651,3 +652,17 @@ def test_retries_change_the_file(client, manager, config, reloader):
     _applied(client, manager)
     assert len(seen) == 2 and seen[0] != seen[1]
     assert "# Apply " in seen[1]
+
+
+def test_healthz_fails_when_the_coordinator_says_so(config, manager):
+    class Coordinator:
+        role = "leader"
+        frozen = False
+
+        def healthy(self):
+            return False, "Can't reach a Primary component of the database"
+
+    client = testclient.TestClient(api.create_app(config, manager, Coordinator()))
+    response = client.get("/healthz")
+    assert response.status_code == 503
+    assert "Primary" in response.text

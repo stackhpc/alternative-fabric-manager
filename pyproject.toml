@@ -40,6 +40,12 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "S603", "S607", "SIM105", "S310"]
+# A seeded fault schedule, not cryptography
+"tests/functional/test_nemesis.py" = ["S311"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "timings(**overrides): HA timings for a functional test's cluster",
+    "env(**variables): environment for a functional test's instances",
+]

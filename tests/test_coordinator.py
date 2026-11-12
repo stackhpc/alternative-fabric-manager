@@ -395,6 +395,128 @@ def test_unanswered_checks_dont_wait_for_the_cooldown(lease, clock):
     assert a.role == coordinator_mod.Role.STARTING
 
 
+def test_a_failed_renewal_still_renews_the_watchdogs_lease(lease, clock, monkeypatch):
+    # A Galera stall shorter than T_self, as while the survivors evict a
+    # lost node, mustn't let the watchdog's lease lapse; its deadline stays
+    # bounded by the last renewal that succeeded (see The watchdog).
+    a = make(lease, "a")
+    lead(a)
+    t0 = a.t0
+    a.runner.leases.clear()
+
+    def renew(*_args):
+        raise lease_mod.NotPrimary("stalled")
+
+    monkeypatch.setattr(lease, "renew", renew)
+    clock.now += TIMINGS["self_stop_timeout"] / 2
+    a._tick()
+    assert a.role == coordinator_mod.Role.LEADER
+    assert a.t0 == t0
+    (term, deadline), *_ = a.runner.leases
+    assert term == a.term
+    assert clock.now < deadline
+    assert deadline <= t0 + TIMINGS["self_stop_timeout"] + TIMINGS["watchdog_timeout"]
+
+
+def _stalled_leader(lease, clock):
+    """A leader whose lease thread then makes no progress, as while its
+    database calls block"""
+    a = make(lease, "a")
+    lead(a)
+    a.runner.leases.clear()
+    return a, a.t0
+
+
+def _bound(t0):
+    return t0 + TIMINGS["self_stop_timeout"] + TIMINGS["watchdog_timeout"]
+
+
+def test_the_liveness_thread_renews_the_watchdog_through_a_stall(lease, clock):
+    a, t0 = _stalled_leader(lease, clock)
+    clock.now = t0 + TIMINGS["self_stop_timeout"] - 0.1
+    a._renew_watchdog()
+    (term, deadline), *_ = a.runner.leases
+    assert term == a.term
+    assert clock.now < deadline <= _bound(t0)
+
+
+def test_the_liveness_thread_stops_at_t_self(lease, clock):
+    a, t0 = _stalled_leader(lease, clock)
+    clock.now = t0 + TIMINGS["self_stop_timeout"]
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_never_renews_after_a_step_down(lease, clock):
+    a, _t0 = _stalled_leader(lease, clock)
+    a._step_down("test")
+    a.runner.leases.clear()
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_leaves_a_held_lease_alone(lease, clock):
+    a, _t0 = _stalled_leader(lease, clock)
+    lease.request_freeze(a.term, "operator", 30)
+    a._freeze_step()
+    assert a.held
+    a.runner.leases.clear()
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_stops_when_a_loop_overruns(lease, clock, monkeypatch):
+    a, t0 = _stalled_leader(lease, clock)
+    monkeypatch.setattr(a.manager, "iteration_age", lambda: a.apply_bound + 1)
+    clock.now = t0 + 1
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_health_follows_the_database(lease, clock, monkeypatch):
+    a = make(lease, "a")
+    assert not a.healthy()[0]
+    a._rejoin()
+    assert a.healthy() == (True, "")
+
+    real = lease.heartbeat
+    cut_off = [True]
+
+    def heartbeat(*args):
+        if cut_off[0]:
+            raise lease_mod.NotPrimary("cut off")
+        return real(*args)
+
+    monkeypatch.setattr(lease, "heartbeat", heartbeat)
+    clock.now += 2 * TIMINGS["ha_period"] + TIMINGS["call_timeout"] + 0.1
+    a._tick()
+    ok, why = a.healthy()
+    assert not ok and "Primary" in why
+    cut_off[0] = False
+    a._tick()
+    assert a.healthy()[0]
+    a.role = coordinator_mod.Role.STOPPING
+    assert a.healthy() == (False, "Stopping")
+
+
+def test_a_manager_paused_past_t_self_in_a_renewal_writes_no_lease(
+    lease, clock, monkeypatch
+):
+    a = make(lease, "a")
+    lead(a)
+    a.runner.leases.clear()
+    real = lease.renew
+
+    def slow(*args):
+        # Paused inside the call, past T_self from the tick's start
+        clock.now += TIMINGS["self_stop_timeout"] + 1
+        return real(*args)
+
+    monkeypatch.setattr(lease, "renew", slow)
+    a._lead()
+    assert not a.runner.leases
+
+
 def test_a_deleted_node_row_is_put_back_at_the_next_heartbeat(lease, clock):
     a = make(lease, "a")
     lead(a)
