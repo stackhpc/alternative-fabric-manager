@@ -813,6 +813,17 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
   database stays, and is harmless; there is no command to remove it, and
   don't delete it by hand. Removing the host from the `controllers` group
   then drops it from HAProxy's backends at the next deploy.
+- **After restoring Neutron's database** from a backup, run
+  `--forget-revisions`. AFM refuses a request that runs late, after a later
+  one for the same object, by Neutron's revision numbers, and keeps deleted
+  objects' for 7 days (see specs/ha.md, Late requests); a restore takes
+  revisions back, and brings deleted IDs back, so their requests would be
+  refused until then:
+
+  ```sh
+  ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
+    --config-file /etc/alternative-fabric-manager/afm.conf --forget-revisions
+  ```
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk

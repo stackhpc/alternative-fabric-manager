@@ -39,6 +39,9 @@ LOG = logging.getLogger(__name__)
 
 JOB_PATH = "app/jobs/%d"
 JsonBody = Annotated[dict[str, Any], fastapi.Body()]
+# networking-mlnx sends the object's dict with a DELETE too, whose
+# revision_number the manager records (see specs/ha.md, Late requests)
+OptionalJsonBody = Annotated[dict[str, Any] | None, fastapi.Body()]
 
 
 def create_app(config, manager, coordinator=None):
@@ -97,9 +100,9 @@ def create_app(config, manager, coordinator=None):
         return accepted(manager.put_network(network_id, data))
 
     @router.delete("/{domain}/Network/{network_id}", status_code=202)
-    def delete_network(domain: str, network_id: str):
+    def delete_network(domain: str, network_id: str, data: OptionalJsonBody = None):
         check_domain(domain)
-        return accepted(manager.delete_network(network_id))
+        return accepted(manager.delete_network(network_id, data))
 
     @router.post("/{domain}/Port", status_code=202)
     def create_port(domain: str, data: JsonBody):
@@ -112,9 +115,9 @@ def create_app(config, manager, coordinator=None):
         return accepted(manager.put_port(port_id, data))
 
     @router.delete("/{domain}/Port/{port_id}", status_code=202)
-    def delete_port(domain: str, port_id: str):
+    def delete_port(domain: str, port_id: str, data: OptionalJsonBody = None):
         check_domain(domain)
-        return accepted(manager.delete_port(port_id))
+        return accepted(manager.delete_port(port_id, data))
 
     @router.get("/app/jobs/{job_id}")
     def get_job(job_id: int):

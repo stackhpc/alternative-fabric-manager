@@ -1152,6 +1152,22 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       healthcheck, database credentials, the containers' stop timeout,
       expected switches, and the check that control traffic doesn't run over
       the InfiniBand fabric.
+- [x] Late requests: revisions recorded on networks, ports and deferred
+      requests, tombstones, the checks after the generation bump, the
+      deletion's body read, tombstones dropped after 7 days, and
+      `--forget-revisions` (see Late requests).
+- [x] Counters wide enough for a cluster's life: the generation, the
+      applied generation and job IDs as 64-bit integers, since every request
+      bumps the generation and a 32-bit one overflows after 2^31, about 7
+      years at 10 requests a second, after which, in MariaDB's strict mode,
+      every request would fail. The lease's counter and heartbeats are
+      64-bit already, and terms only rise with takeovers.
+- [ ] A soak test: a cluster left for 12 to 24 hours under steady requests
+      and no faults keeps one leader, term and OpenSM process throughout,
+      fails no job, and doesn't grow its memory or file descriptors, so that
+      a long-lived OpenSM is shown not to be killed by any deadline, bound or
+      counter that only a long run reaches, such as an idle apply loop's
+      iteration age.
 
 ## Open questions
 

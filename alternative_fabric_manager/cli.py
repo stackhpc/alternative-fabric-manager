@@ -84,6 +84,14 @@ def main(argv=None):
         "stopping that leader's OpenSM and checking that no opensm process "
         "runs on its host: nothing checks this for you (see --status)",
     )
+    parser.add_argument(
+        "--forget-revisions",
+        action="store_true",
+        help="After restoring Neutron's database from a backup, whose "
+        "revisions go back and deleted IDs return: forget every deleted "
+        "object and recorded revision, so that no current request is "
+        "refused as late, and exit",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -172,6 +180,14 @@ def main(argv=None):
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in switches:
             print(f"0x{guid:016x}")
+        return
+
+    if args.forget_revisions:
+        manager = manager_mod.Manager(
+            config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
+        )
+        count = manager.forget_revisions()
+        print(f"Forgot {count} deleted objects and every recorded revision")
         return
 
     if args.show_enforcement_errors or args.clear_enforcement_errors:

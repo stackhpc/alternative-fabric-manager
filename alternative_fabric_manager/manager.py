@@ -184,6 +184,135 @@ class Manager:
         self._wakeup.set()
         return job.id
 
+    # Late requests (see specs/ha.md)
+
+    @staticmethod
+    def revision_of(data):
+        """Neutron's revision_number in a request's dict, or None"""
+        value = (data or {}).get("revision_number")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def _check_late(self, session, kind, object_id, revision):
+        """After the generation bump: refuse a late create or update with
+        InvalidRequest, return the job of an open deferred request that this
+        one resends, or None to go ahead"""
+        tombstone = session.get(db.Tombstone, (kind, object_id))
+        if tombstone is not None:
+            if kind == "network":
+                # A network is never created again under its ID.
+                raise partitions.InvalidRequest(
+                    f"Network {object_id} was deleted: a late request"
+                )
+            if revision is not None and not (
+                (tombstone.set_revision is None or revision > tombstone.set_revision)
+                and (
+                    tombstone.deleted_revision is None
+                    or revision >= tombstone.deleted_revision
+                )
+            ):
+                raise partitions.InvalidRequest(
+                    f"Port {object_id} was deleted, and revision {revision} "
+                    "is from before: a late request"
+                )
+        if revision is None:
+            return None
+        model = db.Network if kind == "network" else db.Port
+        current = session.get(model, object_id)
+        if (
+            current is not None
+            and current.revision is not None
+            and revision < current.revision
+        ):
+            raise partitions.InvalidRequest(
+                f"The {kind} {object_id} is at revision {current.revision}, "
+                f"past {revision}: a late request"
+            )
+        waiting = self._waiting(session, kind, object_id)
+        if waiting is not None:
+            waited = json.loads(waiting.data).get("revision")
+            if waited is not None:
+                if revision < waited:
+                    raise partitions.InvalidRequest(
+                        f"The {kind} {object_id} waits at revision {waited}, "
+                        f"past {revision}: a late request"
+                    )
+                if revision == waited:
+                    # A resend: the waiting request's job is the one
+                    # networking-mlnx polls, so keep it.
+                    return waiting.job_id
+        return None
+
+    def _bury(self, session, kind, object_id, revision, live):
+        """Leave or raise a deleted object's tombstone, before its deferred
+        request is superseded"""
+        waiting = self._waiting(session, kind, object_id)
+        tombstone = session.get(db.Tombstone, (kind, object_id))
+        set_revisions = [
+            r
+            for r in (
+                live.revision if live is not None else None,
+                json.loads(waiting.data).get("revision") if waiting else None,
+                tombstone.set_revision if tombstone is not None else None,
+            )
+            if r is not None
+        ]
+        deleted = [
+            r
+            for r in (
+                revision,
+                tombstone.deleted_revision if tombstone is not None else None,
+            )
+            if r is not None
+        ]
+        if tombstone is None:
+            tombstone = db.Tombstone(kind=kind, object_id=object_id)
+            session.add(tombstone)
+        tombstone.set_revision = max(set_revisions, default=None)
+        tombstone.deleted_revision = max(deleted, default=None)
+        tombstone.deleted_at = _now()
+        if (
+            live is not None
+            and live.revision is not None
+            and revision is not None
+            and revision <= live.revision
+        ):
+            # Current, or late after a host move: it can't be told (see Late
+            # requests), so it is applied, but say so.
+            LOG.warning(
+                "Deleting %s %s at revision %d, not past its %d: if it was "
+                "late, Neutron still has it",
+                kind,
+                object_id,
+                revision,
+                live.revision,
+            )
+
+    def forget_tombstones(self, days=7):
+        """Drop tombstones older than their keeping time"""
+        cutoff = _now() - datetime.timedelta(days=days)
+        with self._lock, self.sessionmaker() as session:
+            session.execute(
+                sa.delete(db.Tombstone).where(db.Tombstone.deleted_at < cutoff)
+            )
+            session.commit()
+
+    def forget_revisions(self):
+        """After Neutron's database is restored: drop every tombstone and
+        recorded revision, and return how many tombstones there were"""
+        with self._lock, self.sessionmaker() as session:
+            count = session.scalar(sa.select(sa.func.count()).select_from(db.Tombstone))
+            session.execute(sa.delete(db.Tombstone))
+            session.execute(sa.update(db.Network).values(revision=None))
+            session.execute(sa.update(db.Port).values(revision=None))
+            for row in session.scalars(sa.select(db.Deferred)):
+                values = json.loads(row.data)
+                values.pop("revision", None)
+                row.data = json.dumps(values)
+            session.commit()
+            return count
+
     @staticmethod
     def _supersede(session, kind, object_id, reason="Superseded by a later request"):
         """Drop an object's deferred request, failing its job"""
@@ -230,6 +359,8 @@ class Manager:
             session.add(network)
         network.pkey = values["pkey"]
         network.name = values["name"]
+        if values.get("revision") is not None:
+            network.revision = max(network.revision or 0, values["revision"])
         session.flush()
 
     @staticmethod
@@ -266,6 +397,14 @@ class Manager:
         port.network_id = values["network_id"]
         port.guid = values["guid"]
         port.host = values["host"]
+        if values.get("revision") is not None:
+            port.revision = max(port.revision or 0, values["revision"])
+        # Set, so no longer deleted (see Late requests)
+        session.execute(
+            sa.delete(db.Tombstone).where(
+                db.Tombstone.kind == "port", db.Tombstone.object_id == port_id
+            )
+        )
         session.flush()
 
     def put_network(self, network_id, data):
@@ -276,9 +415,18 @@ class Manager:
             raise partitions.InvalidRequest(
                 f"Partition key 0x{pkey:04x} of network {network_id} is reserved"
             )
-        values = {"pkey": pkey, "name": str(data.get("name") or "")[:255]}
+        values = {
+            "pkey": pkey,
+            "name": str(data.get("name") or "")[:255],
+            "revision": self.revision_of(data),
+        }
         with self._lock, self.sessionmaker() as session:
             generation = self._bump(session)
+            resent = self._check_late(
+                session, "network", network_id, values["revision"]
+            )
+            if resent is not None:
+                return resent
             self._supersede(session, "network", network_id)
             self._release(session, "network", network_id)
             effect = effects.network_present(network_id, pkey)
@@ -297,10 +445,17 @@ class Manager:
                 session, generation, "put_network", network_id, effect
             )
 
-    def delete_network(self, network_id):
+    def delete_network(self, network_id, data=None):
         partitions.check_id(network_id)
         with self._lock, self.sessionmaker() as session:
             generation = self._bump(session)
+            self._bury(
+                session,
+                "network",
+                network_id,
+                self.revision_of(data),
+                session.get(db.Network, network_id),
+            )
             self._supersede(
                 session, "network", network_id, "Superseded by its deletion"
             )
@@ -354,8 +509,15 @@ class Manager:
             "network_id": network_id,
             "guid": f"{guid:016x}",
             "host": str(data.get("binding:host_id") or "")[:255],
+            "revision": self.revision_of(data),
         }
         with self._lock, self.sessionmaker() as session:
+            # First, so that every read below sees the requests serialised
+            # before this one (see Shared state, Late requests)
+            generation = self._bump(session)
+            resent = self._check_late(session, "port", port_id, values["revision"])
+            if resent is not None:
+                return resent
             network = session.get(db.Network, network_id)
             waiting_network = self._waiting(session, "network", network_id)
             if network is None and waiting_network is None:
@@ -369,7 +531,6 @@ class Manager:
                 pkey = network.pkey
             else:
                 pkey = json.loads(waiting_network.data)["pkey"]
-            generation = self._bump(session)
             self._supersede(session, "port", port_id)
             self._release(session, "port", port_id)
             effect = effects.port_present(
@@ -388,10 +549,17 @@ class Manager:
             self._set_port(session, port_id, values)
             return self._commit_job(session, generation, "put_port", port_id, effect)
 
-    def delete_port(self, port_id):
+    def delete_port(self, port_id, data=None):
         partitions.check_id(port_id)
         with self._lock, self.sessionmaker() as session:
             generation = self._bump(session)
+            self._bury(
+                session,
+                "port",
+                port_id,
+                self.revision_of(data),
+                session.get(db.Port, port_id),
+            )
             self._supersede(session, "port", port_id, "Superseded by its deletion")
             port = session.get(db.Port, port_id)
             guid = port.guid if port is not None else None
@@ -1216,5 +1384,6 @@ class Manager:
         self.sync()
         self.check_fabric()
         self.evaluate_jobs()
+        self.forget_tombstones()
 
     apply_pending = reconcile
