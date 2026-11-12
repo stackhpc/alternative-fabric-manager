@@ -308,8 +308,9 @@ class ManagedDocker(DockerReloader):
         A start, or a takeover in HA mode, then doesn't wait on a registry,
         nor fail because one is down (see specs/ha.md, Timeouts). An image
         already here is never pulled again: with a tag that moves, that would
-        change which OpenSM runs from one start to the next. Raises
-        DockerException if the pull fails."""
+        change which OpenSM runs from one start to the next. Raises if the
+        pull fails: DockerException, or requests' errors if the daemon goes
+        away."""
         if self.has_image():
             return
         LOG.info("Pulling OpenSM's image %s", self.config.image)
