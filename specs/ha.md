@@ -356,8 +356,11 @@ tombstone; a refusal rolls the transaction back.
   but a late deletion after a host move removes a live port, which Neutron
   shows ACTIVE, from its partition until its next update that changes it,
   or its next binding, which may never come; a resend at the same revision
-  doesn't restore it. This is a known limitation. A deletion at or below a live port's
-  revision logs a warning naming it.
+  doesn't restore it. This is a known limitation, and a late deletion at
+  the port's revision can't even be warned of: an ordinary deletion
+  carries the revision of the port's last request too, as tempest's runs
+  show. A deletion below a live port's revision, which is unusual, logs a
+  warning naming it.
 - **A request with no `revision_number`** is neither checked nor recorded,
   except against a network's tombstone; a deletion without one leaves a
   tombstone with no `d`. Objects from before revisions were recorded have

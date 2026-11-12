@@ -279,12 +279,13 @@ class Manager:
             and live is not None
             and live.revision is not None
             and revision is not None
-            and revision <= live.revision
+            and revision < live.revision
         ):
-            # Current, or late after a host move: it can't be told (see Late
-            # requests), so it is applied, but say so.
+            # Unusual, so worth a warning; at the port's revision is the
+            # ordinary case, which a late deletion after a host move can't
+            # be told from (see Late requests). Applied either way.
             LOG.warning(
-                "Deleting %s %s at revision %d, not past its %d: if it was "
+                "Deleting %s %s at revision %d, below its %d: if it was "
                 "late, Neutron still has it",
                 kind,
                 object_id,
