@@ -132,6 +132,10 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         except docker.errors.DockerException as e:
             raise docker_driver.ReloadError(f"Docker: {e}") from e
         if not present:
+            # Not eligible from the coordinator's next reach refresh, rather
+            # than after this cache too, so that it doesn't keep winning the
+            # lease only to fail again
+            self._reach = (None, time.monotonic())
             raise docker_driver.ReloadError(
                 f"OpenSM's image {self.config.image} isn't on this node"
             )

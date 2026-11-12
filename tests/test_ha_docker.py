@@ -245,9 +245,14 @@ def test_a_missing_image_is_logged_once_until_it_returns(driver, caplog):
 def test_start_fails_rather_than_pull_a_missing_image(driver):
     # A takeover then steps down rather than wait on a registry holding the
     # lease (see specs/ha.md, Timeouts).
+    driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
+    assert driver.reach() == 1
+    probes = len(driver.client.runs)
     driver.prepare("u", 3, 1e12)
     driver.write_lease("u", 3, 1e12)
     driver.client.images.present = False
     with pytest.raises(ha_docker.docker_driver.ReloadError, match="isn't on this node"):
         driver.start()
-    assert driver.client.runs == []
+    assert len(driver.client.runs) == probes
+    # Not eligible again on the reach cached before the image went
+    assert driver.reach() is None

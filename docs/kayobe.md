@@ -322,6 +322,8 @@ lease before Docker kills it.
   register: afm_opensm_inspect
   changed_when: false
   failed_when: false
+  # Read-only, so that --check can decide whether to pull
+  check_mode: false
   become: true
 
 - name: Ensure OpenSM's image is present
