@@ -29,7 +29,13 @@ AFM_FUNCTIONAL=1 timeout 2400 uv run pytest -q tests/functional/test_failover.py
 
 - Needs Docker; `AFM_DOCKER` (default `sudo docker`) is the command. The
   image is `docker.io/library/mariadb:10.11`, which bundles Galera.
-- The full suite takes about 3-4 minutes. Select scenarios with `-k`.
+- The full suite takes about 14 minutes. Select scenarios with `-k`.
+- The nemesis, `tests/functional/test_nemesis.py`, needs `AFM_NEMESIS=1`
+  too and takes about 6 minutes: 300 s of seeded random faults
+  (`AFM_NEMESIS_SECONDS`), then a history check. It prints its
+  `AFM_NEMESIS_SEED`; set that to replay a failing schedule, though not
+  its exact timing. Run with `-s` to see its summary and any `NOTE:`
+  lines, and read `history.json` in its test directory after a failure.
 - Run in the background if it may outlast a tool call's timeout.
 - Run it twice after a timing-sensitive change: one pass can hide a race.
 
