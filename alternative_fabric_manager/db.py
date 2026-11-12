@@ -362,6 +362,9 @@ def check_serving(session):
     statement makes."""
     if session.get_bind().dialect.name == "sqlite":
         return
+    # This SELECT waits causally too, but it is not what keeps a request
+    # from reading a lagging node's older state: every statement's own wait
+    # is, SYNC_WAIT, the generation bump's above all. Neither is removable.
     try:
         wsrep_on = session.scalar(sa.text("SELECT @@wsrep_on"))
     except sa.exc.DBAPIError as e:

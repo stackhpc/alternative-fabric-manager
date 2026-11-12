@@ -987,7 +987,10 @@ the OpenStack services do. SQLAlchemy makes the backend a
   could refuse a valid request with a final 400 for state it hasn't
   applied yet, such as a port on a network created meanwhile, as the
   nemesis found. A request whose node isn't in a Primary component, or
-  isn't ready, gets 503, which networking-mlnx retries.
+  isn't ready, gets 503, which networking-mlnx retries. A lease call so
+  makes two causal waits, its status check's and its statement's, each
+  bounded by the call timeout, so a leader's tick under sustained lag
+  takes up to six call timeouts, below `T_self` with the defaults.
 - **UTC.** Timestamps and deadlines are `DATETIME(6)` values set and
   compared with `UTC_TIMESTAMP(6)`, so that no session's timezone or
   daylight saving change can age a job. SQLite uses its own UTC functions.
