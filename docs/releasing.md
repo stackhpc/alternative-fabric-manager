@@ -18,8 +18,9 @@ them (see [Upgrades](#after-publishing)).
 - **Choose the version.** It must be newer than both `pyproject.toml`'s
   version and the latest tag.
 - **The workflow can push to `main`.** It commits the version bump to
-  `main` as `github-actions[bot]`. If `main` requires pull requests or
-  reviews, allow GitHub Actions to bypass that rule, or the push fails.
+  `main` as `github-actions[bot]`. If `main`'s ruleset requires pull
+  requests, reviews or status checks, add GitHub Actions to its bypass
+  list, or the push fails (see Branch protection).
 
 ## Run the workflow
 
@@ -33,16 +34,19 @@ gh run watch --repo stackhpc/alternative-fabric-manager
 
 The workflow:
 
-1. refuses to run from any branch but `main`;
-2. checks the version: well formed, not already a tag, and newer than both
+1. runs the nemesis on `main`, about 7 minutes: randomized HA faults
+   against live requests, with the history checked afterwards (see the
+   functional-tests skill), and goes no further if it fails;
+2. refuses to run from any branch but `main`;
+3. checks the version: well formed, not already a tag, and newer than both
    `pyproject.toml`'s version and the latest tag;
-3. sets the version in `pyproject.toml` and `uv.lock` with `uv version`,
+4. sets the version in `pyproject.toml` and `uv.lock` with `uv version`,
    using the uv in `.uv-version`, and fails if anything else changed;
-4. commits **Release 0.2.0** to `main` and pushes it;
-5. tags that commit `0.2.0`, an annotated tag, and pushes the tag;
-6. opens a **draft** release for the tag, with GitHub's generated release
+5. commits **Release 0.2.0** to `main` and pushes it;
+6. tags that commit `0.2.0`, an annotated tag, and pushes the tag;
+7. opens a **draft** release for the tag, with GitHub's generated release
    notes;
-7. starts **Build and publish image** on the tag, which builds and pushes
+8. starts **Build and publish image** on the tag, which builds and pushes
    `ghcr.io/stackhpc/alternative-fabric-manager:0.2.0` for amd64 and arm64.
    A tag pushed by a workflow doesn't start other workflows by itself, so
    the release workflow starts it.
@@ -119,3 +123,25 @@ Running the workflow again after the bump reached `main` fails its
 validation, since the version is then no longer newer than
 `pyproject.toml`'s: finish by hand as above. Never move or delete a tag
 once its release is published: deployments and the image refer to it.
+
+## Branch protection
+
+`main`'s ruleset (**Settings** → **Rules** → **Rulesets**) should:
+
+- **require a pull request** before merging, and **block force pushes**;
+- **require these status checks**: `Test` (lint, formatting and unit
+  tests) and `Functional (failover)`, which every pull request gets: it
+  runs the failover suite when the pull request touches HA code, the
+  schema, the API, the harness or the dependencies, and passes in seconds
+  otherwise. A check only appears in the ruleset's search once it has run,
+  so add it after a pull request has run it;
+- leave **require branches to be up to date** off, unless a merge queue is
+  in use, or every merge makes each open HA pull request run the 15-minute
+  suite again;
+- list **GitHub Actions** as a bypass actor, for the Release workflow's
+  push of the version bump.
+
+Don't require `Pytest`, which only annotates `Test`'s results, or the
+nemesis, which runs in the release workflow and every night
+(`nightly.yaml`), not on pull requests: a nightly failure opens an issue
+naming its seed.

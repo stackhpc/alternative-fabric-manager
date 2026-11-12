@@ -2,12 +2,13 @@
 # instances against a three-node Galera cluster in containers, with a fake
 # OpenSM under the real watchdog.
 #
-# - Pull requests that touch HA code run the failover suite.
-# - Every night, the nemesis runs for longer, with a random seed: each run
-#   tries new interleavings of faults.
-# - The release workflow calls it with the nemesis as a gate, so that no
-#   version is tagged without a passing run.
-# - Either can be run by hand.
+# - Every pull request gets a "Functional (failover)" check, which can be
+#   required: it runs the failover suite if the pull request touches HA code,
+#   and otherwise passes in seconds, so that a required check never waits
+#   for a run that a path filter skipped.
+# - nightly.yaml calls it for a longer nemesis, and release.yaml for the
+#   nemesis as a gate before a version is tagged.
+# - Either suite can be run by hand, with a seed to replay.
 #
 # A failed run uploads every test's instance logs, fabric directory and,
 # for the nemesis, history.json, and its summary names the nemesis seed,
@@ -16,17 +17,6 @@ name: Functional
 
 on:
   pull_request:
-    paths:
-      - "alternative_fabric_manager/ha/**"
-      - "alternative_fabric_manager/manager.py"
-      - "alternative_fabric_manager/drivers/**"
-      - "alternative_fabric_manager/db.py"
-      - "alternative_fabric_manager/migrations/**"
-      - "alternative_fabric_manager/api.py"
-      - "tests/functional/**"
-      - ".github/workflows/functional.yaml"
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       suite:
@@ -58,25 +48,29 @@ on:
         description: "What to check out, such as main for a release"
         default: ""
         type: string
+    outputs:
+      seed:
+        description: "The nemesis seed, to replay a failure"
+        value: ${{ jobs.functional.outputs.seed }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: functional-${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || github.event_name }}
+  group: functional-${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || 'failover' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   functional:
-    name: >-
-      ${{ (inputs.suite || (github.event_name == 'schedule' && 'nemesis') || 'failover') }}
+    # A stable name, for a required check
+    name: Functional (${{ inputs.suite || 'failover' }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      seed: ${{ steps.summary.outputs.seed }}
     env:
-      SUITE: ${{ inputs.suite || (github.event_name == 'schedule' && 'nemesis') || 'failover' }}
-      # Nightly runs are longer, to find what short ones miss.
-      AFM_NEMESIS_SECONDS: >-
-        ${{ inputs.nemesis_seconds || (github.event_name == 'schedule' && '1800') || '300' }}
+      SUITE: ${{ inputs.suite || 'failover' }}
+      AFM_NEMESIS_SECONDS: ${{ inputs.nemesis_seconds || '300' }}
       AFM_NEMESIS_SEED: ${{ inputs.nemesis_seed }}
       # The runner's user can use Docker without sudo.
       AFM_DOCKER: docker
@@ -88,23 +82,46 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
+      - name: Decide whether to run
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Only a pull request may skip: one that doesn't touch HA code, the
+          # schema, the API or the harness.
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          pattern='^(alternative_fabric_manager/(ha/|drivers/|migrations/|manager\.py|db\.py|api\.py)|tests/functional/|\.github/workflows/functional\.yaml|pyproject\.toml|uv\.lock)'
+          if git diff --name-only "$BASE" HEAD | grep -qE "$pattern"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No HA code changed: nothing to run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Set up uv
+        if: steps.scope.outputs.run == 'true'
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
 
       - name: Install locked dependencies
+        if: steps.scope.outputs.run == 'true'
         run: uv sync --locked
 
       - name: Pull MariaDB's image
+        if: steps.scope.outputs.run == 'true'
         run: docker pull docker.io/library/mariadb:10.11
 
       - name: Run the failover suite
-        if: env.SUITE == 'failover'
+        if: steps.scope.outputs.run == 'true' && env.SUITE == 'failover'
         run: >-
           uv run pytest -q tests/functional/test_failover.py
           --basetemp="$RUNNER_TEMP/functional"
 
       - name: Run the nemesis
-        if: env.SUITE == 'nemesis'
+        if: steps.scope.outputs.run == 'true' && env.SUITE == 'nemesis'
         env:
           AFM_NEMESIS: "1"
         run: |
@@ -113,15 +130,19 @@ jobs:
             --basetemp="$RUNNER_TEMP/functional" | tee "$RUNNER_TEMP/nemesis.txt"
 
       - name: Summarise the nemesis
-        if: always() && env.SUITE == 'nemesis'
+        id: summary
+        if: always() && steps.scope.outputs.run == 'true' && env.SUITE == 'nemesis'
         run: |
+          seed="$(grep -oE 'AFM_NEMESIS_SEED=[0-9]+' "$RUNNER_TEMP/nemesis.txt" \
+            | head -1 | cut -d= -f2 || true)"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
           {
             echo "## Nemesis"
             echo
             grep -E "AFM_NEMESIS_SEED=|faults,|NOTE:" "$RUNNER_TEMP/nemesis.txt" \
               | sed 's/^/    /' || echo "No summary: see the log."
             echo
-            echo "Replay with \`AFM_NEMESIS_SEED=<seed>\`, by hand or with this"
+            echo "Replay with \`AFM_NEMESIS_SEED=$seed\`, by hand or with this"
             echo "workflow's nemesis_seed input."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -137,5 +158,5 @@ jobs:
           if-no-files-found: ignore
 
       - name: Remove the Galera containers
-        if: always()
+        if: always() && steps.scope.outputs.run == 'true'
         run: docker rm -f afm-galera-1 afm-galera-2 afm-galera-3 || true

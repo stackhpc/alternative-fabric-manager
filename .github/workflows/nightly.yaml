@@ -1,0 +1,49 @@
+# Every night, the nemesis for 30 minutes on main, with a random seed: each
+# run tries new interleavings of HA faults against live requests (see
+# functional.yaml). A failure opens an issue naming the seed, or comments on
+# the one already open, rather than blocking anything.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  nemesis:
+    name: Nemesis
+    permissions:
+      contents: read
+    uses: ./.github/workflows/functional.yaml
+    with:
+      suite: nemesis
+      nemesis_seconds: "1800"
+
+  report:
+    name: Report a failure
+    needs: nemesis
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: ${{ needs.nemesis.outputs.seed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly nemesis failed"
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            "The nightly nemesis failed: $RUN_URL" \
+            "Seed: \`${SEED:-unknown}\`. Replay it with \`AFM_NEMESIS_SEED=${SEED:-<seed>}\` (see the functional-tests skill), or with the Functional workflow's nemesis_seed input." \
+            "The run's artifact has every test's logs and history.json.")"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
