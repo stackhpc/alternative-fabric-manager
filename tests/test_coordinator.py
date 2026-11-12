@@ -415,3 +415,58 @@ def test_a_failed_renewal_still_renews_the_watchdogs_lease(lease, clock, monkeyp
     assert term == a.term
     assert clock.now < deadline
     assert deadline <= t0 + TIMINGS["self_stop_timeout"] + TIMINGS["watchdog_timeout"]
+
+
+def _stalled_leader(lease, clock):
+    """A leader whose lease thread then makes no progress, as while its
+    database calls block"""
+    a = make(lease, "a")
+    lead(a)
+    a.runner.leases.clear()
+    return a, a.t0
+
+
+def _bound(t0):
+    return t0 + TIMINGS["self_stop_timeout"] + TIMINGS["watchdog_timeout"]
+
+
+def test_the_liveness_thread_renews_the_watchdog_through_a_stall(lease, clock):
+    a, t0 = _stalled_leader(lease, clock)
+    clock.now = t0 + TIMINGS["self_stop_timeout"] - 0.1
+    a._renew_watchdog()
+    (term, deadline), *_ = a.runner.leases
+    assert term == a.term
+    assert clock.now < deadline <= _bound(t0)
+
+
+def test_the_liveness_thread_stops_at_t_self(lease, clock):
+    a, t0 = _stalled_leader(lease, clock)
+    clock.now = t0 + TIMINGS["self_stop_timeout"]
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_never_renews_after_a_step_down(lease, clock):
+    a, _t0 = _stalled_leader(lease, clock)
+    a._step_down("test")
+    a.runner.leases.clear()
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_leaves_a_held_lease_alone(lease, clock):
+    a, _t0 = _stalled_leader(lease, clock)
+    lease.request_freeze(a.term, "operator", 30)
+    a._freeze_step()
+    assert a.held
+    a.runner.leases.clear()
+    a._renew_watchdog()
+    assert not a.runner.leases
+
+
+def test_the_liveness_thread_stops_when_a_loop_overruns(lease, clock, monkeypatch):
+    a, t0 = _stalled_leader(lease, clock)
+    monkeypatch.setattr(a.manager, "iteration_age", lambda: a.apply_bound + 1)
+    clock.now = t0 + 1
+    a._renew_watchdog()
+    assert not a.runner.leases

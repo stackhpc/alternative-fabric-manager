@@ -430,6 +430,10 @@ ha_state_dir = {{ afm_state_dir }}
 host_proc = /host/proc
 # Kayobe's containers have Docker's default stop timeout
 container_stop_timeout = 10
+# If you lower self_stop_timeout (20 s), keep it well above Galera's
+# eviction of a lost node, evs.suspect_timeout (5 s) plus a view change,
+# during which no node can commit: below it, losing any Galera node stops
+# OpenSM.
 shutdown_timeout = 8
 ```
 

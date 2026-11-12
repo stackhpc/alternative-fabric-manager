@@ -87,6 +87,12 @@ class Coordinator:
         self._takeover = None
         self._takeover_started = None
         self._renewals_stopped = False
+        # What the liveness thread may renew the watchdog's lease with: the
+        # instance, term and t0 of the lease thread's last write with a
+        # deadline, or None once it wrote a held lease or began stepping
+        # down. The lock keeps a renewal from landing after that.
+        self._grant = None
+        self._grant_lock = threading.Lock()
         self._opensm_gone = False
         self._restarting = False
         # Other nodes' heartbeats as last seen, and since when, to tell live
@@ -109,6 +115,7 @@ class Coordinator:
         self._rejoin()
         self._thread = threading.Thread(target=self._run, name="lease", daemon=True)
         self._thread.start()
+        threading.Thread(target=self._liveness, name="liveness", daemon=True).start()
 
     def _rejoin(self):
         """Register with a new instance UUID, and make sure no OpenSM of ours
@@ -242,18 +249,66 @@ class Coordinator:
 
     # Leading
 
-    def _loops_alive(self):
+    def _loops_alive(self, log=True):
         """The liveness condition: no loop iteration over its bound"""
         if self.manager.iteration_age() > self.apply_bound:
-            LOG.error("The apply loop is past its bound")
+            if log:
+                LOG.error("The apply loop is past its bound")
             return False
+        takeover_started = self._takeover_started
         if (
-            self._takeover_started is not None
-            and _now() - self._takeover_started > self.takeover_bound
+            takeover_started is not None
+            and _now() - takeover_started > self.takeover_bound
         ):
-            LOG.error("The takeover is past its bound")
+            if log:
+                LOG.error("The takeover is past its bound")
             return False
         return True
+
+    # The watchdog's lease
+
+    def _write_watchdog_lease(self, deadline):
+        """Write the watchdog's lease, held if no deadline, and record what
+        the liveness thread may renew it with"""
+        with self._grant_lock:
+            self.runner.write_lease(self.uuid, self.term, deadline)
+            self._grant = None if deadline is None else (self.uuid, self.term, self.t0)
+
+    def _revoke_grant(self):
+        with self._grant_lock:
+            self._grant = None
+
+    def _liveness(self):
+        """Renew the watchdog's lease every period while the loops make
+        progress, with no database call in the way, so that a Galera stall
+        shorter than T_self, during which the lease thread's own calls
+        block, doesn't let it lapse. It stops once no renewal has succeeded
+        for T_self, and the deadline stays bounded by t0 + T_self +
+        T_watchdog (see The watchdog)."""
+        while not self._stop.wait(self.config.ha_period):
+            try:
+                self._renew_watchdog()
+            except Exception:  # noqa: BLE001 - try again next period
+                LOG.exception("Renewing the watchdog's lease failed")
+
+    def _renew_watchdog(self):
+        with self._grant_lock:
+            if self._grant is None or self.held:
+                return
+            instance, term, t0 = self._grant
+            now = _now()
+            if t0 is None or now - t0 >= self.config.self_stop_timeout:
+                return
+            if not self._loops_alive(log=False):
+                return
+            self.runner.write_lease(
+                instance,
+                term,
+                min(
+                    now + self.config.watchdog_timeout,
+                    t0 + self.config.self_stop_timeout + self.config.watchdog_timeout,
+                ),
+            )
 
     @property
     def apply_bound(self):
@@ -322,10 +377,8 @@ class Coordinator:
         # stays bounded by t0 + T_self + T_watchdog, and self-stop ends it
         # at T_self (see The watchdog).
         if self.opensm_started and self.t0 is not None:
-            self.runner.write_lease(
-                self.uuid,
-                self.term,
-                None if self.held else self._watchdog_deadline(now),
+            self._write_watchdog_lease(
+                None if self.held else self._watchdog_deadline(now)
             )
         if renewed is None:
             return
@@ -383,7 +436,7 @@ class Coordinator:
         self.manager.halt()
         # The held lease again first: a failed start removes the watchdog's
         # files.
-        self.runner.write_lease(self.uuid, self.term, None)
+        self._write_watchdog_lease(None)
         self.runner.prepare(self.uuid, self.term, None)
 
         def restart():
@@ -420,16 +473,14 @@ class Coordinator:
             self.held = True
             self.frozen = True
             if self.opensm_started:
-                self.runner.write_lease(self.uuid, self.term, None)
+                self._write_watchdog_lease(None)
         elif state.freeze_state == "ending":
             # In this order, and again until it commits: a deadline for the
             # watchdog, self-stop timing, a renewal, then the acknowledgement
             # (see Freeze).
             now = _now()
             if self.opensm_started:
-                self.runner.write_lease(
-                    self.uuid, self.term, self._watchdog_deadline(now)
-                )
+                self._write_watchdog_lease(self._watchdog_deadline(now))
             self.held = False
             if self.lease.renew(self.uuid, self.term):
                 self.t0 = now
@@ -591,8 +642,8 @@ class Coordinator:
         deadline = None if self.held else self.t0 + self.config.self_stop_timeout
         self.runner.prepare(self.uuid, self.term, deadline)
         self.opensm_started = True
-        self.runner.write_lease(
-            self.uuid, self.term, None if self.held else self._watchdog_deadline(_now())
+        self._write_watchdog_lease(
+            None if self.held else self._watchdog_deadline(_now())
         )
 
     def _start_opensm(self):
@@ -612,6 +663,7 @@ class Coordinator:
     def _abandon(self):
         """Come back as a new instance, having made sure no OpenSM of ours
         runs, without releasing anything"""
+        self._revoke_grant()
         self.runner.stop()
         if not self.runner.verify_stopped():
             LOG.error("Can't verify that OpenSM stopped: not a candidate")
@@ -627,6 +679,7 @@ class Coordinator:
         """Stop OpenSM, verify it stopped, and release the lease if asked,
         and if the deadline, at SIGTERM, allows"""
         LOG.warning("Stepping down: %s", why)
+        self._revoke_grant()
         term = self.term
         # OpenSM first: the applier may take up to its bound to finish.
         self.runner.stop()
