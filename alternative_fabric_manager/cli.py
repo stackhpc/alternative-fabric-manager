@@ -213,6 +213,12 @@ def main(argv=None):
         drivers.make_driver(config),
     )
     app = api.create_app(config, manager)
+    if hasattr(manager.driver, "ensure_image"):
+        try:
+            manager.driver.ensure_image()
+        except Exception as e:  # noqa: BLE001 - as a daemon restart raises
+            # The start below tries again, and reports what fails.
+            logging.getLogger(__name__).error("Can't pull OpenSM's image: %s", e)
     manager.start()
     try:
         uvicorn.run(
@@ -245,9 +251,11 @@ def _serve_ha(config, args):
         config, lease_mod.GaleraLease(sessionmaker), driver, manager
     )
     app = api.create_app(config, manager, coordinator)
+    image_stop = threading.Event()
 
     class Server(uvicorn.Server):
         def handle_exit(self, sig, frame):
+            image_stop.set()
             # Step down before uvicorn stops: it raises the signal again once
             # it has, which ends the process.
             coordinator.shutdown()
@@ -261,6 +269,11 @@ def _serve_ha(config, args):
             log_level="debug" if args.debug else "info",
         )
     )
+    # Before any takeover needs it, and on every instance, so that a
+    # takeover doesn't wait on a registry (see specs/ha.md, Timeouts)
+    threading.Thread(
+        target=driver.keep_image, args=(image_stop,), name="image", daemon=True
+    ).start()
     threading.Thread(target=coordinator.start, name="coordinator", daemon=True).start()
     server.run()
 

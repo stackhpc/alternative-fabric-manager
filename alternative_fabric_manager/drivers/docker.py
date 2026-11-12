@@ -26,6 +26,7 @@ import time
 
 import docker
 import docker.errors
+import docker.utils
 
 from alternative_fabric_manager import opensm_conf
 from alternative_fabric_manager.drivers import (
@@ -77,6 +78,8 @@ _PORT_GUID = re.compile(r"(?:of port|VPort|guid \()\s*0x([0-9a-fA-F]{1,16})")
 _SWITCH_PORT = re.compile(r"switch 0x([0-9a-fA-F]{1,16}) port (\d+)")
 _PARSE_LINE = re.compile(r"PARSE ERROR: line (\d+)")
 POLL_INTERVAL = 0.5
+# Seconds between attempts to pull OpenSM's image that failed
+PULL_RETRY = 60.0
 
 
 def _is_partitions_error(line):
@@ -290,6 +293,59 @@ class ManagedDocker(DockerReloader):
                 "running if the manager stops"
             )
         return kwargs
+
+    def has_image(self):
+        """Whether this host has OpenSM's image"""
+        try:
+            self.client.images.get(self.config.image)
+            return True
+        # docker-py makes a 404 ImageNotFound only by its message's wording,
+        # which another API, such as Podman's, may not match
+        except docker.errors.NotFound:
+            return False
+
+    def ensure_image(self):
+        """Pull OpenSM's image if this host doesn't have it
+
+        A start, or a takeover in HA mode, then doesn't wait on a registry,
+        nor fail because one is down (see specs/ha.md, Timeouts). An image
+        already here is never pulled again: with a tag that moves, that would
+        change which OpenSM runs from one start to the next. Raises if the
+        pull fails: DockerException, or requests' errors if the daemon goes
+        away."""
+        if self.has_image():
+            return
+        LOG.info("Pulling OpenSM's image %s", self.config.image)
+        repository, tag = docker.utils.parse_repository_tag(self.config.image)
+        # The low-level pull, since the high-level one discards the stream,
+        # and with it the registry's reason for a pull that fails part way
+        for chunk in self.client.api.pull(
+            repository, tag=tag or "latest", stream=True, decode=True
+        ):
+            if "error" in chunk:
+                raise docker.errors.APIError(chunk["error"])
+        if not self.has_image():
+            raise docker.errors.ImageNotFound(
+                f"{self.config.image} isn't here after pulling it"
+            )
+        LOG.info("Pulled OpenSM's image %s", self.config.image)
+
+    def keep_image(self, stop, interval=PULL_RETRY):
+        """ensure_image() every interval until stop is set: for a thread of
+        its own, since a pull may take minutes. It keeps checking after a
+        pull succeeds, so that a node whose image is removed, as by a prune,
+        gets it back before it's needed."""
+        while not stop.is_set():
+            try:
+                self.ensure_image()
+            except Exception as e:  # noqa: BLE001 - as a daemon restart raises
+                LOG.error(
+                    "Can't pull OpenSM's image %s, retrying in %d s: %s",
+                    self.config.image,
+                    interval,
+                    e,
+                )
+            stop.wait(interval)
 
     def _remove(self):
         with contextlib.suppress(docker.errors.NotFound):

@@ -162,3 +162,32 @@ def test_a_removed_option_is_ignored_with_a_warning(tmp_path, caplog):
     config = config_mod.Config.load(str(path))
     assert not hasattr(config, "manual_takeover")
     assert "manual_takeover was removed" in caplog.text
+
+
+def test_single_node_starts_opensm_even_if_the_pull_fails(tmp_path, monkeypatch):
+    # The start pulls again, and reports what fails.
+    import uvicorn
+
+    from alternative_fabric_manager import cli, drivers
+    from alternative_fabric_manager import manager as manager_mod
+
+    calls = []
+
+    class Driver(drivers.NoOpenSM):
+        def ensure_image(self):
+            calls.append("pull")
+            raise ConnectionError("daemon gone")
+
+    monkeypatch.setattr(drivers, "make_driver", lambda _config: Driver())
+    monkeypatch.setattr(
+        manager_mod.Manager, "start", lambda self: calls.append("start")
+    )
+    monkeypatch.setattr(manager_mod.Manager, "stop", lambda self: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.append("serve"))
+    path = tmp_path / "afm.conf"
+    path.write_text(
+        f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
+        f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
+    )
+    cli.main(["--config-file", str(path)])
+    assert calls == ["pull", "start", "serve"]

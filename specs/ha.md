@@ -869,6 +869,22 @@ older version, is ignored. So:
 - Nova's `vif_plugging_timeout` and Ironic's wait for ports > the journal's
   sync interval + its retry backoff + the job timeout.
 
+Starting OpenSM in that sum assumes its image is already on the node: a
+pull from a registry has no bound, and may fail just when a takeover needs
+it. So every instance, from its start, checks every minute that its node
+has OpenSM's image, and pulls it, on a thread of its own, if not. A node
+without the image reaches no switches, since the reach scan runs in that
+image, and the scan never pulls it; so it isn't eligible to take the lease
+until the pull completes, and its lease thread never waits on a registry.
+Nor does starting OpenSM pull it: an image removed after the node last
+scanned fails the start, so that a takeover steps down for another
+candidate rather than wait holding the lease, and a frozen node retries.
+It stays in HAProxy's rotation meanwhile, since the API doesn't need the
+image. An instance only pulls an image its node lacks, so that a tag that
+moves can't change OpenSM between one start and the next, though it can
+after the image is removed; deployments pin the image by digest, and pull
+it on every node themselves too.
+
 With a 2 s poll, `sweep_timeout` 30 s, 5 s for a fabric check, `B` 60 s,
 `T` 30 s, `T_reach` 30 s, 5 s for Ask, `T_watchdog` 45 s, and HA mode's
 `start_timeout` of 60 s, the job timeout must exceed 60 + 30 + 2 + 30 + 5 +
@@ -1039,6 +1055,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | A takeover's winner dies before starting OpenSM | Its targets, and itself, stay in the target set. The next candidate waits for them all | Jobs wait longer |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
 | An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
+| A node lacks OpenSM's image, and can't pull it | Its reach is 0, so it isn't eligible; it stays in HAProxy's rotation, and logs an error every minute | Nothing, while another candidate has the image; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
 | Any one Galera node lost, even a candidate's | Every node's commits block until the survivors evict it, after `evs.suspect_timeout`, 5 s by default, and a view change; the leader's renewals fail meanwhile, but its liveness thread keeps the watchdog's lease | Within `T_self`, nothing happens |
 | A MariaDB failover | Failed reads reset the candidates' timers, and the leader's renewals fail meanwhile | Within `T_self`, nothing happens. Longer, the leader stops its OpenSM, and a leader is elected once a Primary component is back, so the SA is down meanwhile, and jobs in flight can time out and are resent |
