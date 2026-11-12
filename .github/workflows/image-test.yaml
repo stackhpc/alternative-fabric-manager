@@ -1,0 +1,121 @@
+# Test the image as it ships: run the unit tests against the package
+# installed in it, on SQLite and on MariaDB, and smoke-test the runtime image
+# with its own entrypoint. Only amd64: arm64 would run under QEMU, too slowly
+# for the timing-based watchdog tests.
+name: Test image
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to test; the caller's by default
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  image_test:
+    name: Test image
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: docker.io/library/mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: afm-ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Read uv version
+        id: uv_version
+        run: |
+          version="$(<.uv-version)"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "Unexpected uv version: $version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      # Reads the publish build's cache too, but writes only its own scope,
+      # so it never replaces the publish build's multi-arch cache.
+      - name: Build the test image
+        id: build_test
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: test
+          platforms: linux/amd64
+          pull: true
+          load: true
+          push: false
+          build-args: |
+            UV_VERSION=${{ steps.uv_version.outputs.version }}
+          tags: afm-test:ci
+          cache-from: |
+            type=gha,scope=alternative-fabric-manager
+            type=gha,scope=alternative-fabric-manager-test
+          cache-to: type=gha,mode=max,scope=alternative-fabric-manager-test
+
+      # Shares the test image's layers on the same builder, so it writes no
+      # cache: that would replace the test scope with a graph lacking it.
+      - name: Build the runtime image
+        id: build_runtime
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            UV_VERSION=${{ steps.uv_version.outputs.version }}
+          tags: afm:ci
+          cache-from: |
+            type=gha,scope=alternative-fabric-manager
+            type=gha,scope=alternative-fabric-manager-test
+
+      - name: Test on SQLite
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD/reports:/reports" afm-test:ci \
+            --junitxml=/reports/pytest-image-sqlite.xml
+
+      # Server databases are the only ones that run the Alembic migrations.
+      - name: Test on MariaDB
+        if: ${{ !cancelled() && steps.build_test.outcome == 'success' }}
+        run: |
+          mkdir -p reports
+          docker run --rm --network host -v "$PWD/reports:/reports" \
+            -e AFM_TEST_DATABASE_URL=mysql+pymysql://root:afm-ci@127.0.0.1:3306/afm_test \
+            afm-test:ci --junitxml=/reports/pytest-image-mariadb.xml
+
+      - name: Smoke-test the runtime image
+        if: ${{ !cancelled() && steps.build_runtime.outcome == 'success' }}
+        run: .github/scripts/smoke-test.sh afm:ci
+
+      - name: Publish test annotations
+        if: ${{ always() && hashFiles('reports/*.xml') != '' }}
+        uses: mikepenz/action-junit-report@3a81627bfac62268172037048872e8ebd4207e6d # v6.4.1
+        with:
+          check_name: Pytest (image)
+          report_paths: reports/*.xml
+          # The tested commit, when it isn't the caller's
+          commit: ${{ inputs.ref }}

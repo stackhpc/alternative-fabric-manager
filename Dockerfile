@@ -21,7 +21,7 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY alternative_fabric_manager ./alternative_fabric_manager
 RUN uv sync --locked --no-dev --no-editable
 
-FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST}
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS base
 
 LABEL org.opencontainers.image.title="alternative-fabric-manager" \
       org.opencontainers.image.description="An InfiniBand fabric manager for networking-mlnx that drives OpenSM partitions" \
@@ -38,3 +38,24 @@ VOLUME ["/var/lib/alternative-fabric-manager"]
 EXPOSE 8090
 ENTRYPOINT ["alternative-fabric-manager"]
 CMD ["--config-file", "/etc/alternative-fabric-manager/afm.conf"]
+
+# The unit tests run against the installed package in the runtime image, so
+# CI sees what ships: a file left out of the wheel fails them. The source
+# tree isn't copied, so the tests can't import it instead.
+FROM base AS test
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=bind,source=pyproject.toml,target=/tmp/afm/pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=/tmp/afm/uv.lock \
+    uv export --project /tmp/afm --locked --only-group dev --no-hashes \
+        --no-emit-package ruff -o /tmp/dev.txt \
+    && UV_PYTHON_DOWNLOADS=never uv pip install --python /opt/afm/bin/python \
+        -r /tmp/dev.txt \
+    && rm /tmp/dev.txt
+WORKDIR /test
+COPY tests ./tests
+ENTRYPOINT ["pytest"]
+CMD []
+
+# The image that ships: the last stage, so a build without a target gets it.
+FROM base AS runtime
