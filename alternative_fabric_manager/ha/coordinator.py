@@ -170,6 +170,7 @@ class Coordinator:
             if previous in (Role.LEADER, Role.TAKING_OVER) and not self.frozen:
                 self._step_down("shutting down", deadline=deadline)
             else:
+                self._revoke_grant()
                 self.runner.stop()
                 self.manager.halt()
             try:
@@ -377,8 +378,11 @@ class Coordinator:
         # stays bounded by t0 + T_self + T_watchdog, and self-stop ends it
         # at T_self (see The watchdog).
         if self.opensm_started and self.t0 is not None:
+            # A fresh reading: now was read before this tick's database
+            # calls, and a stale one would shorten the liveness thread's
+            # deadline. The bound, t0 + T_self + T_watchdog, is the same.
             self._write_watchdog_lease(
-                None if self.held else self._watchdog_deadline(now)
+                None if self.held else self._watchdog_deadline(_now())
             )
         if renewed is None:
             return

@@ -44,6 +44,7 @@ from tests.functional.test_failover import (
     TAKEOVER,
     _isolate,
     _operator,
+    cluster_size,
     docker,
     wait_for,
 )
@@ -92,9 +93,12 @@ class Client:
     def _instance(self):
         return self.rng.choice(NODES)
 
-    def _send(self, method, path, body=None):
-        """A request, retried on 503 and on an unreachable instance, through
-        random instances; the job's path"""
+    def _send(self, method, path, body, obj):
+        """A request, retried through random instances on 503, on 500, as
+        while an instance's Galera node stalls, and on no answer, as
+        networking-mlnx resends; the job's path. A 500 or no answer leaves
+        the outcome unknown: the request may still run, even after a later
+        one, from a paused instance, which the checker allows for."""
         end = time.monotonic() + 600
         while time.monotonic() < end:
             i = self._instance()
@@ -107,6 +111,7 @@ class Client:
                     w=self.w,
                     method=method,
                     path=path,
+                    obj=obj,
                     via=i,
                     status=None,
                     error=repr(e),
@@ -119,6 +124,7 @@ class Client:
                 w=self.w,
                 method=method,
                 path=path,
+                obj=obj,
                 via=i,
                 status=status,
                 job=job,
@@ -126,7 +132,7 @@ class Client:
             )
             if status == 202:
                 return job
-            if status == 503:
+            if status in (500, 503):
                 time.sleep(0.5)
                 continue
             # Anything else breaks the contract; the checker reports it.
@@ -151,11 +157,11 @@ class Client:
             time.sleep(0.5)
         raise AssertionError(f"{job} never ended")
 
-    def _do(self, method, path, body=None):
+    def _do(self, method, path, body, obj):
         """Send until a job completes, resending failed ones, as
         networking-mlnx's journal does"""
         for _attempt in range(20):
-            job = self._send(method, path, body)
+            job = self._send(method, path, body, obj)
             if job is None:
                 return False
             if self._wait(job) == "Completed":
@@ -179,6 +185,7 @@ class Client:
                     "provider:physical_network": "ibphysnet",
                     "provider:segmentation_id": vlan,
                 },
+                net,
             )
             if not ok:
                 return
@@ -202,18 +209,19 @@ class Client:
                         }
                     ],
                 },
+                port,
             )
             if not ok:
                 return
             self.model[net].add(port)
             if self.stop.is_set():
                 return
-            if not self._do("DELETE", f"/cloudx/Port/{port}"):
+            if not self._do("DELETE", f"/cloudx/Port/{port}", None, port):
                 return
             self.model[net].discard(port)
             if self.stop.is_set():
                 return
-            if not self._do("DELETE", f"/cloudx/Network/{net}"):
+            if not self._do("DELETE", f"/cloudx/Network/{net}", None, net):
                 return
             del self.model[net]
 
@@ -299,13 +307,32 @@ class Nemesis:
     def link_down(self, i):
         return self._file_fault("linkdown", i)
 
+    def _whole(self, i):
+        """Wait until Galera has three nodes again, so that the next Galera
+        fault still leaves a majority"""
+        wait_for(
+            lambda: cluster_size(self.cluster, next(j for j in NODES if j != i)) == 3,
+            120,
+            "Galera whole again",
+        )
+
     def isolate_galera(self, i):
         _isolate(self.cluster, i, True)
-        return lambda: _isolate(self.cluster, i, False)
+
+        def heal():
+            _isolate(self.cluster, i, False, wait=False)
+            self._whole(i)
+
+        return heal
 
     def pause_galera(self, i):
         docker("pause", f"afm-galera-{i}")
-        return lambda: docker("unpause", f"afm-galera-{i}", check=False)
+
+        def heal():
+            docker("unpause", f"afm-galera-{i}", check=False)
+            self._whole(i)
+
+        return heal
 
     NODE_FAULTS = (
         "pause_manager",
@@ -395,11 +422,24 @@ def _swept(cluster):
 
 
 def check(cluster, history, clients):
-    """The invariants over the whole history; a list of problems"""
-    problems = []
-    # The contract: no 400 to a valid request, no 404 to a DELETE, no 500
+    """The invariants over the whole history: (problems, notes). The notes
+    are objects that a request with an unknown outcome, sent before the
+    client moved on, may have brought back after the client deleted them:
+    a hazard of networking-mlnx's resends that the checker reports rather
+    than fails on.
+
+    The sweep evidence is necessary, not sufficient: it shows that some
+    OpenSM swept the job's generation before the job was seen Completed,
+    not that it did so in the current term after a passing check."""
+    problems, notes = [], []
+    # The contract: no 400 to a valid request, no 404 to a DELETE. A 500,
+    # as while an instance's Galera node stalls, is resent, as networking-
+    # mlnx resends anything that isn't a 400.
+    unknown = set()
     for e in history.of("send"):
-        if e["status"] is not None and e["status"] not in (202, 503):
+        if e["status"] is None or e["status"] == 500:
+            unknown.add(e["obj"])
+        elif e["status"] not in (202, 503):
             problems.append(
                 f"{e['method']} {e['path']} got {e['status']} via {e['via']}"
             )
@@ -440,22 +480,42 @@ def check(cluster, history, clients):
             expected_networks.add(net)
             for port in net_ports:
                 expected_ports[port] = net
-    if networks != expected_networks:
-        problems.append(
-            f"networks: {sorted(networks - expected_networks)} unexpected, "
-            f"{sorted(expected_networks - networks)} missing"
-        )
-    if ports != expected_ports:
-        problems.append(f"ports: {ports} where the client expects {expected_ports}")
+    for net in sorted(expected_networks - networks):
+        problems.append(f"network {net} is missing")
+    for port in sorted(set(expected_ports) - set(ports)):
+        problems.append(f"port {port} is missing")
+    for port, net in expected_ports.items():
+        if port in ports and ports[port] != net:
+            problems.append(f"port {port} is on {ports[port]}, not {net}")
+    for kind, extra in (
+        ("network", networks - expected_networks),
+        ("port", set(ports) - set(expected_ports)),
+    ):
+        for obj in sorted(extra):
+            if obj in unknown:
+                notes.append(
+                    f"{kind} {obj} came back after its deletion, from a request "
+                    "with an unknown outcome"
+                )
+            else:
+                problems.append(f"{kind} {obj} is unexpected")
     # The leader's OpenSM swept the latest generation
     if not any(s[3] >= (state_generation or 0) for s in swept):
         problems.append(f"no sweep of the latest generation, {state_generation}")
-    # Progress while the faults ran
-    if sum(c.completed for c in clients) < WORKERS:
-        problems.append("the client hardly progressed")
-    return problems
+    # Progress while the faults ran, not only after they healed
+    healed = history.of("healed")[0]["t"]
+    during = sum(
+        1 for e in history.of("done") if e["status"] == "Completed" and e["t"] < healed
+    )
+    if during < 4 * WORKERS:
+        problems.append(f"the client completed only {during} requests under faults")
+    return problems, notes
 
 
+# T_self above Galera's eviction of a lost node, 5 s, as in production, so
+# that Galera faults exercise the liveness thread rather than self-stop
+# (see specs/ha.md, Timeouts)
+@pytest.mark.timings(lease_timeout=14.0, self_stop_timeout=10.0)
 def test_nemesis(cluster, tmp_path):
     seed = int(os.environ.get("AFM_NEMESIS_SEED") or random.randrange(2**32))
     print(f"AFM_NEMESIS_SEED={seed}")
@@ -507,17 +567,36 @@ def test_nemesis(cluster, tmp_path):
     _config, _lease, sessionmaker = _operator(cluster)
 
     def settled():
+        # A job's status is computed when it is read, so read each open one
+        # through the API, as the client would have: some, from requests
+        # with an unknown outcome, nobody polled.
         with sessionmaker() as session:
-            open_jobs = session.scalar(
-                sa.select(sa.func.count())
-                .select_from(db.Job)
-                .where(db.Job.status.in_([db.JobStatus.PENDING, db.JobStatus.RUNNING]))
+            open_jobs = list(
+                session.scalars(
+                    sa.select(db.Job.id).where(
+                        db.Job.status.in_([db.JobStatus.PENDING, db.JobStatus.RUNNING])
+                    )
+                )
             )
-        return open_jobs == 0
+        for job_id in open_jobs:
+            try:
+                cluster.request(NODES[job_id % 3], "GET", f"/app/jobs/{job_id}")
+            except (urllib.error.URLError, OSError, TimeoutError):
+                pass
+        return not open_jobs
 
     wait_for(settled, 300, "every job to end")
-    time.sleep(5)
-    problems = errors + check(cluster, history, clients)
+
+    def latest_swept():
+        with sessionmaker() as session:
+            generation = session.scalar(
+                sa.select(db.State.value).where(db.State.name == "generation")
+            )
+        return any(s[3] >= (generation or 0) for s in _swept(cluster))
+
+    wait_for(latest_swept, 60, "a sweep of the latest generation")
+    problems, notes = check(cluster, history, clients)
+    problems = errors + problems
     with open(tmp_path / "history.json", "w") as f:
         json.dump(
             {
@@ -525,6 +604,7 @@ def test_nemesis(cluster, tmp_path):
                 "events": history.events,
                 "swept": _swept(cluster),
                 "problems": problems,
+                "notes": notes,
             },
             f,
             indent=1,
@@ -536,4 +616,6 @@ def test_nemesis(cluster, tmp_path):
         f"{sum(c.completed for c in clients)} requests completed, "
         f"{sum(1 for e in history.of('done') if e['status'] == 'Failed')} jobs failed"
     )
+    for note in notes:
+        print("NOTE:", note)
     assert not problems, f"seed {seed}: " + "; ".join(problems[:10])

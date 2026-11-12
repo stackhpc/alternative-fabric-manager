@@ -1169,7 +1169,22 @@ def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
     apply_change(cluster, leader, 1)
     _config, lease, sessionmaker = _operator(cluster)
     term = lease.read().term
-    _switches(cluster, [runner_mod.SWITCH])
+    # The candidates lose the switch first, and publish it, so that the
+    # leader, whose checks then fail, never sees a stale reach of 2 from
+    # one of them and hands over.
+    for i in NODES:
+        if i != leader:
+            _switches(cluster, [runner_mod.SWITCH], node=i)
+    wait_for(
+        lambda: all(
+            reach == 1
+            for name, _uuid, _hb, reach, _stopped in lease.nodes()
+            if name != f"node-{leader}"
+        ),
+        30,
+        "the candidates' reach published",
+    )
+    _switches(cluster, [runner_mod.SWITCH], node=leader)
     job = _send(cluster, leader, "/cloudx/Network", network(2, 102))
     end = time.monotonic() + 10 * cluster.timings["check_interval"]
     while time.monotonic() < end:
