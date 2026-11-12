@@ -56,14 +56,27 @@ def docker(*args, check=True):
     return subprocess.run([*DOCKER, *args], check=check, capture_output=True, text=True)
 
 
+# Every port and container name is offset, so that a long run, such as
+# the soak, can share the host with the usual ones.
+OFFSET = int(os.environ.get("AFM_FUNCTIONAL_OFFSET", "0"))
+
+
+def galera_name(i):
+    return f"afm-galera-{i}" if not OFFSET else f"afm-galera{OFFSET}-{i}"
+
+
 def sql_port(i):
-    return 3400 + i
+    return 3400 + OFFSET + i
+
+
+def api_port(i):
+    return 8190 + OFFSET + i
 
 
 def query(i, password, statement):
     return docker(
         "exec",
-        f"afm-galera-{i}",
+        galera_name(i),
         "mariadb",
         "-uroot",
         f"-p{password}",
@@ -90,14 +103,14 @@ def wait_for(condition, timeout, what):
 def galera():
     password = secrets.token_hex(12)
     for i in NODES:
-        docker("rm", "-f", f"afm-galera-{i}", check=False)
+        docker("rm", "-f", galera_name(i), check=False)
 
     def start(i, *extra):
         docker(
             "run",
             "-d",
             "--name",
-            f"afm-galera-{i}",
+            galera_name(i),
             "--network",
             "host",
             "-e",
@@ -109,13 +122,14 @@ def galera():
             "--wsrep-provider=/usr/lib/galera/libgalera_smm.so",
             "--wsrep-cluster-name=afmtest",
             f"--wsrep-node-name=n{i}",
-            f"--wsrep-node-address=127.0.0.1:{4600 + i}",
-            "--wsrep-cluster-address=gcomm://127.0.0.1:4601,127.0.0.1:4602,127.0.0.1:4603",
-            f"--wsrep-provider-options=gmcast.listen_addr=tcp://127.0.0.1:{4600 + i};"
-            f"ist.recv_addr=127.0.0.1:{4610 + i}",
+            f"--wsrep-node-address=127.0.0.1:{4600 + OFFSET + i}",
+            "--wsrep-cluster-address=gcomm://"
+            + ",".join(f"127.0.0.1:{4600 + OFFSET + j}" for j in NODES),
+            f"--wsrep-provider-options=gmcast.listen_addr=tcp://127.0.0.1:"
+            f"{4600 + OFFSET + i};ist.recv_addr=127.0.0.1:{4610 + OFFSET + i}",
             "--wsrep-sst-method=mariabackup",
             f"--wsrep-sst-auth=root:{password}",
-            f"--wsrep-sst-receive-address=127.0.0.1:{4620 + i}",
+            f"--wsrep-sst-receive-address=127.0.0.1:{4620 + OFFSET + i}",
             "--binlog-format=ROW",
             "--innodb-autoinc-lock-mode=2",
             *extra,
@@ -136,7 +150,7 @@ def galera():
         )
     yield password
     for i in NODES:
-        docker("rm", "-f", f"afm-galera-{i}", check=False)
+        docker("rm", "-f", galera_name(i), check=False)
 
 
 def url(i, password, database="afm"):
@@ -281,7 +295,7 @@ class Cluster:
         settings = {
             "node": f"node-{i}",
             "token": TOKEN,
-            "port": 8190 + i,
+            "port": api_port(i),
             "connection": url(i, self.password),
             "config_dir": str(self.tmp / f"config-{i}"),
             "state_dir": str(self.tmp / f"state-{i}"),
@@ -348,7 +362,7 @@ class Cluster:
     def request(self, i, method, path, body=None):
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
-            f"http://127.0.0.1:{8190 + i}/ufmRestV3{path}",
+            f"http://127.0.0.1:{api_port(i)}/ufmRestV3{path}",
             data=data,
             method=method,
             headers={
@@ -366,7 +380,7 @@ class Cluster:
         """Instance i's /healthz status, or None if it doesn't answer"""
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{8190 + i}/healthz", timeout=5
+                f"http://127.0.0.1:{api_port(i)}/healthz", timeout=5
             ) as response:
                 return response.status
         except urllib.error.HTTPError as e:
@@ -411,7 +425,7 @@ def cluster(galera, tmp_path, request):
     cluster.stop()
     for i in NODES:
         query(i, galera, "SET GLOBAL wsrep_provider_options='gmcast.isolate=0'")
-        docker("unpause", f"afm-galera-{i}", check=False)
+        docker("unpause", galera_name(i), check=False)
     # So that the next test starts with a Primary component of three
     for i in NODES:
         wait_for(
@@ -539,10 +553,10 @@ def test_a_leader_in_a_minority_stops_and_the_majority_elects(cluster):
 def test_without_galera_the_leader_stops_and_comes_back(cluster):
     cluster.wait_leader()
     for i in NODES:
-        docker("pause", f"afm-galera-{i}")
+        docker("pause", galera_name(i))
     wait_for(lambda: not runner_mod.masters(cluster.fabric), 30, "self-stop")
     for i in NODES:
-        docker("unpause", f"afm-galera-{i}")
+        docker("unpause", galera_name(i))
     leader = cluster.wait_leader()
     apply_change(cluster, leader, 5)
 
@@ -576,14 +590,14 @@ def test_a_frozen_leader_keeps_opensm_through_a_galera_outage(cluster):
         "503 while frozen",
     )
     for i in NODES:
-        docker("pause", f"afm-galera-{i}")
+        docker("pause", galera_name(i))
     # Well past T_self, and past T plus the watchdog's lease: OpenSM stays.
     end = time.monotonic() + TIMINGS["lease_timeout"] + TIMINGS["watchdog_timeout"] + 4
     while time.monotonic() < end:
         assert cluster.leader() == leader
         time.sleep(0.5)
     for i in NODES:
-        docker("unpause", f"afm-galera-{i}")
+        docker("unpause", galera_name(i))
     # Still frozen and held, with Galera back: no takeover.
     time.sleep(TIMINGS["lease_timeout"] + 2)
     assert cluster.leader() == leader
@@ -970,12 +984,12 @@ def test_sigterm_with_the_database_unreachable_stops_opensm_in_bound(cluster):
         cluster, next(i for i in NODES if i != leader)
     )
     term = lease.read().term
-    docker("pause", f"afm-galera-{leader}")
+    docker("pause", galera_name(leader))
     started = time.monotonic()
     cluster.signal(leader, signal.SIGTERM)
     _exits_within(cluster, leader, cluster.timings["shutdown_timeout"] + 5)
     assert not cluster.fake_pids(leader), "OpenSM outlived its manager"
-    docker("unpause", f"afm-galera-{leader}")
+    docker("unpause", galera_name(leader))
     successor = cluster.wait_leader(other_than=leader)
     assert lease.read().term > term
     # Not released: the successor waited for the lease to expire.
@@ -1032,10 +1046,10 @@ def test_a_galera_blip_shorter_than_self_stop_keeps_opensm(cluster):
     term = lease.read().term
     pids = cluster.sm_pids(leader)
     for i in NODES:
-        docker("pause", f"afm-galera-{i}")
+        docker("pause", galera_name(i))
     time.sleep(2)
     for i in NODES:
-        docker("unpause", f"afm-galera-{i}")
+        docker("unpause", galera_name(i))
     time.sleep(cluster.timings["lease_timeout"])
     assert cluster.sm_pids(leader) == pids
     assert lease.read().term == term
@@ -1048,7 +1062,7 @@ def test_two_galera_nodes_down_stops_every_opensm(cluster):
     survivor = leader
     down = [i for i in NODES if i != survivor]
     for i in down:
-        docker("pause", f"afm-galera-{i}")
+        docker("pause", galera_name(i))
     wait_for(
         lambda: not cluster.active(),
         cluster.timings["lease_timeout"] + 10,
@@ -1060,7 +1074,7 @@ def test_two_galera_nodes_down_stops_every_opensm(cluster):
         assert not cluster.active()
         time.sleep(0.5)
     for i in down:
-        docker("unpause", f"afm-galera-{i}")
+        docker("unpause", galera_name(i))
     leader = cluster.wait_leader()
     apply_change(cluster, leader, 1)
 
@@ -1407,14 +1421,14 @@ def test_a_lagging_galera_node_refuses_nothing_the_cluster_committed(cluster):
     leader = cluster.wait_leader()
     rejoining = next(i for i in NODES if i != leader)
     other = next(i for i in NODES if i not in (leader, rejoining))
-    docker("pause", f"afm-galera-{rejoining}")
+    docker("pause", galera_name(rejoining))
     wait_for(lambda: cluster_size(cluster, other) == 2, 60, "the paused node evicted")
     job = _send(cluster, other, "/cloudx/Network", network(1, 101))
     cluster.job_completes(other, job, TAKEOVER + 60)
     # Fill the gap it must catch up on
     for n in range(2, 9):
         _send(cluster, other, "/cloudx/Network", network(n, 100 + n))
-    docker("unpause", f"afm-galera-{rejoining}")
+    docker("unpause", galera_name(rejoining))
     answers = []
     end = time.monotonic() + 120
     while time.monotonic() < end:
