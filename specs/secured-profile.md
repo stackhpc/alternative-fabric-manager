@@ -8,6 +8,10 @@ AFM's hardening (docs/opensm-hardening.md) already covers most of it. This
 spec adds the rest that OpenSM 5.17 can do, as new hardening groups, and
 says why the remaining items are left out.
 
+The new groups are opt-in and stay out of `all` (see Choosing the groups).
+Each one waits for hardware tests whose outcomes decide parts of its
+design.
+
 ## Where AFM stands
 
 | Profile item | AFM today | This spec |
@@ -20,28 +24,38 @@ says why the remaining items are left out.
 | Enhanced SA trust model with registration limits | `sa_trust` | — |
 | Allowed SM GUIDs | None | `allowed_sm` group |
 | VSKEY, CCKEY, N2N key | None | `class_keys` group |
-| MAD limiter | `babbling_port_policy` limits traps only | `sa_rate` group |
+| MAD limiter | `babbling_port_policy` limits traps only | `sa_rate` group, if the hardware test supports it |
 | MFT with M_Key mandatory | None | Documented |
 | Keys from a periodically randomised seed | Keys never change | Not adopted (see Not adopted) |
-| SHARP job keys, service keys | None | Not adopted |
+| SHARP job keys, service keys | None | An open question, with a proposal |
 | All HCAs in the same pkey | Not applicable | Not adopted |
 
 ## Allowed SM GUIDs
 
 ### Why
 
-A host that runs a subnet manager takes part in the SM election. The SM_Key
-only protects a handover, and the M_Key stops a rogue SM setting ports. But
-a tenant's SM with a higher priority, or an equal priority and a lower port
-GUID, can still win the election, and send AFM's OpenSM to STANDBY. The
-fabric is then left without a working SM. New ports don't come up, partition
-changes aren't applied, and the fabric check fails, so no job completes.
-That is a denial of service that any bare metal tenant can cause.
+A host that runs a subnet manager takes part in the SM election. A tenant's
+SM without the fabric's keys can't set ports, since the M_Key protects
+them. It can't complete a handover either: OpenSM ignores an SM whose
+SM_Key doesn't match (`ERR 2F18`). Whether it can still send AFM's OpenSM
+to STANDBY, by winning the election on priority or GUID, isn't known.
+Hardware test 1 answers that, against a baseline without the list. If it
+can, the fabric is left without a working SM: new ports don't come up,
+partition changes aren't applied, and the fabric check fails, so no job
+completes. Any bare metal tenant could cause that denial of service.
 
 With `allowed_sm_guids`, OpenSM ignores every SM whose port isn't in the
-list. It logs `ERR 0F09: Ignoring SM on port 0x..., is not part of the
-allowed port GUIDs`, and drops an SMInfo Set from such a port with
-`ERR 2F1C`.
+list (`ERR 0F09: Ignoring SM on port 0x..., is not part of the allowed port
+GUIDs`). It drops an SMInfo Set from such a port (`ERR 2F1C`). If the
+port it is polling, or its master, leaves the list, it goes back to
+discovery ("is not longer a part of the allowed SM GUIDs").
+
+If test 1 shows that the SM_Key and M_Key already keep AFM's OpenSM master,
+the group's case is only defence in depth, and the doc says so.
+
+The list is only as strong as port GUIDs as an identity. A bare metal
+tenant that could rewrite its adapter's port GUID could claim an allowed
+one. Partitions already rest on that assumption.
 
 ### The group
 
@@ -51,63 +65,145 @@ A new hardening group, `allowed_sm`, sets one option:
 allowed_sm_guids 0x<guid>,0x<guid>,...
 ```
 
-The list holds the port GUIDs of every InfiniBand port on every host where
-AFM may run OpenSM:
+The list holds the port GUIDs of the **physical functions** of the
+InfiniBand adapters on every host where AFM may run OpenSM. Virtual
+functions are left out: on a host that is also a hypervisor, a virtual
+function's GUID belongs to a tenant's port. A port is a physical function
+when its device has no `physfn` link in sysfs
+(`/sys/class/infiniband/<dev>/device/physfn`). It counts only if its link
+layer is InfiniBand.
 
-- **Single node:** the host's own ports. Before rendering `opensm.conf`,
-  the manager reads them with `ibstat -p` in a short-lived container of
-  OpenSM's image. That is how HA mode's reach probe already runs
-  diagnostics before OpenSM starts. As in the fabric check's `own_guids`,
-  it drops the placeholder GUIDs that unassigned virtual functions report
-  (`0` and all ones). Every port is listed, because OpenSM may bind to any
-  of them unless `guid` is set.
-- **HA:** the union of the port GUIDs that every node row in the cluster
-  records, live or not, retired nodes excluded. Each node records its own
-  ports' GUIDs in its node row when it registers, with the same probe (see
-  Changes to specs/ha.md). Every OpenSM a leader might hand over to, or ask
-  to stop, is then in every other leader's list.
+- **Single node:** the host's own physical ports, read before
+  `opensm.conf` is rendered. They're read in a short-lived container of
+  OpenSM's image, as HA mode's reach probe already does before OpenSM
+  starts. Every physical port is listed, because OpenSM may bind to any of
+  them unless `guid` is set.
+- **HA:** the union of the port GUIDs that the cluster's node rows record,
+  live or stopped. A node's ports leave the list only when an operator
+  forgets the node's row. specs/ha.md's Retiring a node says that such a
+  command comes with the checks that read node rows' adapters. This spec
+  adds it (see Changes to specs/ha.md). A clean stop, which marks a node
+  `stopped`, leaves the list as it was.
+
+Ports are recorded in a node row only by a probe that succeeded and found at
+least one physical InfiniBand port:
+
+- at registration, if the row has no port GUIDs yet;
+- by an operator's command, after an adapter is replaced.
+
+A probe that fails, finds no image, or finds no ports never changes a row.
+So the list changes only when a node joins, is forgotten, or the operator
+records new adapters. It never changes because a virtual function was
+assigned, or a probe failed.
+
+### Overrides
 
 `[opensm_conf] allowed_sm_guids` overrides the generated list, as with any
-hardened option. The `0` form ("do not allow any other SM") isn't used:
-in HA mode, a leader's OpenSM must honour the next leader's fence ask (an
-SMInfo Set, which `ERR 2F1C` would drop), and must see the next leader's SM
-as a managed node's.
+hardened option. Unlike other overrides, it's checked:
+
+- **Syntax:** `Config.validate` refuses an override that isn't `0`, or a
+  comma-separated list of 64-bit hexadecimal GUIDs. OpenSM would otherwise
+  log `ERR 7549` and disable the feature.
+- **At start:** `ERR 7549` in OpenSM's start log fails the start, so a list
+  that OpenSM rejected can never pass as protection.
+- **HA:** the override must contain every port GUID in the node rows, and
+  `0` is refused, because each leader must accept the others' SMs (see HA).
+  The override is a cluster setting, so it is part of the configuration
+  hash. Only the generated list is left out of the hash.
 
 ### Refusing a list that would lock AFM out
 
 If the list leaves out the port that OpenSM binds to, the fabric could
-have no SM. Before writing `opensm.conf`, the manager refuses to start
-OpenSM, raising an alarm and reporting OpenSM as not running, when any of
-these hold:
+have no SM. The checks apply to the effective list, generated or
+overridden. When one fails, the manager refuses to start OpenSM, raises an
+alarm, and reports OpenSM as not running. It checks that:
 
-- the generated list is empty, because the probe found no ports;
-- `[opensm_conf] guid` is set, and isn't in the list;
-- in HA mode, this node's own row has no port GUIDs.
+- the list isn't empty, and isn't `0` in HA mode;
+- the list holds this host's physical ports, as the probe reads them now,
+  or holds `[opensm_conf] guid` if that is set;
+- in HA mode, this node's row has port GUIDs.
 
-Whether OpenSM itself refuses to run on a port that isn't in the list is
-part of the hardware test.
-
-### Changing the list
-
-The list changes when a node joins, is retired, or has an adapter replaced.
-The leader re-renders `opensm.conf` whenever the list it would generate
-changes. NVIDIA's documentation says `allowed_sm_guids` can change without
-restarting OpenSM, and the binary has `osm_update_allowed_sm_guids`. Whether
-a SIGHUP applies the change is part of the hardware test. Until that test
-passes, the leader moves the leadership to apply it, as for a
-fabric-affecting change.
-
-The list is derived from node rows, not configured, so it is left out of
-the configuration hash, like other node-specific options.
+Hardware test 1 also tests whether OpenSM itself refuses to run on a port
+that isn't in its list.
 
 ### The fabric check
 
-An SM that OpenSM ignores may no longer appear in the SA's SMInfo records,
-which the fabric check reads. So the check also matches `ERR 0F09` in
-OpenSM's log since the last check. As with an unknown SM today, that raises
-an alarm and doesn't fail the check, because OpenSM is ignoring the other
-SM. An unknown SM that is master, or AFM's OpenSM going to STANDBY, still
-fails the check.
+Ignoring an SM would hide it from the fabric check. ha.md relies on seeing
+another SM: Why the unconfirmed wait is enough ends with the new leader's
+OpenSM starting in STANDBY, or the check finding another master. So the
+check sorts ignored SMs by whether they could hold the fabric's keys.
+
+The manager keeps a set of **known SM ports**: every port GUID that any
+node row has ever recorded, kept when a node is forgotten. A forgotten
+node's `opensm.conf` and cache still hold the keys, and key rotation is
+future work.
+
+- **`ERR 0F09` naming a known SM port**, logged since the last check, fails
+  the check and marks the fabric contested. It stays contested until a
+  direct SMInfo Get of that port, by LID and with the SM_Key, finds no SM
+  there, or finds one that is NOT-ACTIVE. In HA mode, a known port is
+  outside the list only when its node was forgotten. An override that
+  leaves it out is refused.
+- **`ERR 0F09` naming any other port** raises an alarm and doesn't fail the
+  check. Such an SM has no keys: they're generated by AFM, and held only by
+  the database, the managers' hosts and the backups, which the hardening doc
+  says to keep from tenants. Without the M_Key it can't set ports, so it
+  can't undo a sweep. Without the SM_Key it can't hand over. The list stops
+  it taking the election, so AFM's OpenSM stays master, and the check still
+  sees that from AFM's own SMInfo record.
+- An SM in the SA's SMInfo records is judged as today.
+
+This rule rests on two outcomes of hardware test 1:
+
+- **Whether `0F09` repeats at every sweep, or is logged once.** If it's
+  logged once, a known port stays contested until the direct Get clears it,
+  as above. For other ports, an alarm raised once is enough.
+- **Whether an ignored master still sets ports.** It shouldn't, without the
+  M_Key. If test 1 shows that an SM with a wrong M_Key can change a port's
+  state anyway, then every `0F09` fails the check, and `allowed_sm` gives
+  only the alarm.
+
+### HA
+
+In HA mode, every leader's list contains every other node's ports, so:
+
+- the fence ask, an SMInfo Set from the new leader's host, isn't dropped
+  with `ERR 2F1C`;
+- a resumed old leader's OpenSM sees the new one, and the new one sees it,
+  as the election and the fabric check expect.
+
+`allowed_sm` in HA mode depends on parts of specs/ha.md that aren't
+implemented yet. HA mode refuses the group until all of these are in:
+
+- node rows record adapters (cli.py builds the Coordinator without them
+  today);
+- configuration epochs are enforced, so leaders with different lists can't
+  alternate during a rolling upgrade;
+- the fabric check treats a managed node's SM as ha.md says;
+- the fence ask is implemented, and hardware test 1 shows it is honoured
+  with both hosts listed.
+
+A rolling upgrade to a version that records port GUIDs leaves older rows
+without them. A leader renders the list only once every row that isn't
+forgotten has port GUIDs. Until then it refuses to start OpenSM with the
+group, as in Refusing a list that would lock AFM out.
+
+### Changing the list
+
+UFM's documentation lists `allowed_sm_guids` among the options that can
+change at run time, and the binary has `osm_update_allowed_sm_guids`.
+Hardware test 2 checks whether a SIGHUP applies a change, both adding and
+removing a GUID, and what else a SIGHUP re-reads from a changed
+`opensm.conf`.
+
+- **If a SIGHUP applies it:** the leader re-renders `opensm.conf` when the
+  list changes, and sends a SIGHUP. Single node, the manager does the same
+  when it starts.
+- **If not:** the leader records the list its OpenSM runs with in
+  `applied`. A node that isn't in that list can't be a candidate. The
+  operator applies a change by moving the leadership, as for an upgrade,
+  once the new node's row has its ports. There's no automatic step-down for
+  it.
 
 ## Class keys
 
@@ -141,40 +237,61 @@ cc_key_lease_period 0
 n2n_key_enable 2
 n2n_key_protect_bit 1
 n2n_key_lease_period 0
-key_mgr_seed <generated>
+key_mgr_seed <stored>
 ```
 
-OpenSM derives each port's VS, CC and N2N keys from `key_mgr_seed`, or from
-the M_Key when the seed is 0. AFM generates a seed of its own, random,
-64-bit and non-zero, and keeps it in the database with the other keys. A
-leaked M_Key then doesn't give away the class keys. The `secrets` table
-holds keys by name, so `key_mgr_seed` needs no schema change. The manager
-generates it only when `class_keys` is chosen.
+### The seed
+
+OpenSM derives each port's class keys from `key_mgr_seed`, or uses the
+M_Key when the seed is 0. AFM uses a seed of its own, random, 64-bit and
+non-zero. That's not because a separate seed is much harder to steal: it's
+kept wherever the M_Key is, including OpenSM's startup log. It's because an
+operator given the VS key for a diagnostic tool would otherwise be given the
+M_Key.
+
+With leases of 0, a seed that is lost leaves every port keyed with keys no
+SM can reproduce. So the seed must be in every backup taken before any port
+is keyed:
+
+- `key_mgr_seed` joins `KEYS`. The manager generates it at startup, whatever
+  the hardening groups, in the release **before** the one that can enable
+  `class_keys`. The backup that the deploy-host skill takes before an
+  upgrade then holds it.
+- `--show-keys` prints it. AGENTS.md's rule never to print OpenSM's keys
+  covers it.
+- An `[opensm_conf] key_mgr_seed` override that is `0`, or differs from the
+  stored seed, is refused, as ha.md refuses keys other than the stored ones.
+
+OpenSM also caches class keys per port (`guid2vskey`, `guid2cckey`,
+`guid2_n2n_key`, beside `guid2mkey`) in `/var/cache/opensm`. If those
+caches, rather than the seed, decide a port's key, a database backup isn't
+enough, even on a single node. Hardware test 3 checks that an OpenSM with
+an empty cache and only the seed manages ports that another OpenSM keyed.
+Until it passes, the group is refused in single-node and HA modes.
+
+### Leases
 
 The leases are 0 for the same reason as the M_Key's (see
 docs/opensm-hardening.md, The lease). AFM stops OpenSM during restarts and
 takeovers, and a lease that ran out while no SM ran would let a host clear
-a port's protection. The hardware test checks that a lease of 0 means "never
+a port's protection. Hardware test 3 checks that a lease of 0 means "never
 expires" for these classes, as it does for the M_Key. If it doesn't, the
 group uses the longest lease OpenSM accepts, and the doc says so.
 
-### HA
+### Turning the keys off, and downgrades
 
-Every leader must derive the same keys for every port, or a new leader
-couldn't configure ports that its predecessor keyed. That holds only if
-OpenSM derives a port's keys from the seed and the port alone, not from
-state that's cached on one node. OpenSM caches M_Keys in `guid2mkey`, and
-the binary has `key_mgr_get_key_db`. The two-OpenSM hardware test checks
-this. Until it passes, HA mode refuses `class_keys`.
+Ports keep their keys until an SM that has them changes them. To turn a
+class off:
 
-### Turning the keys off
+1. Set `<class>_key_enable 1` (Disable) in `[opensm_conf]`, and restart.
+   OpenSM then clears the keys from the ports.
+2. Check that it has finished, as hardware test 3 establishes.
+3. Only then drop `class_keys`.
 
-As with the M_Key, ports keep their keys until an SM that has them changes
-them. To turn a class off, set `<class>_key_enable 1` (Disable) in
-`[opensm_conf]` and restart. OpenSM then clears the keys from the ports.
-Only then drop `class_keys`. Dropping it at once sets the class's enable to
-0 (Ignore), which leaves ports protected by keys that the SM no longer
-manages.
+Dropping the group at once sets enable to 0 (Ignore), which leaves ports
+protected by keys that the SM no longer manages. A downgrade to a release
+without the group has the same effect. So the release notes, and the
+hardening doc's downgrade section, require step 1 before any downgrade.
 
 ### Cost
 
@@ -187,18 +304,31 @@ are unaffected.
 
 ## SA request rate
 
-UFM's MAD limiter is a UFM feature, and its documentation doesn't say which
-OpenSM options it uses. The nearest OpenSM option is `sa_rate_threshold`:
-the most SA requests that one port may send per 100 ms. OpenSM drops the
-rest, logging `ERR 4C11: Number of sent SA queries ... for GUID ... Port
-... is bigger than sa_rate_threshold`. Each virtual function has its own
-port GUID, so one tenant can't use up another tenant's allowance.
+UFM's MAD limiter (`[MADLimiter] mad_limiter_enabled` in UFM) is a UFM
+feature, and its documentation doesn't say which OpenSM options it uses.
+The nearest OpenSM option is `sa_rate_threshold`: the most SA requests per
+100 ms. OpenSM drops the rest, logging `ERR 4C11: Number of sent SA queries
+... for GUID ... Port ... is bigger than sa_rate_threshold`.
 
-A new hardening group, `sa_rate`, sets `sa_rate_threshold 1000`, that is
-10,000 requests a second from one port. That is well above what IPoIB and
-connection setup need, but it stops one port flooding the SA. Before the
-group goes into `all`, the value is checked against an MPI job's start-up
-on the test fabric, which makes the most path record requests.
+What OpenSM counts against is unknown. If it counts per port GUID, each
+virtual function gets its own allowance. If it counts per physical port,
+virtual functions sharing a port share one allowance, and one guest could
+get its neighbours' and its hypervisor's requests dropped. The group would
+then add a denial of service between tenants. Nor is it known whether
+trusted requesters, which send the SA_Key, are limited, which would include
+the manager's own `saquery`.
+
+A new hardening group, `sa_rate`, sets `sa_rate_threshold`, only if
+hardware test 4 shows that:
+
+- the count is per port GUID;
+- a flooding port is limited, and another port is unaffected;
+- the chosen value doesn't limit an MPI job's start-up.
+
+Otherwise the group isn't added, and the MAD limiter stays a gap. The
+value, proposed as 1000 per 100 ms, is set from the test's results. That
+includes the SA's total capacity, since a limit near it protects little
+against several ports flooding at once.
 
 ## Not adopted
 
@@ -209,14 +339,11 @@ on the test fabric, which makes the most path record requests.
   which key each port has.
 - **`m_key_per_port`.** This gives every port its own M_Key, so a leaked
   port key exposes only that port. It isn't adopted until it's known how
-  OpenSM derives the keys, for the reason given under Class keys, HA. AFM's
-  fence ask, fabric check and diagnostics would also need each target
+  OpenSM derives the keys, for the same reason as the class keys' cache.
+  AFM's fence ask, fabric check and diagnostics would also need each target
   port's key.
-- **SHARP job keys and service keys.** These protect UFM's SHARP
-  Aggregation Manager, which AFM doesn't run. OpenSM leaves SHARP enabled on
-  switches that support it (`sharp_enabled 2`). Whether a tenant could use
-  SHARP without an Aggregation Manager that AFM controls is an open
-  question.
+- **The performance management class.** Neither UFM's profile nor OpenSM
+  keys it, so a tenant can read, and reset, switch counters.
 - **All HCAs in the same pkey.** UFM's single-pkey bare metal profile
   doesn't fit a fabric where each network is its own partition.
 
@@ -227,72 +354,132 @@ operational, not a setting. The hardening doc will say that in-band MFT
 tools (`flint -d lid-...`, `mlxlink`, `mlxconfig` over InfiniBand) need the
 M_Key, and the VS key once `class_keys` is on. It will also say that such
 tools must be run only from the managers' hosts, never from a tenant's.
+In-band MFT is one of the hardening doc's recovery routes for a lost M_Key.
+With `class_keys`, a lost seed blocks it too, which is another reason the
+seed must be backed up before any port is keyed.
 
-## Defaults and upgrades
+## Choosing the groups
 
-`allowed_sm`, `class_keys` and `sa_rate` join `all` once their hardware
-tests pass. Until then they can be named, but `all` leaves them out. When
-they join `all`, a deployment that relies on the default gets them at its
-next upgrade. The release notes mark this as fabric-affecting:
+`all` keeps meaning the six groups it has today. The new groups are named
+beside it, for example `hardening = all, allowed_sm`. `Config.validate`
+accepts `all` together with named groups, but still refuses `none` with
+anything else. So an upgrade never turns on a new group by itself, and
+each one is a deliberate choice that whoever shares the fabric has agreed
+to, as AGENTS.md requires.
 
-- single node: the restart after the upgrade applies them;
-- HA: the hash changes, so the operator records a new epoch, as for any
-  fabric-affecting change.
-
-Whoever shares the fabric must agree to them first, as with any change to
-hardening.
+- `allowed_sm` and `sa_rate` leave no state on ports. Whether either
+  should later join `all`, with an upgrade that asks for an explicit
+  acknowledgement, is decided after deployments have used them.
+- `class_keys` stays out of `all` for good, because it leaves keys on every
+  port that only its seed can remove.
 
 ## Changes to specs/ha.md
 
 These go into specs/ha.md before the HA code changes:
 
-- **Shared state, `nodes`:** each node's adapters' port GUIDs, beside their
-  node GUIDs, recorded at registration and whenever the probe finds them
-  changed.
+- **Shared state, `nodes`:** each node's physical functions' port GUIDs,
+  beside the adapters' node GUIDs. They're recorded only by a successful
+  probe, at registration or by an operator's command. Also add the known SM
+  ports, which keep a forgotten node's GUIDs.
+- **Retiring a node:** a command to forget a node's row, which ha.md
+  defers to this kind of check. Forgetting a row removes the node's ports
+  from the list, keeps them among the known SM ports, and is refused for a
+  node that is live or in the target set. The leader then re-renders.
 - **Configuration:** `opensm.conf` includes `allowed_sm_guids`, generated
-  from the node rows. The list is excluded from the configuration hash, and
-  a change to it moves the leadership until a SIGHUP is shown to apply it.
-- **Job completion, fabric checks:** `ERR 0F09` raises the unknown-SM alarm.
-- **Required keys:** `class_keys` is refused until the two-OpenSM test
-  shows that keys derived from the seed agree across leaders.
-- **Retiring a node** removes its ports from the list, and the leader then
-  re-renders.
+  from the node rows. An override is part of the configuration hash; the
+  generated list isn't. If a SIGHUP doesn't apply a change, `applied`
+  records the running list, and a node outside it can't be a candidate.
+- **Job completion, fabric checks:** `ERR 0F09` naming a known SM port
+  fails the check and contests the fabric until a direct SMInfo Get clears
+  it. Naming another port, it raises the unknown-SM alarm.
+- **Required keys:** HA mode refuses `allowed_sm` until its dependencies
+  (see HA) are in, and `class_keys` until hardware test 3 passes.
 
 ## Hardware tests
 
-On a fabric that nobody else shares, since these tests run a second SM,
-send SMInfo Sets and flood the SA, with two hosts:
+These run on a fabric that nobody else shares, since they run a second SM,
+send SMInfo Sets and flood the SA. They use two hosts, A and B. Each test
+says which design choice its outcome decides.
 
-1. `allowed_sm_guids` with only host A: an OpenSM on host B at a higher
-   priority doesn't send A's OpenSM to STANDBY, A logs `0F09`, and B's
-   SMInfo Set is dropped with `2F1C`. Also check whether B appears in A's
-   SMInfo records, and whether OpenSM runs on a port that isn't in its
-   own list.
-2. Adding host B's GUID and sending SIGHUP: does it take effect without a
-   restart?
-3. `class_keys`: VS, CC and N2N keys are set on switches and adapters, and an
-   unkeyed `mlxlink` from a host fails. After a takeover by the other
-   host's OpenSM, with the same seed, ports are still configured. With
-   leases of 0, the keys survive an hour with no SM while a host sends
-   unkeyed MADs.
-4. `sa_rate`: an MPI job's start-up across the test fabric logs no `4C11`.
+1. **Allowed SMs.** A runs AFM's OpenSM. B runs OpenSM at a higher
+   priority, in four runs:
+   - without a list, B with a wrong SM_Key;
+   - with A's list holding only A, B with a wrong SM_Key, then with an
+     SM_Key of 0, then with the fabric's keys;
+   - with both listed, B with the fabric's keys.
+
+   Each run records:
+   - A's state;
+   - B's state, as A's SMInfo records show it and as a direct SMInfo Get
+     shows it;
+   - how often A logs `0F09` (once, or every sweep);
+   - whether B, believing it is master, changes any port.
+
+   Two further runs record whether A's OpenSM starts when its own port
+   isn't in its list, and whether `allowed_sm_guids 0` behaves like a list
+   holding only A. The fence ask is then sent as AFM will send it: by a
+   tool on B, by directed route, before B's OpenSM runs, from B's second
+   port too. The test records whether A honours it with both hosts listed,
+   and what `2F1C`'s "sender guid" is.
+
+   *Decides:* the group's case (Why), the fabric check's rule for ignored
+   SMs, and whether `allowed_sm` is allowed in HA mode.
+2. **Changing the list.** With A running, add B's GUID, then remove it,
+   each followed by a SIGHUP. Record whether each takes effect, what `0F09`
+   and the "not longer a part" message show, and which other options a
+   SIGHUP re-reads.
+
+   *Decides:* SIGHUP or a leadership move (Changing the list).
+3. **Class keys.**
+   - A keys the fabric with `class_keys`.
+   - A keyed VS query from A works, and an unkeyed `mlxlink` from B fails.
+   - A stops. B starts with the same seed and an empty `/var/cache/opensm`.
+     B logs none of the key managers' errors (`9803`, `9822`, `9823`,
+     `9B03`, `9B22`, `C1xx`). Keyed queries still work and unkeyed ones
+     still fail. B can set a port's VS key.
+   - With leases of 0, the keys survive an hour with no SM while B sends
+     unkeyed MADs.
+   - B starts with a different seed: record what it logs, and whether it
+     can recover the ports.
+   - The turning-off procedure: with enable 1, the keys are cleared, and
+     the test finds how to tell that it has finished.
+
+   *Decides:* whether `class_keys` is allowed in either mode, the lease
+   value, and the downgrade procedure.
+4. **SA rate.** Two guests on virtual functions of one physical port, and
+   one guest elsewhere. One guest floods the SA. Record:
+   - whether `4C11` names the guest's GUID and limits only it;
+   - whether a requester with the SA_Key is limited;
+   - the SA's total request rate.
+
+   Then run an MPI job's start-up across the fabric, and check it logs no
+   `4C11`.
+
+   *Decides:* whether `sa_rate` is added, and its value.
 
 ## Implementation plan
 
-- [ ] Hardware tests 1 and 2; then the `allowed_sm` group for single node,
-      with the lock-out checks and the `0F09` alarm.
-- [ ] specs/ha.md changes; the node rows' port GUIDs; `allowed_sm` in HA
-      mode.
-- [ ] Hardware test 3; then `class_keys`, with `key_mgr_seed` in the
-      database.
-- [ ] Hardware test 4; then `sa_rate`.
-- [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key.
-- [ ] Add the groups to `all`, with release notes.
+- [ ] `key_mgr_seed` in `KEYS`, generated at startup, in `--show-keys`;
+      refuse a zero or changed override. Ship this a release before
+      `class_keys`.
+- [ ] `all` with named extras in `Config.validate`.
+- [ ] Hardware tests 1 and 2. Then `allowed_sm` for single node, with the
+      physical-port probe, override checks, `ERR 7549` as a failed start,
+      the lock-out checks and the `0F09` rules.
+- [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
+      `allowed_sm` in HA mode, once its dependencies are in.
+- [ ] Hardware test 3. Then `class_keys`, with its downgrade procedure.
+- [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
+- [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
+      downgrade procedure.
 
 ## Open questions
 
 - Which in-band tools can take the VS key, and how?
-- Could a tenant use SHARP without an Aggregation Manager that AFM
-  controls?
+- SHARP: AFM runs no Aggregation Manager, and OpenSM leaves SHARP enabled
+  on switches that support it (`sharp_enabled 2`). The proposal is a
+  `sharp` group that sets `sharp_enabled 1` (Disable on all supporting
+  switches), once whoever shares the fabric confirms that nobody uses
+  SHARP. Should it be added?
 - Is UFM's MAD limiter more than an SA rate limit, for example a limit on
   SMPs or VS MADs from hosts? If so, does OpenSM 5.17 have an equivalent?
