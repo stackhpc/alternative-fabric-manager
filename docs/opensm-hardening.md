@@ -146,44 +146,75 @@ key_lease_period = 600
 ```
 
 With a lease, a port that is sent a packet with the wrong key starts a
-countdown. When the countdown runs out, the port drops its protection,
-and a subnet manager with the right keys can then key it again. A subnet
-manager that has the right key stops the countdown, and OpenSM's sweeps do
-too. So a port keeps its protection for as long as an SM manages it, and
-loses it only after the lease passes with no SM managing it.
+countdown. Packets with the right key, such as OpenSM's sweeps, stop it.
+If the countdown runs out, the port drops its protection. For the M_Key,
+that's protection level 0, where a query returns the M_Key itself. So a port
+keeps its protection while a subnet manager with the right key reaches it,
+and can lose it once the lease passes without one.
 
 Choose the lease with both sides in mind:
 
-- **Exposure.** While no subnet manager runs for longer than the lease, a
-  host that sends packets without the key gets a port's protection, and for
-  the M_Key the key itself, back. The manager stops OpenSM whenever it
-  restarts, and in HA mode during a takeover and whenever the database
-  can't be reached. Make the lease longer than the longest such outage you
+- **Exposure: one lapse gives the key away for good.** The countdown is
+  started by whoever sends the wrong key, so any tenant can start it on its
+  own switch port at will. If no subnet manager reaches that port for
+  longer than the lease, the tenant reads the M_Key. That is one M_Key for
+  every port of the fabric, and the manager can't rotate it yet. Once the
+  subnet manager is back and the port is protected again, the tenant still
+  holds the key, and can read and set any port on the fabric for good. So
+  treat any outage with no subnet manager that lasts longer than the lease
+  as a compromise of the M_Key. The manager stops OpenSM whenever it
+  restarts, and in HA mode during a takeover, and while the database can't
+  be reached. Make the lease longer than the longest such outage you
   expect: minutes, not seconds.
-- **Recovery.** A port keyed with a lost key recovers only once the lease
-  has passed. Don't count on that happening while a subnet manager runs.
-  In the hardware test of class keys, ports keyed with another seed stayed
-  unreachable for more than five minutes, despite a 60 s lease, while
-  OpenSM ran and polled them with the wrong key. They answered again after
-  OpenSM had been stopped for three minutes (see specs/secured-profile.md,
-  Results). Why isn't established yet. So to recover, stop every subnet
-  manager for longer than the lease, then start one with the right keys.
 
-A short lease, such as `60`, is useful for testing hardening on a fabric
-that nobody else depends on. Any mistake then recovers within minutes of
-stopping the manager. Don't run a tenant fabric with a lease that short:
-every restart of the manager opens the window.
+  This has happened on a test fabric. With a 60 s M_Key lease, a few
+  unkeyed queries to a switch, then three minutes with no subnet manager,
+  dropped the switch's protection. It answered unkeyed queries, and so
+  would have given out the M_Key, for some minutes after the subnet manager
+  started again (see specs/secured-profile.md, Results).
+- **Recovery is expected, not yet shown.** A lease is meant to let a port
+  whose key was lost be keyed again. The lapse above shows the first half
+  happening, but no test has yet shown a port keyed with a lost M_Key keyed
+  again. The countdown starts only on a wrong-keyed packet, and a quiet
+  fabric sends none. So the expected procedure is:
+  1. Start a subnet manager with the keys you now have, once. Its wrong-keyed
+     packets start every port's countdown.
+  2. Stop every subnet manager.
+  3. Wait longer than the lease.
+  4. Start the subnet manager again. The ports' protection has dropped, so
+     it can set its keys on them.
+
+  For class keys there's no evidence either way yet. In the first hardware
+  test, ports keyed with another seed timed out OpenSM's key queries for
+  more than five minutes, despite a 60 s lease, while OpenSM ran. But the
+  same timeouts also occurred with the right seed, so the cause isn't known
+  (see specs/secured-profile.md, Results).
+
+A short lease, such as `60`, is for testing hardening on a fabric that
+nobody else depends on. A mistake there may become recoverable within
+minutes, by the procedure above. Never run a tenant fabric with a lease
+that short: every restart of the manager would give any tenant the M_Key.
 
 The option covers every key lease that a hardening group writes. A lease
 set for one key in `[opensm_conf]`, such as `m_key_lease_period = 0`, still
 wins over it, and the manager logs a warning at start, since that key is
-then not covered. The manager logs at start whether keys are permanent or
-expire, and after how long.
+then not covered. A fabric that followed earlier versions of this doc, with
+`m_key_lease_period = 600` in `[opensm_conf]`, should move it to
+`[opensm] key_lease_period = 600`. The manager logs at start the leases it
+writes, or that it writes none.
+
+In HA mode every node must have the same `key_lease_period`, since each
+writes its own `opensm.conf`. Otherwise every takeover changes every port's
+lease. It's fabric-affecting, like the hardening groups (specs/ha.md,
+Configuration epochs). The manager warns when the lease is shorter than the
+longest a takeover can leave the fabric without a subnet manager, since
+every unclean takeover would then be a lapse.
 
 Changing the option takes effect when the manager restarts, which restarts
-OpenSM. OpenSM sets the new lease on a port when it next configures it with
-the right key. So setting a lease doesn't unlock a port whose key is
-already lost: OpenSM can't reach that port to change its lease. The keys
+OpenSM. OpenSM is expected to set the new lease on a port when it next
+configures it with the right key. That hasn't been shown yet for a port
+whose lease was already set. Setting a lease doesn't unlock a port whose key
+is already lost: OpenSM can't reach that port to change its lease. The keys
 the subnet manager keeps to itself, the SM_Key and the SA_Key, aren't stored
 on ports, have no lease, and aren't affected.
 

@@ -193,9 +193,10 @@ class Config:
     # The lease, in seconds, of every key the manager sets on ports (the
     # M_Key, and later the class keys). 0, the default, makes them permanent:
     # a port never drops its protection. A positive lease lets ports keyed
-    # with a lost key recover once no SM has reached them for that long, at
-    # the cost of the window docs/opensm-hardening.md, Permanent keys,
-    # describes. [opensm_conf] can still override a single lease.
+    # with a lost key be keyed again, but any outage with no SM longer than
+    # the lease lets a tenant read the fabric's M_Key, for good
+    # (docs/opensm-hardening.md, Permanent keys). [opensm_conf] can still
+    # override a single lease. Fabric-affecting: the same on every HA node.
     key_lease_period: int = 0
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
@@ -264,6 +265,8 @@ class Config:
         problems = _ha_problems(self)
         if problems:
             raise ConfigError("[ha] " + "; ".join(problems))
+        for warning in ha_warnings(self):
+            LOG.warning("%s", warning)
 
     def validate(self):
         if not self.token:
@@ -371,6 +374,38 @@ def ha_settings(config):
     )
 
 
+def takeover_bound(config):
+    """The longest an HA takeover takes, from the old leader's last apply to
+    the new leader's OpenSM starting: as long as the fabric may go without a
+    subnet manager in an unclean takeover"""
+    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    return (
+        apply_bound
+        + config.lease_timeout
+        + config.ha_period
+        + config.reach_timeout
+        + 5
+        + config.watchdog_timeout
+        + config.start_timeout
+        + 5
+    )
+
+
+def ha_warnings(config):
+    """HA settings that are allowed but weaken the fabric's protection"""
+    warnings = []
+    takeover = takeover_bound(config)
+    if 0 < config.key_lease_period <= takeover:
+        # Not refused, so that a test fabric can use a short lease
+        warnings.append(
+            f"[opensm] key_lease_period is {config.key_lease_period} s, no longer "
+            f"than a takeover's longest, {takeover:.0f} s: any tenant can read "
+            "the M_Key during an unclean takeover (see docs/opensm-hardening.md, "
+            "Permanent keys)"
+        )
+    return warnings
+
+
 def _ha_problems(config):
     """The timing inequalities of specs/ha.md that a configuration breaks"""
     problems = []
@@ -384,17 +419,7 @@ def _ha_problems(config):
             "self_stop_timeout + ha_period + call_timeout must be less than "
             "lease_timeout"
         )
-    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
-    takeover = (
-        apply_bound
-        + config.lease_timeout
-        + config.ha_period
-        + config.reach_timeout
-        + 5
-        + config.watchdog_timeout
-        + config.start_timeout
-        + 5
-    )
+    takeover = takeover_bound(config)
     if config.job_timeout <= takeover:
         problems.append(
             f"[opensm] job_timeout must exceed {takeover:.0f} s, a takeover's "

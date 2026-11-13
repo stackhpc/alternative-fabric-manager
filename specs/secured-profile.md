@@ -422,19 +422,24 @@ hardening doc's downgrade section, require step 1 before any downgrade.
 
 In-band tools that send VS MADs, such as `mlxlink`, `mlxreg`, in-band
 `flint`, `ibdiagnet`, and in-band switch firmware upgrades, need the VS key.
-With VS keys on, an unkeyed `mlxlink -d lid-<n>` times out reading the
-device's configuration space. Not every VS attribute is protected: an
-unkeyed `vendstat -N` (General Info) still answered with
-`vs_key_ci_protect_bits 1`, so a tenant can still read a switch's general
-information. `ibdiagnet`'s `--vs_key_file` makes OpenSM's cache,
-`/var/cache/opensm`, a secret that operators handle. The hardening doc's
-list of where keys live gains it when `class_keys` lands. `ibdiagnet` takes `--vs_key_file` (OpenSM's
-`guid2vskey`), but couldn't open the adapter from OpenSM's container while
-OpenSM ran. `mlxlink` has no key option. Which tools can take the key,
-and how, is still an open question. The doc's
-Diagnostics section will list them once it's answered. AFM itself sends
-only SMPs and SA requests, so its fabric check, reach probe and fence ask
-are unaffected.
+`mlxlink` also sends SMPs, so it needs the M_Key as well, whatever the VS
+keys (see Results).
+
+An unkeyed `vendstat -N` (General Info) answered with
+`vs_key_ci_protect_bits 1`. Whether that is because General Info is
+unprotected, or because the VS keys weren't enforced at all, the first run
+can't tell.
+
+`mlxlink` has no key option. `ibdiagnet` takes `--vs_key_file`, pointed at
+OpenSM's `guid2vskey`, but in the test it couldn't open the adapter from
+OpenSM's container while OpenSM ran. Using it makes OpenSM's cache,
+`/var/cache/opensm`, a secret that operators handle, so the hardening doc's
+list of where keys live gains it when `class_keys` lands. Which tools can
+take the key, and how, is still an open question. The doc's Diagnostics
+section will list them once it's answered.
+
+AFM itself sends only SMPs and SA requests, so its fabric check, reach
+probe and fence ask are unaffected.
 
 ## SA request rate
 
@@ -524,6 +529,9 @@ These go into specs/ha.md before the HA code changes:
 - **Configuration:** `opensm.conf` includes `allowed_sm_guids`, generated
   from the node rows. An override is part of the configuration hash; the
   generated list isn't. `applied` records the running list.
+  `key_lease_period` is in the hash, as fabric-affecting (already made in
+  ha.md). A lease no longer than a takeover's longest is warned about, not
+  refused, so that a test fabric can use a short one.
 - **Job completion, fabric checks:** `ERR 0F09` naming a known SM port
   fails the check and contests the fabric, until a direct query shows
   NOT-ACTIVE or IsSM clear. Naming another port, it raises the unknown-SM
@@ -627,14 +635,26 @@ set matched the backup.
   logged as `ERR 9828` at every sweep. The CC and N2N caches stayed empty.
   `class_keys` must not treat `9828` as a failure, or it fails on such
   hardware.
-- **Unkeyed VS access is blocked:** an unkeyed `mlxlink` to the switch,
-  its CA and other adapters timed out. An unkeyed `vendstat -N` (General
-  Info) still answered, so not every VS attribute is protected. Before
-  the keys were set, only `vendstat` was tried unkeyed. `mlxlink`
-  answered unkeyed once the keys were no longer enforced. With 60 s leases
-  and unkeyed probes in between, that can't be told apart from the leases
-  running out, so this run doesn't show that `enable 1` clears keys. The
-  lease-0 run must verify Turning the keys off, step 1.
+- **Whether VS keys block unkeyed access wasn't shown.** The run used
+  unkeyed `mlxlink` as its probe, but `mlxlink` reads the device ID with an
+  SMP first, which the M_Key (protection level 2) refuses without the key.
+  Its failures, before and during the keyed runs, were the M_Key's doing.
+  Its successes after the quiet three minutes were the M_Key's protection
+  lapsing (see the next bullet). So nothing in this run shows VS key
+  protection working, or `enable 1` clearing it. The next run needs a VS
+  probe that sends no SMP, or `mlxlink` given the M_Key, and must verify
+  Turning the keys off, step 1. An unkeyed `vendstat -N` (General Info),
+  which sends VS MADs only, answered throughout, with and without VS keys.
+- **The M_Key lease lapsed, as Permanent keys warns.** The fabric ran with
+  `m_key_lease_period 60`. Unkeyed `mlxlink` probes, which send unkeyed
+  SMPs, started the switch's and its CA's countdowns. Three minutes with
+  no SM then dropped their protection, and unkeyed SMPs to them answered,
+  which at that level returns the M_Key, for some minutes after OpenSM
+  started again. They were protected again within half an hour. The fabric
+  had no other users, but this is the exposure
+  docs/opensm-hardening.md, Permanent keys, describes, happening in
+  practice. When a running OpenSM puts back a port's lapsed protection
+  isn't known: the next run should record it.
 - **The seed alone decides VS keys, on one host:** after moving the class
   key caches aside, OpenSM derived identical keys (the same hash over the
   8 ports: the switch, its CA and six adapters, this host's included),
@@ -643,19 +663,21 @@ set matched the backup.
 - **A changed seed didn't recover while OpenSM ran:** with a new seed,
   OpenSM wrote new keys to its cache. KeyInfo Gets to the switch and its CA
   then timed out every 10 s (`ERR 980B`, `ERR 5410`, class `0xa`, attribute
-  `0xf`), for more than five minutes, despite the 60 s lease. Unkeyed
-  queries weren't tried during those minutes. After OpenSM had been stopped
-  for three minutes, an unkeyed `mlxlink` answered again.
+  `0xf`), for more than five minutes, despite the 60 s lease. No VS probe
+  that avoids the M_Key was tried during those minutes, so whether the
+  ports kept their VS keys isn't known.
 - **Not explained yet:** the same timeouts also appeared on a restart with
   the original seed. That restart followed unkeyed `mlxlink` probes of
-  the switch. They continued with `vs_key_enable 1`, even after unkeyed
-  `mlxlink` answered, and stopped only with enable back at its default,
-  when OpenSM sends no KeyInfo at all. The rest of test 3 retests this
-  with a probe-free run.
+  the switch. They continued with `vs_key_enable 1`, and stopped only with
+  enable back at its default, when OpenSM sends no KeyInfo at all. The
+  rest of test 3 retests this with a probe-free run.
 
-After the run, the switch and its CA answered unkeyed `mlxlink` and
-`vendstat`, and OpenSM, with no class key options, logged no errors. The
-other adapters weren't probed again.
+After the run, OpenSM, with no class key options, logged no errors, and
+every physical port refused unkeyed SMPs and answered keyed ones: M_Key
+protection was back. Whether any port still holds a VS key from the test
+seeds isn't known, since no probe that shows it worked. If one does, it
+holds it with a 60 s lease, which runs out after a wrong-keyed VS MAD and a
+minute with none.
 
 Still to run for test 3:
 - a lease of 0, which must verify that `enable 1` clears the keys;

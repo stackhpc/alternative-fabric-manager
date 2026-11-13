@@ -204,6 +204,14 @@ def test_key_lease_period(tmp_path):
     assert config.key_lease_period == 60
 
 
+@pytest.mark.parametrize("lease, warned", [(0, False), (60, True), (3600, False)])
+def test_a_lease_shorter_than_a_takeover_is_warned_about(lease, warned):
+    # Allowed, for test fabrics, but every unclean takeover is then a lapse.
+    config = config_mod.Config(key_lease_period=lease)
+    assert config_mod.takeover_bound(config) < 3600
+    assert bool(config_mod.ha_warnings(config)) is warned
+
+
 def test_a_seed_override_loads(tmp_path):
     # Whether it's the stored seed is for the manager to check, on start.
     config = _load(tmp_path, "[api]\ntoken = x\n[opensm_conf]\nkey_mgr_seed = 0x12\n")

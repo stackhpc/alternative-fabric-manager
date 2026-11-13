@@ -946,7 +946,8 @@ networks.
 The configuration's hash covers everything that decides the partitions and
 how OpenSM protects the fabric: the template, `default_partition`,
 `flat_pkey`, `shared_default_partition`, the IPoIB settings, the hardening
-groups, the keys, and the `opensm.conf` overrides, except node-specific ones,
+groups, `key_lease_period`, the keys, and the `opensm.conf` overrides, except
+node-specific ones,
 such as the port GUID OpenSM binds to, and paths. The cluster settings, the
 lease and job timeouts among them, are stored in Galera, not in each
 instance's configuration. The hash is stored with an epoch, which allows one

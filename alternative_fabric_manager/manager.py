@@ -781,6 +781,27 @@ class Manager:
         # The keys are secrets.
         partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
 
+    def _key_leases(self):
+        """The key leases opensm.conf gets, as "name N s" or "name permanent",
+        for the start log: what's written, not what's asked for"""
+        if self.config.driver != "managed":
+            return ""
+        leases = {
+            name: str(self.config.key_lease_period)
+            for group in self.config.hardening_groups
+            for name in opensm_conf.HARDENING[group]
+            if opensm_conf.is_key_lease(name)
+        }
+        leases.update(
+            (name, value)
+            for name, value in self.config.opensm_conf.items()
+            if opensm_conf.is_key_lease(name)
+        )
+        return ", ".join(
+            f"{name} {'permanent' if value.strip() in ('0', '0x0') else value + ' s'}"
+            for name, value in sorted(leases.items())
+        )
+
     # Syncing OpenSM
 
     def start(self):
@@ -799,16 +820,14 @@ class Manager:
             applied = session.get(db.Applied, 1)
             self._contested_fabric = bool(applied and applied.contested)
         LOG.info(
-            "OpenSM hardening: %s; keys %s",
+            "OpenSM hardening: %s; key leases written: %s",
             ", ".join(sorted(self.config.hardening_groups)) or "none",
-            f"expire after {self.config.key_lease_period} s without an SM"
-            if self.config.key_lease_period
-            else "are permanent",
+            self._key_leases() or "none",
         )
         overridden = sorted(
             name for name in self.config.opensm_conf if opensm_conf.is_key_lease(name)
         )
-        if overridden:
+        if overridden and self.config.driver == "managed":
             # Easy to miss when key_lease_period is meant to cover every key
             LOG.warning(
                 "[opensm_conf] sets %s, which wins over [opensm] key_lease_period",

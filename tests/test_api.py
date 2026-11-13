@@ -518,9 +518,36 @@ def test_key_lease_period_reaches_opensm_conf(manager, config, caplog):
         manager.stop()
     with open(config.opensm_conf_file) as f:
         assert "m_key_lease_period 60" in f.read().splitlines()
-    assert "keys expire after 60 s" in caplog.text
+    assert "key leases written: m_key_lease_period 60 s" in caplog.text
     # The keys never appear in the log.
     assert not any(v in caplog.text for v in manager.keys().values())
+
+
+@pytest.mark.parametrize(
+    "driver, hardening, opensm_conf, expected",
+    [
+        # What's written, not what's asked for
+        ("managed", "enforcement", {}, "key leases written: none"),
+        ("docker", "all", {}, "key leases written: none"),
+        (
+            "managed",
+            "all",
+            {"m_key_lease_period": "0"},
+            "key leases written: m_key_lease_period permanent",
+        ),
+    ],
+)
+def test_the_start_log_states_the_leases_written(
+    manager, config, caplog, driver, hardening, opensm_conf, expected
+):
+    config.driver = driver
+    config.hardening = hardening
+    config.key_lease_period = 600
+    config.opensm_conf = opensm_conf
+    with caplog.at_level("INFO"):
+        manager.start()
+        manager.stop()
+    assert expected in caplog.text
 
 
 def test_a_lease_override_is_warned_about(manager, config, caplog):
