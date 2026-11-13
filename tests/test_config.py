@@ -64,6 +64,15 @@ def test_missing_file(tmp_path):
         ("m_key, Enforcement", {"m_key", "enforcement"}),
         ("all, babbling_ports", set(config_mod.HARDENING_GROUPS)),
         ("yes, m_key", set(config_mod.HARDENING_GROUPS)),
+        # Removing groups: from all, named or by default
+        ("all, -sa_trust", set(config_mod.HARDENING_GROUPS) - {"sa_trust"}),
+        ("-sa_trust", set(config_mod.HARDENING_GROUPS) - {"sa_trust"}),
+        (
+            "-sa_trust, -SA_KEY",
+            set(config_mod.HARDENING_GROUPS) - {"sa_trust", "sa_key"},
+        ),
+        ("- babbling_ports", set(config_mod.HARDENING_GROUPS) - {"babbling_ports"}),
+        ("", set()),
     ],
 )
 def test_hardening_option(tmp_path, value, groups):
@@ -87,6 +96,30 @@ def test_no_hardening_stands_alone(tmp_path, value):
 def test_unknown_hardening_group_beside_all(tmp_path):
     with pytest.raises(config_mod.ConfigError, match="unknown groups: mkey"):
         _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = all, mkey\n")
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [
+        # A misspelt removal would otherwise leave the group on unnoticed.
+        ("all, -sa_trusts", "unknown groups: sa_trusts"),
+        ("-all", "unknown groups: all"),
+        ("-none", "unknown groups: none"),
+        # Contradictions
+        ("all, sa_trust, -sa_trust", "both names and removes sa_trust"),
+        ("m_key, sm_key, -sa_trust", "only from all"),
+        ("none, -sa_trust", "either"),
+    ],
+)
+def test_unclear_removals_are_refused(tmp_path, value, match):
+    with pytest.raises(config_mod.ConfigError, match=match):
+        _load(tmp_path, f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n")
+
+
+def test_ha_refuses_removing_its_required_keys():
+    # HA mode's Ask and fencing rest on them (specs/ha.md, Required keys).
+    config = config_mod.Config(ha=True, hardening="-m_key")
+    assert any("m_key" in p for p in config_mod._ha_problems(config))
 
 
 def test_hardening_groups_outside_all(tmp_path, monkeypatch):

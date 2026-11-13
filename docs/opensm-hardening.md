@@ -7,14 +7,35 @@ administration (SA) request, or run a subnet manager of its own. A guest on
 a virtual function has less control, but can still make SA requests.
 
 So with the managed driver, the manager writes a hardened set of options into
-`opensm.conf`, in groups. `[opensm] hardening` names the groups, separated by
-commas, `all` by default, or `none`: one option chooses what to harden, for
-example `hardening = m_key, enforcement` on a fabric where only M_Key
-protection is wanted. `all` may be named beside other groups, and adds them
-to its own; `none` stands alone. `all` means the groups below, and keeps
-meaning them: a group added later stays out of it, so that an upgrade never
-turns it on by itself, and is chosen by naming it beside `all`. A single
-OpenSM option can still be overridden in `[opensm_conf]`, for example
+`opensm.conf`, in groups. Everything is hardened by default, and you opt out
+of what your fabric can't take. `[opensm] hardening` says which groups, in
+one line, separated by commas:
+
+| `hardening` | Groups |
+| --- | --- |
+| `all` (the default) | Every group below |
+| `all, -sa_trust` or `-sa_trust` | Every group but `sa_trust` |
+| `-sa_trust, -babbling_ports` | Every group but those two |
+| `m_key, enforcement` | Only those two |
+| `none` | None |
+
+A group prefixed with `-` is removed from `all`. A list of removals alone
+starts from `all`, since that's the default. The manager refuses a value it
+can't read one way only, rather than guess:
+- an unknown group, including a misspelt removal, which would otherwise leave
+  the group on;
+- a group both named and removed;
+- removals beside a list of groups without `all` (list the groups to keep
+  instead);
+- `none` with anything else.
+
+HA mode refuses removing `m_key` or `sm_key`, which it depends on.
+
+A new group joins `all` once it has been tested on hardware. An upgrade that
+adds one turns it on unless you remove it, and the release notes say so.
+Check them before an upgrade, and remove any new group your fabric isn't
+ready for, for example `hardening = -class_keys`. A single OpenSM option can
+still be overridden in `[opensm_conf]`, for example
 `sa_etm_max_num_mcgs = 256`, and wins over the groups.
 
 The keys the manager sets on ports are permanent by default: a port never
@@ -50,7 +71,7 @@ accident.
 | --- | --- |
 | Only OpenStack's hosts, guests and bare metal nodes (the default) | `all` |
 | With ConnectX-3 SR-IOV | `all`, with `sa_etm_allow_untrusted_guidinfo_rec = TRUE` in `[opensm_conf]` (see the SA enhanced trust model) |
-| Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `m_key, sm_key, enforcement` |
+| Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `-sa_key, -sa_trust`, which keeps every other group, and groups added later |
 | Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it, a bare metal tenant can reconfigure switch ports |
 
 ## The keys

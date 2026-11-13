@@ -8,7 +8,8 @@ AFM's hardening (docs/opensm-hardening.md) already covers most of it. This
 spec adds the rest that OpenSM 5.17 can do, as new hardening groups, and
 says why the remaining items are left out.
 
-The new groups are opt-in and stay out of `all` (see Choosing the groups).
+Each new group joins `all`, the default, once its hardware tests pass, and
+can be removed with `-group` (see Choosing the groups).
 Each one waits for hardware tests whose outcomes decide parts of its
 design.
 
@@ -499,18 +500,33 @@ seed must be backed up before any port is keyed.
 
 ## Choosing the groups
 
-`all` keeps meaning the six groups it has today. The new groups are named
-beside it, for example `hardening = all, allowed_sm`. `Config.validate`
-accepts `all` together with named groups, but still refuses `none` with
-anything else. So an upgrade never turns on a new group by itself, and
-each one is a deliberate choice that whoever shares the fabric has agreed
-to, as AGENTS.md requires.
+Everything is hardened by default, and an operator opts out of what their
+fabric can't take, by name: `hardening = -class_keys` hardens everything
+but the class keys. (An earlier version of this spec kept new groups out of
+`all` for good. The user chose hardening by default, with an easy opt-out,
+instead.)
 
-- `allowed_sm` and `sa_rate` leave no state on ports. Whether either
-  should later join `all`, with an upgrade that asks for an explicit
-  acknowledgement, is decided after deployments have used them.
-- `class_keys` stays out of `all` for good, because it leaves keys on every
-  port that only its seed can remove.
+- **While a group is untested,** it is in `HARDENING_GROUPS` but not
+  `ALL_HARDENING_GROUPS`. It can be chosen only by naming it beside `all`,
+  for example `hardening = all, allowed_sm`. Each new group waits for its
+  hardware tests (see Hardware tests), so until then it is experimental.
+- **Once its tests pass,** it joins `all`. The release that adds it is
+  fabric-affecting: its notes name the group, what it changes on the fabric,
+  and how to opt out with `-group`. In HA mode the change needs an epoch,
+  like any fabric-affecting change. On a fabric that others share, whoever
+  shares it must agree before the upgrade, or the operator removes the
+  group first, as AGENTS.md requires.
+- **`class_keys` leaves keys on every port,** which only its seed can
+  remove. Before it joins `all`, the seed must have been in backups for a
+  release (see The seed), and the hardening doc must give the procedure
+  for turning it off.
+
+`[opensm] hardening` grammar: groups, `all`, and `-group`, separated by
+commas, or `none` alone. A list of removals alone starts from `all`.
+`Config.validate` refuses a list it can't read one way only: unknown
+groups (a misspelt removal would leave the group on), a group both named
+and removed, removals beside groups without `all`, and `none` with
+anything else. HA mode refuses removing `m_key` or `sm_key`.
 
 ## Changes to specs/ha.md
 
@@ -694,6 +710,9 @@ Still to run for test 3:
       refuse a zero or changed override. Ship this a release before
       `class_keys`.
 - [x] `all` with named extras in `Config.validate`.
+- [x] `-group` removals from `all`.
+- [ ] Each group joins `ALL_HARDENING_GROUPS` once its hardware tests
+      pass, with release notes.
 - [ ] Hardware tests 1 and 2. Then `allowed_sm` for single node, with the
       physical-port probe, override checks, `ERR 7549` as a failed start,
       the lock-out checks, the `0F09` rules, and the commands to record

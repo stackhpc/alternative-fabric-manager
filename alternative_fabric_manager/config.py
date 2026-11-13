@@ -31,9 +31,10 @@ DEFAULT_VOLUMES = (
     "opensm_cache:/var/cache/opensm"
 )
 DRIVERS = ("managed", "docker", "none")
-# The hardening groups that all means. A group added later stays out of it,
-# and is chosen by naming it beside all, so that an upgrade never turns a new
-# group on by itself.
+# The hardening groups that all means, the default: harden everything, and
+# opt out of a group by name, with -group. A new group joins all once its
+# hardware tests pass (specs/secured-profile.md, Choosing the groups); until
+# then it is in HARDENING_GROUPS only, chosen by naming it beside all.
 ALL_HARDENING_GROUPS = (
     "m_key",
     "sm_key",
@@ -186,8 +187,9 @@ class Config:
 
     # The groups of hardened OpenSM options of docs/opensm-hardening.md to
     # write into opensm.conf (managed), separated by commas: m_key, sm_key,
-    # sa_key, sa_trust, enforcement, babbling_ports, or all, or none. all may
-    # be named with other groups, which adds them; none stands alone.
+    # sa_key, sa_trust, enforcement, babbling_ports; all, the default; -group
+    # to remove one from all ("-sa_trust" alone starts from all); or none,
+    # alone. See parse_hardening.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
@@ -205,11 +207,7 @@ class Config:
     @property
     def hardening_groups(self):
         """The hardening groups that [opensm] hardening names"""
-        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        groups = words & set(HARDENING_GROUPS)
-        if words & set(ALL_HARDENING):
-            groups |= set(ALL_HARDENING_GROUPS)
-        return groups
+        return parse_hardening(self.hardening)
 
     @property
     def partitions_file(self):
@@ -279,19 +277,7 @@ class Config:
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
-        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        unknown = words - set(HARDENING_GROUPS) - set(ALL_HARDENING) - set(NO_HARDENING)
-        if unknown:
-            raise ConfigError(
-                f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
-            )
-        # all may be named with other groups, to add groups outside it, but
-        # none with anything else is a contradiction.
-        if len(words) > 1 and words & set(NO_HARDENING):
-            raise ConfigError(
-                "[opensm] hardening is either none or a list of groups, "
-                "which may include all"
-            )
+        parse_hardening(self.hardening)
         for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
@@ -372,6 +358,52 @@ def ha_settings(config):
         },
         sort_keys=True,
     )
+
+
+def parse_hardening(text):
+    """Return the hardening groups that an [opensm] hardening value names
+
+    It is a list separated by commas of group names, all (or true, yes),
+    and -group to remove a group; or none (or false, no) alone. all is the
+    default, so a list of removals alone, such as "-sa_trust", starts from
+    all. Raises ConfigError for a list that is unclear or contradicts
+    itself, so that what's hardened is never a guess.
+    """
+    words = [w.strip().lower() for w in text.split(",") if w.strip()]
+    removed = {w[1:].strip() for w in words if w.startswith("-")}
+    named = {w for w in words if not w.startswith("-")}
+    known = set(HARDENING_GROUPS)
+    unknown = (named - known - set(ALL_HARDENING) - set(NO_HARDENING)) | (
+        removed - known
+    )
+    if unknown:
+        raise ConfigError(
+            f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
+        )
+    if named & set(NO_HARDENING) and len(words) > 1:
+        raise ConfigError(
+            "[opensm] hardening is either none alone, or a list of groups, "
+            "which may include all and -group"
+        )
+    if named & removed:
+        raise ConfigError(
+            "[opensm] hardening both names and removes "
+            + ", ".join(sorted(named & removed))
+        )
+    # Removing from a list of groups that doesn't include all is either a
+    # no-op or a mistake: say which groups to keep instead.
+    starts_from_all = bool(named & set(ALL_HARDENING)) or not named
+    if removed and not starts_from_all:
+        raise ConfigError(
+            "[opensm] hardening can remove groups (-group) only from all; "
+            "list the groups to keep instead"
+        )
+    if not words:
+        return set()
+    groups = named & known
+    if starts_from_all and not named & set(NO_HARDENING):
+        groups |= set(ALL_HARDENING_GROUPS)
+    return groups - removed
 
 
 def takeover_bound(config):

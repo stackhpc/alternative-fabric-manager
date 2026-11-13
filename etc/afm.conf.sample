@@ -50,9 +50,12 @@ host_config_dir = /etc/opensm
 partitions_template =
 # The groups of hardened OpenSM options, from docs/opensm-hardening.md, to
 # write into opensm.conf, separated by commas: m_key, sm_key, sa_key,
-# sa_trust, enforcement, babbling_ports; or all, or none. For example
-# "m_key, enforcement" for M_Key protection only. [opensm_conf] overrides any
-# single option.
+# sa_trust, enforcement, babbling_ports; all; -group to remove one from all;
+# or none. all, the default, hardens everything; "-sa_trust" hardens
+# everything but sa_trust; "m_key, enforcement" hardens only those. A new
+# group joins all once tested, and an upgrade then turns it on: read the
+# release notes, and remove it with -group if needed. [opensm_conf]
+# overrides any single option.
 hardening = all
 # The lease, in seconds, of every key the manager sets on ports: the M_Key,
 # and the class keys once a group sets them. 0, the default, makes them
