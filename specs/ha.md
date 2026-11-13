@@ -1191,7 +1191,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       years at 10 requests a second, after which, in MariaDB's strict mode,
       every request would fail. The lease's counter and heartbeats are
       64-bit already, and terms only rise with takeovers.
-- [ ] A soak test: a cluster left for 12 to 24 hours under steady requests
+- [x] A soak test: a cluster left for 12 to 24 hours under steady requests
       and no faults keeps one leader, term and OpenSM process throughout,
       fails no job, and doesn't grow its memory or file descriptors, so that
       a long-lived OpenSM is shown not to be killed by any deadline, bound or
