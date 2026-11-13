@@ -1125,65 +1125,67 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       are found only by the SA's SMInfo records, not OpenSM's log.
 - [ ] Single node: map a node GUID and port number, and a node
       description, to a port GUID, so that fewer pkey errors hold every job.
-- [ ] Database: a `[database] connection` URL, Alembic migrations, schema
-      version, configuration epochs and cluster settings,
-      `wsrep_sync_wait`, UTC timestamps, deadlock retry, the generation bump
-      first in every request, constraint errors as 400.
-- [ ] The lease, behind a coordination driver interface with Galera as
-      its first driver: target-set entries of node, instance UUID and term;
-      the verified-stop mark cleared on taking the lease; taking on a
-      Primary component only, renewing, self-stop
-      after `T_self`, releasing on step-down and SIGTERM, expiry on the
-      monotonic clock, terms in every compare-and-set, and the target set.
-- [ ] The manager's liveness thread, with each loop's progress bound,
+- [x] Database: a `[database] connection` URL, Alembic migrations, schema
+      version, cluster settings agreed by every instance,
+      `wsrep_sync_wait = 7`, UTC timestamps, the generation bump first in
+      every request, and 64-bit counters.
+- [ ] Configuration epochs: each instance records its configuration's
+      hash, but nothing yet reads it, so a leader whose configuration isn't
+      allowed doesn't step down (see Configuration epochs); with a CLI to
+      record an epoch.
+- [ ] Retry deadlocks and constraint races in the request path, as Galera's
+      certification conflicts and two instances racing for a pkey or GUID
+      raise them: today they are answered 500, which networking-mlnx
+      resends, so nothing is lost, but they should be retried before
+      answering. Never as 400, since such a request can succeed later.
+- [x] The lease, with Galera: target-set entries of node, instance UUID and
+      term; the verified-stop mark cleared on taking the lease; taking on a
+      Primary component only, renewing, self-stop after `T_self`, releasing
+      on step-down and SIGTERM, expiry on the monotonic clock, terms in
+      every compare-and-set, and the target set.
+- [ ] A coordination driver interface for the lease, with Galera as its
+      first driver: today `GaleraLease` is the only implementation, so this
+      matters once a second is wanted (see Coordination drivers).
+- [x] The manager's liveness thread, with each loop's progress bound,
       gating both the watchdog's lease and the Galera renewal; the host's
       `/proc` mounted read-only for verified stops.
-- [ ] Cluster settings refused when they break the inequalities in
+- [x] Cluster settings refused when they break the inequalities in
       Timeouts.
-- [ ] The watchdog: an entrypoint for OpenSM's container, with the lease and
+- [x] The watchdog: an entrypoint for OpenSM's container, with the lease and
       single-use start requests on tmpfs, the file hashes, `T_watchdog` from
       the cluster setting, and SIGKILL of OpenSM on SIGTERM.
-- [ ] Takeovers: SMInfo DISABLE behind `fence_ask`, the unconfirmed wait,
-      rejoining with a verified stop, and the required keys check.
-- [ ] Freeze: `--freeze` (with `--drain` and `--for`) and `--unfreeze`,
-      the takeover compare-and-set requiring not frozen, 503 for new
-      requests, the leader's hold and the watchdog's held lease, restarting
-      OpenSM only on the frozen node, and candidates' timers restarted at
-      the unfreeze.
-- [x] `--force-unfreeze`, to end a freeze its leader never acknowledged.
+- [x] Takeovers: the unconfirmed wait, rejoining with a verified stop, and
+      the required keys check.
+- [ ] Takeovers: SMInfo DISABLE behind `fence_ask`. The Ask is still a stub
+      that logs (see Fencing), pending the two-OpenSM verification above,
+      which needs a fabric no one else shares.
+- [x] Freeze: `--freeze` and `--unfreeze`, the takeover compare-and-set
+      requiring not frozen, 503 for new requests, the leader's hold and the
+      watchdog's held lease, restarting OpenSM only on the frozen node, and
+      candidates' timers restarted at the unfreeze.
+- [ ] Freeze: `--drain`, and `--for`, without which a frozen leader's held
+      watchdog lease has no deadline.
 - [ ] `--confirm-fenced <node>`, with `fence_manual` (see Manual fencing).
-- [ ] A CLI to record configuration epochs,
-      confirm or remove expected switches, and force a step-down.
+- [x] A CLI to confirm the expected switches, `--confirm-switches`, which
+      also drops one that died.
+- [ ] A CLI to force a step-down.
 - [ ] With the managed-SM fabric check and configuration epochs, a
       command to forget a retired node's row, and the nodes in `--status`
       (see Retiring a node).
-- [ ] Tests: three instances against one MariaDB in CI, and a Galera cluster
-      in containers, with faults injected: the leader killed, paused, cut
-      off from the database or the network; a winner dying mid-takeover; a
-      quarantined object; a deposed leader writing late; a fabric missing a
-      switch. Among them:
-      - the leader's Galera node partitioned into a minority: its OpenSM
-        stops within `T_self`, the majority elects a leader, which starts
-        OpenSM after `T` and the unconfirmed wait, and at no point do two
-        OpenSMs run;
-      - every Galera node down: the leader's OpenSM stops within `T_self`,
-        and a leader is elected once a Primary component returns;
-      - `docker stop` of the leader: the lease is released, the successor
-        starts OpenSM within a few seconds, without waiting; and with the
-        database unreachable, it still exits with OpenSM verified stopped;
-      - the leader's manager paused: its watchdog kills OpenSM before the
-        successor's unconfirmed wait ends;
-      - frozen: Galera stopped, the leader's manager paused, and the
-        leader's Galera node partitioned, with OpenSM kept on the frozen
-        node throughout, new requests answered 503, and no takeover until
-        the leader acknowledges the unfreeze, after which a takeover waits
-        a full `T`; and an unfreeze while the leader's manager is paused,
-        which leaves the lease until a verified stop or an operator's
-        confirmation.
-- [ ] Deployment: a Kayobe or Kolla-Ansible role with the HAProxy backend,
-      healthcheck, database credentials, the containers' stop timeout,
-      expected switches, and the check that control traffic doesn't run over
-      the InfiniBand fabric.
+- [x] Tests: the failover suite, three instances against a three-node
+      Galera cluster in containers with a fake OpenSM under the real
+      watchdog, with faults injected and a monitor that no two OpenSMs ever
+      act at once; a seeded nemesis of overlapping faults under live
+      requests, with a history checker; and the unit tests against
+      MariaDB. CI runs the unit tests on SQLite and MariaDB and the
+      failover suite on every pull request that touches HA code, and the
+      nemesis nightly and before every release.
+- [x] Deployment, documented for Kayobe (docs/kayobe.md) rather than as a
+      role: the HAProxy backend, healthcheck, database credentials, the
+      containers' stop timeout, expected switches, and a deployment check
+      that exactly one controller runs OpenSM and every instance is healthy.
+- [ ] Deployment: a check that control traffic doesn't run over the
+      InfiniBand fabric.
 - [x] Late requests: revisions recorded on networks, ports and deferred
       requests, tombstones, the checks after the generation bump, the
       deletion's body read, tombstones dropped after 7 days, and
@@ -1196,10 +1198,9 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       64-bit already, and terms only rise with takeovers.
 - [x] A soak test: a cluster left for 12 to 24 hours under steady requests
       and no faults keeps one leader, term and OpenSM process throughout,
-      fails no job, and doesn't grow its memory or file descriptors, so that
-      a long-lived OpenSM is shown not to be killed by any deadline, bound or
-      counter that only a long run reaches, such as an idle apply loop's
-      iteration age.
+      fails no job, and doesn't grow its memory or file descriptors. A
+      12-hour run with the production timings passed, its managers' memory
+      flat after the first four hours.
 
 ## Open questions
 
