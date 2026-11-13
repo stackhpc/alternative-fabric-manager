@@ -269,6 +269,12 @@ asymmetric-list run:
 Either way, no rule that bars every outsider: that would leave no eligible
 node when a leader dies before the operator moves the leadership.
 
+In the second case, a leader that dies uncleanly while every live
+candidate is outside its running list leaves the fabric with no SM until
+its stop is verified. That fails closed, and the alarm for a live node
+outside the running list warns of it beforehand. The hardening doc will
+tell operators to move the leadership promptly after a node joins.
+
 ## Class keys
 
 ### Why
