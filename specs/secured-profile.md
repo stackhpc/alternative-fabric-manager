@@ -176,6 +176,10 @@ future work.
   A query that times out never clears the contest. A paused OpenSM
   doesn't answer either, and it is ha.md's one uncovered case. In HA mode,
   a known port is outside the list only when its node was forgotten.
+- **Recording a known SM port.** An operator's command adds a port to the
+  known set. It is how an SM that holds overridden keys is made known (see
+  Required groups), and the only source of known ports on a single node
+  besides its own.
 - **Dropping a known SM port.** A forgotten node's adapter may be reused
   in a host that never holds the keys, even a tenant's. An operator's
   command drops a port from the known set. It asserts that the adapter is
@@ -203,7 +207,8 @@ This rule rests on two outcomes of hardware test 1:
 
 ### HA
 
-In HA mode, every leader's list contains every other node's ports, so:
+In HA mode, once the running list is current (see Changing the list),
+every leader's list contains every other node's ports, so:
 
 - the fence ask, an SMInfo Set from the new leader's host, isn't dropped
   with `ERR 2F1C`;
@@ -222,9 +227,11 @@ implemented yet. HA mode refuses the group until all of these are in:
   with both hosts listed.
 
 A rolling upgrade to a version that records port GUIDs leaves older rows
-without them. A leader renders the list only once every row that isn't
-forgotten has port GUIDs. Until then it refuses to start OpenSM with the
-group, as in Refusing a list that would lock AFM out.
+without them. The leader renders the list from the rows that have port
+GUIDs, as in The group. It refuses to start OpenSM with the group only
+while a row without port GUIDs is in the target set. That row belongs to
+an old-version leader, which doesn't follow the candidate rule and whose
+OpenSM the new list would ignore.
 
 ### Changing the list
 
@@ -246,12 +253,21 @@ outside it.
   automatic step-down for it.
 
 A candidate inside the running list is preferred when the lease is free.
-A candidate outside it may still take over, since that isn't unsafe: the
-new leader's list holds the old leader's ports, so a resumed old OpenSM is
-seen, and the new OpenSM goes to STANDBY or its check fails. Only the fence
-ask is lost (`2F1C`), and the Ask never counts on its own. Restricting
-candidates instead would leave no eligible node when a leader dies before
-the operator moves the leadership.
+Whether a candidate outside it may take over depends on hardware test 1's
+asymmetric-list run:
+
+- **If the newcomer sees the old OpenSM** (the old one still answers its
+  SMInfo Get, since `2F1C` covers only Sets): it may take over, by any of
+  ha.md's ways out of the target set. The new leader's list holds the old
+  leader's ports, so a resumed old OpenSM is seen, and the new OpenSM goes
+  to STANDBY or its check fails. Only the fence ask is lost (`2F1C`), and
+  the Ask never counts on its own.
+- **If it doesn't:** it may take over only once the old leader released the
+  lease or verified its own stop, never by an unconfirmed takeover, which
+  could leave two masters holding the keys with checks that pass.
+
+Either way, no rule that bars every outsider: that would leave no eligible
+node when a leader dies before the operator moves the leadership.
 
 ## Class keys
 
@@ -435,25 +451,26 @@ These go into specs/ha.md before the HA code changes:
 
 - **Shared state, `nodes`:** each node's physical functions' port GUIDs,
   beside the adapters' node GUIDs. They're recorded only by a successful
-  probe, at registration or by an operator's command. Also add the known SM
+  probe: at registration, then at every heartbeat until one succeeds, or by
+  an operator's command. Also add the known SM
   ports, which keep a forgotten node's GUIDs.
-- **Retiring a node:** a command to drop a port from the known SM ports,
+- **Retiring a node:** commands to record and drop known SM ports,
   for a reused adapter, and a command to forget a node's row, which ha.md
   defers to this kind of check. Forgetting a row removes the node's ports
   from the list, keeps them among the known SM ports, and is refused for a
   node that is live or in the target set. The leader then re-renders.
 - **Configuration:** `opensm.conf` includes `allowed_sm_guids`, generated
   from the node rows. An override is part of the configuration hash; the
-  generated list isn't. If a SIGHUP doesn't apply a change, `applied`
-  records the running list, and a node outside it can't be a candidate.
+  generated list isn't. `applied` records the running list.
 - **Job completion, fabric checks:** `ERR 0F09` naming a known SM port
   fails the check and contests the fabric, until a direct query shows
   NOT-ACTIVE or IsSM clear. Naming another port, it raises the unknown-SM
   alarm. The managed-node SM rule matches SMInfo records' port GUIDs
   against the node rows' port GUIDs, not their adapters' node GUIDs.
 - **Candidates:** a node with no port GUIDs can't be a candidate. A
-  candidate inside `applied`'s running list is preferred. An alarm is
-  raised while a live node is outside it.
+  candidate inside `applied`'s running list is preferred. One outside it
+  may take over as Changing the list says, which hardware test 1 decides.
+  An alarm is raised while a live node is outside it.
 - **Required keys:** HA mode refuses `allowed_sm` until its dependencies
   (see HA) are in, and `class_keys` until hardware test 3 passes.
 
@@ -469,6 +486,9 @@ says which design choice its outcome decides.
    - with A's list holding only A, B with a wrong SM_Key, then with an
      SM_Key of 0, then with the fabric's keys;
    - with both listed, B with the fabric's keys;
+   - asymmetric lists: A is master with a list holding only A; B, with the
+     fabric's keys and a list holding both, starts second. Record B's
+     state, B's SMInfo records of A, and whether A answers B's SMInfo Get;
    - with A's list holding only A, B with the fabric's keys, and B's
      OpenSM then stopped with SIGSTOP. Record what the direct SMInfo Get
      returns, whether PortInfo's IsSM bit stays set, and whether A still
@@ -489,7 +509,8 @@ says which design choice its outcome decides.
    and what `2F1C`'s "sender guid" is.
 
    *Decides:* the group's case (Why), the fabric check's rule for ignored
-   SMs, and whether `allowed_sm` is allowed in HA mode.
+   SMs, whether a candidate outside the running list may take over
+   unconfirmed, and whether `allowed_sm` is allowed in HA mode.
 2. **Changing the list.** With A running, add B's GUID, then remove it,
    each followed by a SIGHUP. Record whether each takes effect, what `0F09`
    and the "not longer a part" message show, and which other options a
@@ -534,7 +555,8 @@ says which design choice its outcome decides.
 - [ ] `all` with named extras in `Config.validate`.
 - [ ] Hardware tests 1 and 2. Then `allowed_sm` for single node, with the
       physical-port probe, override checks, `ERR 7549` as a failed start,
-      the lock-out checks and the `0F09` rules.
+      the lock-out checks, the `0F09` rules, and the commands to record
+      and drop known SM ports.
 - [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
       `allowed_sm` in HA mode, once its dependencies are in.
 - [ ] Hardware test 3. Then `class_keys`, with its downgrade procedure.
