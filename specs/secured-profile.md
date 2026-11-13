@@ -1,6 +1,6 @@
 # The secured cloud profile
 
-Status: proposed, 2026-11-13.
+Status: accepted 2026-11-13; implementation in progress (see Implementation plan).
 
 UFM's Secured Cloud Profile (`cloud_profile = 2` in UFM Enterprise 6.26)
 is NVIDIA's list of protections for a fabric that bare metal tenants share.
@@ -310,6 +310,14 @@ n2n_key_lease_period 0
 key_mgr_seed <stored>
 ```
 
+The leases are `[opensm] key_lease_period` (see Leases). Hardware that
+doesn't support a class answers its KeyInfo with status `0xc`, which OpenSM
+logs as `ERR 9828` at every sweep: on the test fabric, CC and N2N keys
+weren't supported (see Results). The group doesn't treat `9828` as a
+failure, or it would fail on such hardware. It doesn't silently overstate
+itself either: the manager logs, once per start, which classes the ports
+rejected, so the operator knows that only VS keys protect those ports.
+
 ### The seed
 
 OpenSM derives each port's class keys from `key_mgr_seed`, or uses the
@@ -337,41 +345,61 @@ is keyed:
   so adding it to `KEYS` doesn't change every node's hash.
 - `--show-keys` prints it. AGENTS.md's rule never to print OpenSM's keys
   covers it.
-- An `[opensm_conf] key_mgr_seed` override that is `0`, or differs from the
-  stored seed, is refused, as ha.md refuses keys other than the stored ones.
+- An `[opensm_conf] key_mgr_seed` override must be a non-zero 64-bit
+  value, in hexadecimal or decimal without leading zeros: spellings that
+  Python and OpenSM read alike. When no seed is stored yet, a valid
+  override is stored as the seed rather than a random one, since ports may
+  already be keyed with it, set by hand. Otherwise an override that differs
+  from the stored seed is refused, as ha.md refuses keys other than the
+  stored ones. An equal override is written as the stored value, never in
+  the operator's spelling.
+- `keys()` stores the seed too, as `--show-keys` and rendering call it, so
+  the class_keys step must record whether a start stored it, for the rule
+  above.
 
 OpenSM also caches class keys per port (`guid2vskey`, `guid2cckey`,
 `guid2_n2n_key`, beside `guid2mkey`) in `/var/cache/opensm`. If those
 caches, rather than the seed, decided a port's key, a database backup
 wouldn't be enough, even on a single node. Hardware test 3's first run
-found that for VS keys they don't: an OpenSM restarted with the caches moved
-aside derived the same keys from the seed (see Results). The cache is
-written from the seed, not read to choose a key. CC and N2N keys are still
-unverified, because the test fabric doesn't support them. Until the rest of
-test 3 passes, the group is refused in single-node and HA modes.
+found that, on the same host, they don't for VS keys: an OpenSM restarted
+with the class key caches moved aside derived the same keys from the seed
+(see Results). That rules out the class key caches, not a derivation that
+also uses the SM's own port GUID or other local state, which is what an HA
+takeover by another host would expose. The second-host run decides HA.
+CC and N2N keys are still unverified, because the test fabric doesn't
+support them. Until the rest of test 3 passes, the group is refused in
+single-node and HA modes.
 
-A port keyed with another seed can't be reached while OpenSM runs: OpenSM
-writes its own derived keys to the cache, and polls the port with them
-every 10 s. Each wrong-keyed MAD appears to restart the port's lease, so
-even a 60 s lease didn't run out until OpenSM had been stopped for three
-minutes (see Results). That makes the seed rules above the only safe path:
-a changed or lost seed can't be fixed by a running OpenSM, whatever the
-lease.
+A port keyed with another seed wasn't shown to recover while OpenSM ran.
+With a changed seed, OpenSM wrote its own derived keys to the cache, and its
+KeyInfo Gets to the switch timed out for more than five minutes despite a
+60 s lease. The switch answered unkeyed queries again after OpenSM had been
+stopped for three minutes. The cause isn't established, since the same
+timeouts also appeared with the right seed (see Results, Not explained
+yet). Either way, the seed rules above are the safe path: don't count on a
+running OpenSM to recover from a changed or lost seed.
 
 ### Leases
 
-The leases are 0 for the same reason as the M_Key's (see
-docs/opensm-hardening.md, The lease). AFM stops OpenSM during restarts and
-takeovers, and a lease that ran out while no SM ran would let a host clear
-a port's protection. Hardware test 3 checks that a lease of 0 means "never
-expires" for these classes, as it does for the M_Key. If it doesn't, the
-group uses the longest lease OpenSM accepts, and the doc says so.
+The leases follow `[opensm] key_lease_period`, like the M_Key's: one option
+sets every key lease the manager writes, 0 (permanent) by default, so that
+an operator opts out of permanent keys in one line (see
+docs/opensm-hardening.md, Permanent keys). The default is 0 for the same
+reason as the M_Key's (see docs/opensm-hardening.md, The lease): AFM stops
+OpenSM during restarts and takeovers, and a lease that ran out while no SM
+ran would let a host clear a port's protection. Hardware test 3 checks that
+a lease of 0 means "never expires" for these classes, as it does for the
+M_Key. If it doesn't, the default for these classes is the longest lease
+OpenSM accepts, and the doc says so.
 
-The cost of a lease of 0 is the one recovery the first run found: a port
-keyed with a seed that's been lost recovered only because its 60 s lease
-ran out while no SM ran. With a lease of 0 it would stay keyed until it's
-power-cycled. Test 3's run with a lease of 0 decides between the two, as
-the M_Key lease did (docs/opensm-hardening.md, The lease).
+The cost of a lease of 0 is recovery. In the first run, ports keyed with a
+lost seed answered again after OpenSM had been stopped for longer than the
+60 s lease. Whether the lease or something else did it isn't established
+(see Results). With a lease of 0 the ports are expected to stay keyed until
+a power cycle clears them, which test 3 also checks. The default stays 0,
+the same choice made for the M_Key. An operator who prefers recovery sets
+`key_lease_period` and accepts the window. That is a policy choice the
+option makes, not something a test decides.
 
 ### Turning the keys off, and downgrades
 
@@ -395,7 +423,12 @@ hardening doc's downgrade section, require step 1 before any downgrade.
 In-band tools that send VS MADs, such as `mlxlink`, `mlxreg`, in-band
 `flint`, `ibdiagnet`, and in-band switch firmware upgrades, need the VS key.
 With VS keys on, an unkeyed `mlxlink -d lid-<n>` times out reading the
-device's configuration space. `ibdiagnet` takes `--vs_key_file` (OpenSM's
+device's configuration space. Not every VS attribute is protected: an
+unkeyed `vendstat -N` (General Info) still answered with
+`vs_key_ci_protect_bits 1`, so a tenant can still read a switch's general
+information. `ibdiagnet`'s `--vs_key_file` makes OpenSM's cache,
+`/var/cache/opensm`, a secret that operators handle. The hardening doc's
+list of where keys live gains it when `class_keys` lands. `ibdiagnet` takes `--vs_key_file` (OpenSM's
 `guid2vskey`), but couldn't open the adapter from OpenSM's container while
 OpenSM ran. `mlxlink` has no key option. Which tools can take the key,
 and how, is still an open question. The doc's
@@ -578,9 +611,10 @@ says which design choice its outcome decides.
 
 ### Results
 
-**Test 3, first run, 2026-11-13.** On the DevStack host's fabric: one
-host with one physical port, one switch (LID 5) with its embedded CA
-(LID 8), and six other adapters. Hosts and switch run OpenSM
+**Test 3, first run, 2026-11-13.** On the DevStack host's fabric, which its
+owner confirmed nobody else used during the test: one switch (LID 5) with
+its embedded CA (LID 8), this host's single physical port, and five other
+adapters. Hosts and switch run OpenSM
 5.17.2.MLNX20240610. With no second host, a restart of the same OpenSM
 stood in for a takeover. The leases were 60 s, not 0. Everything was
 reverted afterwards, and `afm.conf`, `opensm.conf` and the cache's file
@@ -597,16 +631,21 @@ set matched the backup.
   its CA and other adapters timed out. An unkeyed `vendstat -N` (General
   Info) still answered, so not every VS attribute is protected. Before
   the keys were set, only `vendstat` was tried unkeyed. `mlxlink`
-  answered unkeyed after they were cleared.
-- **The seed alone decides VS keys:** after moving every class key cache
-  aside, OpenSM derived identical keys (the same hash over 8 entries), and
-  logged no key errors other than `9828`.
-- **A changed seed can't recover ports while OpenSM runs:** with a new
-  seed, OpenSM wrote new keys to its cache. KeyInfo Gets to the switch and
-  its CA then timed out every 10 s (`ERR 980B`, `ERR 5410`, class `0xa`,
-  attribute `0xf`), for more than five minutes, despite the 60 s lease.
-  After OpenSM had been stopped for three minutes, an unkeyed `mlxlink`
-  answered again.
+  answered unkeyed once the keys were no longer enforced. With 60 s leases
+  and unkeyed probes in between, that can't be told apart from the leases
+  running out, so this run doesn't show that `enable 1` clears keys. The
+  lease-0 run must verify Turning the keys off, step 1.
+- **The seed alone decides VS keys, on one host:** after moving the class
+  key caches aside, OpenSM derived identical keys (the same hash over the
+  8 ports: the switch, its CA and six adapters, this host's included),
+  and logged no key errors other than `9828`. `guid2mkey` and the rest of
+  the cache stayed.
+- **A changed seed didn't recover while OpenSM ran:** with a new seed,
+  OpenSM wrote new keys to its cache. KeyInfo Gets to the switch and its CA
+  then timed out every 10 s (`ERR 980B`, `ERR 5410`, class `0xa`, attribute
+  `0xf`), for more than five minutes, despite the 60 s lease. Unkeyed
+  queries weren't tried during those minutes. After OpenSM had been stopped
+  for three minutes, an unkeyed `mlxlink` answered again.
 - **Not explained yet:** the same timeouts also appeared on a restart with
   the original seed. That restart followed unkeyed `mlxlink` probes of
   the switch. They continued with `vs_key_enable 1`, even after unkeyed
@@ -614,9 +653,18 @@ set matched the backup.
   when OpenSM sends no KeyInfo at all. The rest of test 3 retests this
   with a probe-free run.
 
-Still to run for test 3: a lease of 0; the stale-cache leg; a keyed query
-by a tool that works while OpenSM runs; a second host; CC and N2N keys on
-hardware that supports them.
+After the run, the switch and its CA answered unkeyed `mlxlink` and
+`vendstat`, and OpenSM, with no class key options, logged no errors. The
+other adapters weren't probed again.
+
+Still to run for test 3:
+- a lease of 0, which must verify that `enable 1` clears the keys;
+- unkeyed queries during a wrong-seed run, and a run with no unkeyed probes;
+- whether a power cycle clears class keys;
+- the stale-cache leg;
+- a keyed query by a tool that works while OpenSM runs;
+- a second host;
+- CC and N2N keys on hardware that supports them.
 
 ## Implementation plan
 
