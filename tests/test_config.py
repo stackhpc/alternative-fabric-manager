@@ -121,9 +121,44 @@ def test_show_keys(tmp_path, capsys):
         "m_key",
         "sm_key",
         "sa_key",
+        "key_mgr_seed",
     ]
     cli.main(["--config-file", str(path), "--show-keys"])
     assert capsys.readouterr().out == first
+
+
+def _seed_override_conf(tmp_path):
+    # A seed that isn't the one the manager stores
+    path = tmp_path / "afm.conf"
+    path.write_text(
+        f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
+        f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
+        "[opensm_conf]\nkey_mgr_seed = 0x1\n"
+    )
+    return path
+
+
+def test_show_keys_with_a_refused_seed(tmp_path, capsys):
+    # The seed override is refused when OpenSM would start, not when an
+    # operator looks at the keys.
+    from alternative_fabric_manager import cli
+
+    path = _seed_override_conf(tmp_path)
+    cli.main(["--config-file", str(path), "--show-keys"])
+    names = [line.split()[0] for line in capsys.readouterr().out.splitlines()]
+    assert "key_mgr_seed" in names
+
+
+def test_a_refused_seed_stops_a_single_node_start(tmp_path, monkeypatch):
+    from alternative_fabric_manager import cli
+
+    served = []
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *a, **kw: served.append(a))
+    path = _seed_override_conf(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--config-file", str(path)])
+    assert "key_mgr_seed" in str(e.value.code)
+    assert not served
 
 
 @pytest.mark.parametrize(
@@ -137,11 +172,20 @@ def test_show_keys(tmp_path, capsys):
         ("[opensm_conf]\nlog_flags = 0x01\n", "log_flags"),
         ("[opensm_conf]\nlog_file = /tmp/x\n", "log_file"),
         ("[opensm]\nopensm_args = -P /x\n", "unknown"),
+        ("[opensm_conf]\nkey_mgr_seed = 0\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x0\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = seed\n", "key_mgr_seed"),
     ],
 )
 def test_more_invalid(tmp_path, text, match):
     with pytest.raises(config_mod.ConfigError, match=match):
         _load(tmp_path, "[api]\ntoken = x\n" + text)
+
+
+def test_a_seed_override_loads(tmp_path):
+    # Whether it's the stored seed is for the manager to check, on start.
+    config = _load(tmp_path, "[api]\ntoken = x\n[opensm_conf]\nkey_mgr_seed = 0x12\n")
+    assert config.opensm_conf["key_mgr_seed"] == "0x12"
 
 
 def test_hex_and_bool_options(tmp_path):

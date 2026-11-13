@@ -23,7 +23,13 @@ CONTAINER_CONFIG_DIR = "/etc/opensm"
 
 # Keys that every OpenSM of the fabric must share. The manager generates them
 # once and keeps them in its database.
-KEYS = ("m_key", "sm_key", "sa_key")
+#
+# No group writes key_mgr_seed yet. OpenSM derives the class keys (VS, CC,
+# N2N) from it, and with leases of 0 a lost seed leaves ports keyed with keys
+# no SM can reproduce. So the manager generates it at every start, a release
+# before any group can key a port with it, and every backup of the database
+# holds it by then (see specs/secured-profile.md, The seed).
+KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed")
 
 # The hardened options, in groups that [opensm] hardening names. A group's
 # key, if it has one, is generated once and kept in the database.

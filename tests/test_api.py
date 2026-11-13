@@ -483,6 +483,100 @@ def test_opensm_conf_only_for_the_managed_driver(manager, config):
     assert not pathlib.Path(config.opensm_conf_file).exists()
 
 
+def _seed(manager):
+    with manager.sessionmaker() as session:
+        secret = session.get(db.Secret, "key_mgr_seed")
+        return secret and secret.value
+
+
+@pytest.mark.parametrize(
+    "hardening, driver",
+    [("none", "none"), ("none", "managed"), ("all", "docker"), ("all", "managed")],
+)
+def test_start_generates_the_seed(manager, config, reloader, hardening, driver):
+    # Whatever the groups and driver, so that every backup holds the seed
+    # before any group keys a port with it
+    import re
+
+    config.hardening = hardening
+    config.driver = driver
+    manager.start()
+    manager.stop()
+    seed = _seed(manager)
+    assert re.fullmatch("0x[0-9a-f]{16}", seed) and int(seed, 16)
+    manager.start()
+    manager.stop()
+    assert _seed(manager) == seed
+    assert reloader.starts == 2
+
+
+@pytest.mark.parametrize("hardening", ["all", "m_key, sa_trust"])
+def test_opensm_conf_has_no_seed(manager, config, hardening):
+    from alternative_fabric_manager import opensm_conf
+
+    config.driver = "managed"
+    config.hardening = hardening
+    manager.start()
+    manager.stop()
+    assert _seed(manager)
+    with open(config.opensm_conf_file) as f:
+        content = f.read()
+    assert "key_mgr_seed" not in content
+    # As before the seed was kept
+    keys = {k: v for k, v in manager.keys().items() if k != "key_mgr_seed"}
+    assert content == opensm_conf.render(
+        {}, hardening=config.hardening_groups, keys=keys
+    )
+
+
+def test_a_seed_override_on_a_fresh_database_is_refused(manager, config, reloader):
+    # The operator can't choose the seed.
+    from alternative_fabric_manager import config as config_mod
+
+    config.driver = "managed"
+    config.opensm_conf = {"key_mgr_seed": "0x1"}
+    with pytest.raises(config_mod.ConfigError, match="key_mgr_seed") as e:
+        manager.start()
+    assert _seed(manager) not in str(e.value) and "0x1" not in str(e.value)
+    assert reloader.starts == 0
+    assert manager._thread is None
+    assert not pathlib.Path(config.opensm_conf_file).exists()
+
+
+def test_a_changed_seed_is_refused(manager, config, reloader):
+    from alternative_fabric_manager import config as config_mod
+    from alternative_fabric_manager import opensm_conf
+
+    config.driver = "managed"
+    manager.start()
+    manager.stop()
+    seed = _seed(manager)
+    pathlib.Path(config.opensm_conf_file).unlink()
+    other = opensm_conf.new_key()
+    config.opensm_conf = {"key_mgr_seed": other}
+    with pytest.raises(config_mod.ConfigError, match="key_mgr_seed") as e:
+        manager.start()
+    assert seed not in str(e.value) and other not in str(e.value)
+    assert reloader.starts == 1
+    assert manager._thread is None
+    assert not pathlib.Path(config.opensm_conf_file).exists()
+    assert _seed(manager) == seed
+
+
+def test_the_stored_seed_may_be_overridden_with(manager, config, reloader):
+    config.driver = "managed"
+    manager.start()
+    manager.stop()
+    seed = _seed(manager)
+    for spelling in (seed.upper(), hex(int(seed, 16)), str(int(seed, 16))):
+        config.opensm_conf = {"key_mgr_seed": spelling}
+        manager.start()
+        manager.stop()
+        with open(config.opensm_conf_file) as f:
+            assert f"key_mgr_seed {spelling}" in f.read().splitlines()
+    assert reloader.starts == 4
+
+
 def test_a_guid_belongs_to_one_port(client, manager, config):
     # A port whose deletion never arrived, or two ports with one client ID,
     # would otherwise be in two networks' partitions.

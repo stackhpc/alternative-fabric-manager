@@ -32,6 +32,7 @@ import time
 
 import sqlalchemy as sa
 
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db, effects, opensm_conf, partitions
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
@@ -96,6 +97,15 @@ def _increment(session, name):
             # Another instance created it first; increment it.
             continue
     raise RuntimeError(f"Can't increment {name}")
+
+
+def _stored_key(session, name):
+    """One of the fabric's shared keys, generated if it's missing"""
+    secret = session.get(db.Secret, name)
+    if secret is None:
+        secret = db.Secret(name=name, value=opensm_conf.new_key())
+        session.add(secret)
+    return secret.value
 
 
 class Manager:
@@ -688,15 +698,35 @@ class Manager:
     def keys(self):
         """Return the fabric's shared OpenSM keys, generating any missing"""
         with self._lock, self.sessionmaker() as session:
-            keys = {}
-            for name in opensm_conf.KEYS:
-                secret = session.get(db.Secret, name)
-                if secret is None:
-                    secret = db.Secret(name=name, value=opensm_conf.new_key())
-                    session.add(secret)
-                keys[name] = secret.value
+            keys = {name: _stored_key(session, name) for name in opensm_conf.KEYS}
             session.commit()
             return keys
+
+    def _keep_seed(self):
+        """Generate the class keys' seed if it's missing, and refuse an
+        override that isn't the stored seed
+
+        The seed is generated whatever the groups, so that backups hold it
+        before any port is keyed with it, and it can't be chosen or replaced:
+        ports keyed with another seed would have keys no SM can reproduce
+        (see specs/secured-profile.md, The seed).
+        """
+        with self._lock, self.sessionmaker() as session:
+            seed = _stored_key(session, "key_mgr_seed")
+            session.commit()
+        override = self.config.opensm_conf.get("key_mgr_seed")
+        if override is None:
+            return
+        try:
+            same = int(override, 0) == int(seed, 0)
+        except ValueError:
+            same = False
+        if not same:
+            # Neither value is logged: they're secrets.
+            raise config_mod.ConfigError(
+                "[opensm_conf] key_mgr_seed differs from the stored seed, "
+                "which can't be replaced; remove the option"
+            )
 
     def _key(self, name):
         """The key OpenSM uses, if any: an override, or a hardened one"""
@@ -725,6 +755,9 @@ class Manager:
 
     def start(self):
         """Write the current state, start OpenSM, then keep it in sync"""
+        # Before anything is written or started, so that a refused seed
+        # leaves OpenSM as it was
+        self._keep_seed()
         self._stop.clear()
         # Counted afresh for each OpenSM this manager starts
         self.unanswered_checks = 0

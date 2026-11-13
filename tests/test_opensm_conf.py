@@ -80,3 +80,15 @@ def test_manager_sets_log_flags():
     assert (
         "log_flags 0x07" not in opensm_conf.render({"log_flags": "0xff"}).splitlines()
     )
+
+
+def test_no_group_writes_the_seed():
+    # The seed is kept a release before any group uses it (see
+    # specs/secured-profile.md, The seed), and changes no opensm.conf.
+    assert "key_mgr_seed" in opensm_conf.KEYS
+    keys = {name: opensm_conf.new_key() for name in opensm_conf.KEYS}
+    without_seed = {k: v for k, v in keys.items() if k != "key_mgr_seed"}
+    for groups in (ALL, {"m_key", "sa_trust"}, set()):
+        content = opensm_conf.render({}, hardening=groups, keys=keys)
+        assert "key_mgr_seed" not in content
+        assert content == opensm_conf.render({}, hardening=groups, keys=without_seed)

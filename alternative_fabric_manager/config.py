@@ -309,6 +309,16 @@ class Config:
                     f"[opensm_conf] log_flags must include 0x{REQUIRED_LOG_FLAGS:02x}, "
                     "whose messages the manager watches for"
                 )
+        # With a seed of 0, OpenSM derives the class keys from the M_Key. The
+        # manager also refuses a seed other than the stored one, on start.
+        seed = self.opensm_conf.get("key_mgr_seed")
+        if seed is not None:
+            try:
+                seed = int(seed, 0)
+            except ValueError:
+                raise ConfigError("[opensm_conf] key_mgr_seed isn't a number") from None
+            if not seed:
+                raise ConfigError("[opensm_conf] key_mgr_seed can't be 0")
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(

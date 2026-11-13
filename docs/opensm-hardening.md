@@ -59,6 +59,14 @@ database gives every manager the same keys, and keeps them across restarts.
 Only the keys of the chosen groups are written. A key set in
 `[opensm_conf]` wins over the generated one.
 
+The manager also generates `key_mgr_seed` on every start, whatever the
+groups, though no group writes it yet. OpenSM derives the class keys (VS, CC
+and N2N) from it, and a port keyed with a lost seed can't be managed again,
+so the seed is generated a release early, for database backups to hold it
+before it is ever used. `--show-keys` prints it, and it is as secret as the
+other keys. Unlike them, it can't be overridden: the manager refuses an
+`[opensm_conf] key_mgr_seed` that is 0 or differs from the stored seed.
+
 The keys are in:
 
 - the manager's database, which the manager creates readable only by root;
