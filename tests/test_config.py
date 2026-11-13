@@ -59,6 +59,8 @@ def test_missing_file(tmp_path):
         ("false", set()),
         ("m_key", {"m_key"}),
         ("m_key, Enforcement", {"m_key", "enforcement"}),
+        ("all, babbling_ports", set(config_mod.HARDENING_GROUPS)),
+        ("yes, m_key", set(config_mod.HARDENING_GROUPS)),
     ],
 )
 def test_hardening_option(tmp_path, value, groups):
@@ -71,6 +73,33 @@ def test_hardening_option(tmp_path, value, groups):
 def test_unknown_hardening_group(tmp_path):
     with pytest.raises(config_mod.ConfigError, match="mkey"):
         _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = mkey\n")
+
+
+@pytest.mark.parametrize("value", ["all, none", "none, m_key", "no, all"])
+def test_no_hardening_stands_alone(tmp_path, value):
+    with pytest.raises(config_mod.ConfigError, match="either"):
+        _load(tmp_path, f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n")
+
+
+def test_unknown_hardening_group_beside_all(tmp_path):
+    with pytest.raises(config_mod.ConfigError, match="unknown groups: mkey"):
+        _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = all, mkey\n")
+
+
+def test_hardening_groups_outside_all(tmp_path, monkeypatch):
+    # A group outside all, as later opt-in groups will be, is chosen only by
+    # naming it, so an upgrade never turns it on by itself.
+    six = set(config_mod.HARDENING_GROUPS)
+    monkeypatch.setattr(
+        config_mod, "HARDENING_GROUPS", config_mod.HARDENING_GROUPS + ("seventh",)
+    )
+    for value, groups in (
+        ("all", six),
+        ("all, seventh", six | {"seventh"}),
+        ("seventh, m_key", {"seventh", "m_key"}),
+    ):
+        text = f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n"
+        assert _load(tmp_path, text).hardening_groups == groups
 
 
 def test_managed_opensm_options_cant_be_overridden(tmp_path):

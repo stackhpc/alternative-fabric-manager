@@ -10,9 +10,12 @@ So with the managed driver, the manager writes a hardened set of options into
 `opensm.conf`, in groups. `[opensm] hardening` names the groups, separated by
 commas, `all` by default, or `none`: one option chooses what to harden, for
 example `hardening = m_key, enforcement` on a fabric where only M_Key
-protection is wanted. A single OpenSM option can still be overridden in
-`[opensm_conf]`, for example `m_key_lease_period = 120`, and wins over the
-groups.
+protection is wanted. `all` may be named beside other groups, and adds them
+to its own; `none` stands alone. `all` means the groups below, and keeps
+meaning them: a group added later stays out of it, so that an upgrade never
+turns it on by itself, and is chosen by naming it beside `all`. A single
+OpenSM option can still be overridden in `[opensm_conf]`, for example
+`m_key_lease_period = 120`, and wins over the groups.
 
 | Group | Option | OpenSM default | Hardened | Stops |
 | --- | --- | --- | --- | --- |

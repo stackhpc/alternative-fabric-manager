@@ -30,8 +30,10 @@ DEFAULT_VOLUMES = (
     "opensm_cache:/var/cache/opensm"
 )
 DRIVERS = ("managed", "docker", "none")
-# The hardening groups of opensm_conf.HARDENING
-HARDENING_GROUPS = (
+# The hardening groups that all means. A group added later stays out of it,
+# and is chosen by naming it beside all, so that an upgrade never turns a new
+# group on by itself.
+ALL_HARDENING_GROUPS = (
     "m_key",
     "sm_key",
     "sa_key",
@@ -39,6 +41,8 @@ HARDENING_GROUPS = (
     "enforcement",
     "babbling_ports",
 )
+# The hardening groups of opensm_conf.HARDENING: all's, then any outside it
+HARDENING_GROUPS = ALL_HARDENING_GROUPS
 # opensm.conf keys that the manager sets, which overrides can't change: the
 # manager depends on OpenSM reading its partitions file, staying in the
 # foreground, logging to its container's output, and enforcing partitions.
@@ -181,7 +185,8 @@ class Config:
 
     # The groups of hardened OpenSM options of docs/opensm-hardening.md to
     # write into opensm.conf (managed), separated by commas: m_key, sm_key,
-    # sa_key, sa_trust, enforcement, babbling_ports, or all or none.
+    # sa_key, sa_trust, enforcement, babbling_ports, or all, or none. all may
+    # be named with other groups, which adds them; none stands alone.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
 
@@ -192,9 +197,10 @@ class Config:
     def hardening_groups(self):
         """The hardening groups that [opensm] hardening names"""
         words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
+        groups = words & set(HARDENING_GROUPS)
         if words & set(ALL_HARDENING):
-            return set(HARDENING_GROUPS)
-        return words - set(NO_HARDENING)
+            groups |= set(ALL_HARDENING_GROUPS)
+        return groups
 
     @property
     def partitions_file(self):
@@ -268,9 +274,12 @@ class Config:
             raise ConfigError(
                 f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
             )
-        if len(words) > 1 and words & (set(ALL_HARDENING) | set(NO_HARDENING)):
+        # all may be named with other groups, to add groups outside it, but
+        # none with anything else is a contradiction.
+        if len(words) > 1 and words & set(NO_HARDENING):
             raise ConfigError(
-                "[opensm] hardening is either all, none, or a list of groups"
+                "[opensm] hardening is either none or a list of groups, "
+                "which may include all"
             )
         for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
