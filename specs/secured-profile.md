@@ -70,8 +70,9 @@ InfiniBand adapters on every host where AFM may run OpenSM. Virtual
 functions are left out: on a host that is also a hypervisor, a virtual
 function's GUID belongs to a tenant's port. A port is a physical function
 when its device has no `physfn` link in sysfs
-(`/sys/class/infiniband/<dev>/device/physfn`). It counts only if its link
-layer is InfiniBand.
+(`/sys/class/infiniband/<dev>/device/physfn`), and isn't an mlx5
+sub-function (an auxiliary device under `mlx5_core.sf`), which also has no
+`physfn` link. It counts only if its link layer is InfiniBand.
 
 - **Single node:** the host's own physical ports, read before
   `opensm.conf` is rendered. They're read in a short-lived container of
@@ -88,13 +89,33 @@ layer is InfiniBand.
 Ports are recorded in a node row only by a probe that succeeded and found at
 least one physical InfiniBand port:
 
-- at registration, if the row has no port GUIDs yet;
+- at registration, and then at every heartbeat until a probe first
+  succeeds, since the probe fails while a fresh node is still pulling
+  OpenSM's image;
 - by an operator's command, after an adapter is replaced.
+
+A node whose row has no port GUIDs can't be a candidate, so it never holds
+the lease or runs OpenSM, and the leader renders the list from the rows
+that have them.
 
 A probe that fails, finds no image, or finds no ports never changes a row.
 So the list changes only when a node joins, is forgotten, or the operator
 records new adapters. It never changes because a virtual function was
 assigned, or a probe failed.
+
+### Required groups
+
+`allowed_sm` needs the `m_key` group, at protection level 1 or more, and
+the `sm_key` group, in both modes. The fabric check's rule for ignored SMs
+rests on an ignored SM having neither key (see The fabric check). Without
+them, an ignored SM could set pkey tables on unprotected ports while the
+check, which no longer sees it, passes. `Config.validate` refuses the group
+without them.
+
+If `m_key` or `sm_key` is set in `[opensm_conf]`, rather than generated,
+AFM can't know which other SMs hold it. Then every `0F09` fails the check
+and contests the fabric, unless the operator records the other SMs' ports
+as known SM ports.
 
 ### Overrides
 
@@ -106,7 +127,8 @@ hardened option. Unlike other overrides, it's checked:
   log `ERR 7549` and disable the feature.
 - **At start:** `ERR 7549` in OpenSM's start log fails the start, so a list
   that OpenSM rejected can never pass as protection.
-- **HA:** the override must contain every port GUID in the node rows, and
+- **HA:** the override must contain every port GUID in the node rows,
+  which are the known SM ports of nodes that haven't been forgotten, and
   `0` is refused, because each leader must accept the others' SMs (see HA).
   The override is a cluster setting, so it is part of the configuration
   hash. Only the generated list is left out of the hash.
@@ -120,8 +142,13 @@ alarm, and reports OpenSM as not running. It checks that:
 
 - the list isn't empty, and isn't `0` in HA mode;
 - the list holds this host's physical ports, as the probe reads them now,
-  or holds `[opensm_conf] guid` if that is set;
+  or holds `[opensm_conf] guid` if that is set. A probe that fails refuses
+  the start, since the manager can't tell;
 - in HA mode, this node's row has port GUIDs.
+
+The same checks run before every re-render. `ERR 7549` after a SIGHUP
+fails the apply, as it does a start, since OpenSM has then turned the
+feature off in the running process.
 
 Hardware test 1 also tests whether OpenSM itself refuses to run on a port
 that isn't in its list.
@@ -140,10 +167,21 @@ future work.
 
 - **`ERR 0F09` naming a known SM port**, logged since the last check, fails
   the check and marks the fabric contested. It stays contested until a
-  direct SMInfo Get of that port, by LID and with the SM_Key, finds no SM
-  there, or finds one that is NOT-ACTIVE. In HA mode, a known port is
-  outside the list only when its node was forgotten. An override that
-  leaves it out is refused.
+  direct query of that port, by LID and with the SM_Key and M_Key, shows
+  either:
+  - SMInfo answering NOT-ACTIVE; or
+  - PortInfo with the IsSM capability bit clear, meaning no SM is bound
+    there.
+
+  A query that times out never clears the contest. A paused OpenSM
+  doesn't answer either, and it is ha.md's one uncovered case. In HA mode,
+  a known port is outside the list only when its node was forgotten.
+- **Dropping a known SM port.** A forgotten node's adapter may be reused
+  in a host that never holds the keys, even a tenant's. An operator's
+  command drops a port from the known set. It asserts that the adapter is
+  no longer in a host with the keys, and is refused for a port in a node
+  row. Without it, a tenant's SM on a reused adapter would contest the
+  fabric for good.
 - **`ERR 0F09` naming any other port** raises an alarm and doesn't fail the
   check. Such an SM has no keys: they're generated by AFM, and held only by
   the database, the managers' hosts and the backups, which the hardening doc
@@ -196,14 +234,24 @@ Hardware test 2 checks whether a SIGHUP applies a change, both adding and
 removing a GUID, and what else a SIGHUP re-reads from a changed
 `opensm.conf`.
 
+In both cases, the leader records the effective list its OpenSM runs with
+in `applied`, and raises an alarm while a live node with port GUIDs is
+outside it.
+
 - **If a SIGHUP applies it:** the leader re-renders `opensm.conf` when the
   list changes, and sends a SIGHUP. Single node, the manager does the same
   when it starts.
-- **If not:** the leader records the list its OpenSM runs with in
-  `applied`. A node that isn't in that list can't be a candidate. The
-  operator applies a change by moving the leadership, as for an upgrade,
-  once the new node's row has its ports. There's no automatic step-down for
-  it.
+- **If not:** the operator applies a change by moving the leadership, as
+  for an upgrade, once the new node's row has its ports. There's no
+  automatic step-down for it.
+
+A candidate inside the running list is preferred when the lease is free.
+A candidate outside it may still take over, since that isn't unsafe: the
+new leader's list holds the old leader's ports, so a resumed old OpenSM is
+seen, and the new OpenSM goes to STANDBY or its check fails. Only the fence
+ask is lost (`2F1C`), and the Ask never counts on its own. Restricting
+candidates instead would leave no eligible node when a leader dies before
+the operator moves the leadership.
 
 ## Class keys
 
@@ -257,6 +305,14 @@ is keyed:
   the hardening groups, in the release **before** the one that can enable
   `class_keys`. The backup that the deploy-host skill takes before an
   upgrade then holds it.
+- A start that generates the seed never renders `class_keys`. It refuses
+  the group with an alarm, and a later start may use it. That covers a
+  fresh install, a skipped release and a restore of an older backup: the
+  seed is always in the database, and so in the next backup, before a
+  port is keyed. After such a restore, a new seed is a refusal and an
+  alarm, not ports keyed with a seed that a backup lacks.
+- The seed enters the configuration hash only when `class_keys` is chosen,
+  so adding it to `KEYS` doesn't change every node's hash.
 - `--show-keys` prints it. AGENTS.md's rule never to print OpenSM's keys
   covers it.
 - An `[opensm_conf] key_mgr_seed` override that is `0`, or differs from the
@@ -381,7 +437,8 @@ These go into specs/ha.md before the HA code changes:
   beside the adapters' node GUIDs. They're recorded only by a successful
   probe, at registration or by an operator's command. Also add the known SM
   ports, which keep a forgotten node's GUIDs.
-- **Retiring a node:** a command to forget a node's row, which ha.md
+- **Retiring a node:** a command to drop a port from the known SM ports,
+  for a reused adapter, and a command to forget a node's row, which ha.md
   defers to this kind of check. Forgetting a row removes the node's ports
   from the list, keeps them among the known SM ports, and is refused for a
   node that is live or in the target set. The leader then re-renders.
@@ -390,8 +447,13 @@ These go into specs/ha.md before the HA code changes:
   generated list isn't. If a SIGHUP doesn't apply a change, `applied`
   records the running list, and a node outside it can't be a candidate.
 - **Job completion, fabric checks:** `ERR 0F09` naming a known SM port
-  fails the check and contests the fabric until a direct SMInfo Get clears
-  it. Naming another port, it raises the unknown-SM alarm.
+  fails the check and contests the fabric, until a direct query shows
+  NOT-ACTIVE or IsSM clear. Naming another port, it raises the unknown-SM
+  alarm. The managed-node SM rule matches SMInfo records' port GUIDs
+  against the node rows' port GUIDs, not their adapters' node GUIDs.
+- **Candidates:** a node with no port GUIDs can't be a candidate. A
+  candidate inside `applied`'s running list is preferred. An alarm is
+  raised while a live node is outside it.
 - **Required keys:** HA mode refuses `allowed_sm` until its dependencies
   (see HA) are in, and `class_keys` until hardware test 3 passes.
 
@@ -402,11 +464,15 @@ send SMInfo Sets and flood the SA. They use two hosts, A and B. Each test
 says which design choice its outcome decides.
 
 1. **Allowed SMs.** A runs AFM's OpenSM. B runs OpenSM at a higher
-   priority, in four runs:
-   - without a list, B with a wrong SM_Key;
+   priority, in these runs:
+   - without a list, B with a wrong SM_Key, then with an SM_Key of 0;
    - with A's list holding only A, B with a wrong SM_Key, then with an
      SM_Key of 0, then with the fabric's keys;
-   - with both listed, B with the fabric's keys.
+   - with both listed, B with the fabric's keys;
+   - with A's list holding only A, B with the fabric's keys, and B's
+     OpenSM then stopped with SIGSTOP. Record what the direct SMInfo Get
+     returns, whether PortInfo's IsSM bit stays set, and whether A still
+     logs `0F09`.
 
    Each run records:
    - A's state;
@@ -437,6 +503,9 @@ says which design choice its outcome decides.
      B logs none of the key managers' errors (`9803`, `9822`, `9823`,
      `9B03`, `9B22`, `C1xx`). Keyed queries still work and unkeyed ones
      still fail. B can set a port's VS key.
+   - Stale cache: B keys ports added during its term, then stops, and A
+     leads again with its old cache. A manages every port, the new ones
+     included, as every HA takeover starts from a stale cache.
    - With leases of 0, the keys survive an hour with no SM while B sends
      unkeyed MADs.
    - B starts with a different seed: record what it logs, and whether it
