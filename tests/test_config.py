@@ -1,3 +1,6 @@
+import contextlib
+import io
+
 import pytest
 
 from alternative_fabric_manager import config as config_mod
@@ -128,13 +131,19 @@ def test_show_keys(tmp_path, capsys):
 
 
 def _seed_override_conf(tmp_path):
-    # A seed that isn't the one the manager stores
+    # A seed that isn't the one the manager stores: a random seed is stored
+    # first, then the configuration overrides it.
+    from alternative_fabric_manager import cli
+
     path = tmp_path / "afm.conf"
-    path.write_text(
+    text = (
         f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
         f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
-        "[opensm_conf]\nkey_mgr_seed = 0x1\n"
     )
+    path.write_text(text)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["--config-file", str(path), "--show-keys"])
+    path.write_text(text + "[opensm_conf]\nkey_mgr_seed = 0x1\n")
     return path
 
 
@@ -166,6 +175,8 @@ def test_a_refused_seed_stops_a_single_node_start(tmp_path, monkeypatch):
     [
         ("[opensm]\nhardening = none, m_key\n", "either"),
         ("[opensm]\ncheck_interval = 0\n", "positive"),
+        ("[opensm]\nkey_lease_period = -1\n", "key_lease_period"),
+        ("[opensm]\nkey_lease_period = 65536\n", "key_lease_period"),
         ("[opensm]\nipoib_mtu = 6\n", "ipoib_mtu"),
         ("[opensm]\nflat_pkey = 100\n", "flat_pkey"),
         ("[opensm_conf]\npart_enforce = off\n", "part_enforce"),
@@ -175,11 +186,22 @@ def test_a_refused_seed_stops_a_single_node_start(tmp_path, monkeypatch):
         ("[opensm_conf]\nkey_mgr_seed = 0\n", "key_mgr_seed"),
         ("[opensm_conf]\nkey_mgr_seed = 0x0\n", "key_mgr_seed"),
         ("[opensm_conf]\nkey_mgr_seed = seed\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x12_34\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 010\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = -1\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x1ffffffffffffffff\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 18446744073709551616\n", "key_mgr_seed"),
     ],
 )
 def test_more_invalid(tmp_path, text, match):
     with pytest.raises(config_mod.ConfigError, match=match):
         _load(tmp_path, "[api]\ntoken = x\n" + text)
+
+
+def test_key_lease_period(tmp_path):
+    assert _load(tmp_path, "[api]\ntoken = x\n").key_lease_period == 0
+    config = _load(tmp_path, "[api]\ntoken = x\n[opensm]\nkey_lease_period = 60\n")
+    assert config.key_lease_period == 60
 
 
 def test_a_seed_override_loads(tmp_path):

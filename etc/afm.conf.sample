@@ -54,6 +54,14 @@ partitions_template =
 # "m_key, enforcement" for M_Key protection only. [opensm_conf] overrides any
 # single option.
 hardening = all
+# The lease, in seconds, of every key the manager sets on ports: the M_Key,
+# and the class keys once a group sets them. 0, the default, makes them
+# permanent: a port never drops its protection, and a port whose key is lost
+# stays locked until it's power-cycled. Up to 65535 opts out: a port drops
+# its protection once no subnet manager has reached it for that long. Use
+# minutes, longer than a restart or takeover; 60 suits a test fabric only.
+# See docs/opensm-hardening.md, Permanent keys.
+key_lease_period = 0
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5

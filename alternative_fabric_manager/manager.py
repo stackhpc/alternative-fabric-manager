@@ -99,13 +99,23 @@ def _increment(session, name):
     raise RuntimeError(f"Can't increment {name}")
 
 
-def _stored_key(session, name):
-    """One of the fabric's shared keys, generated if it's missing"""
+def _stored_key(session, name, initial=None):
+    """One of the fabric's shared keys, stored as initial, or generated, if
+    it's missing"""
     secret = session.get(db.Secret, name)
     if secret is None:
-        secret = db.Secret(name=name, value=opensm_conf.new_key())
+        secret = db.Secret(name=name, value=initial or opensm_conf.new_key())
         session.add(secret)
     return secret.value
+
+
+def _canonical_seed(value):
+    """The seed as the manager stores and writes it, or None if it isn't one"""
+    try:
+        seed = int(value, 0)
+    except (TypeError, ValueError):
+        return None
+    return f"0x{seed:016x}" if 0 < seed < 2**64 else None
 
 
 class Manager:
@@ -696,36 +706,50 @@ class Manager:
     # Keys and OpenSM's options
 
     def keys(self):
-        """Return the fabric's shared OpenSM keys, generating any missing"""
-        with self._lock, self.sessionmaker() as session:
-            keys = {name: _stored_key(session, name) for name in opensm_conf.KEYS}
-            session.commit()
-            return keys
+        """Return the fabric's shared OpenSM keys, generating any missing
+
+        A missing seed is stored as the operator's override, if there is one:
+        ports may already be keyed with it, set by hand before the manager
+        kept a seed (see specs/secured-profile.md, The seed).
+        """
+        initial = {
+            "key_mgr_seed": _canonical_seed(self.config.opensm_conf.get("key_mgr_seed"))
+        }
+        for attempt in range(2):
+            with self._lock, self.sessionmaker() as session:
+                try:
+                    keys = {
+                        name: _stored_key(session, name, initial.get(name))
+                        for name in opensm_conf.KEYS
+                    }
+                    session.commit()
+                except sa.exc.IntegrityError:
+                    # Another instance stored a key first, which surfaces at
+                    # a flush or the commit; read the stored keys back.
+                    session.rollback()
+                    if attempt:
+                        raise
+                    continue
+                return keys
 
     def _keep_seed(self):
-        """Generate the class keys' seed if it's missing, and refuse an
-        override that isn't the stored seed
+        """Store the class keys' seed if it's missing, and refuse an override
+        that isn't the stored seed
 
-        The seed is generated whatever the groups, so that backups hold it
-        before any port is keyed with it, and it can't be chosen or replaced:
-        ports keyed with another seed would have keys no SM can reproduce
-        (see specs/secured-profile.md, The seed).
+        The seed is stored whatever the groups, so that backups hold it before
+        any port is keyed with it, and it can't be replaced: ports keyed with
+        another seed would have keys no SM can reproduce (see
+        specs/secured-profile.md, The seed).
         """
-        with self._lock, self.sessionmaker() as session:
-            seed = _stored_key(session, "key_mgr_seed")
-            session.commit()
+        seed = self.keys()["key_mgr_seed"]
         override = self.config.opensm_conf.get("key_mgr_seed")
-        if override is None:
-            return
-        try:
-            same = int(override, 0) == int(seed, 0)
-        except ValueError:
-            same = False
-        if not same:
+        if override is not None and _canonical_seed(override) != seed:
             # Neither value is logged: they're secrets.
             raise config_mod.ConfigError(
-                "[opensm_conf] key_mgr_seed differs from the stored seed, "
-                "which can't be replaced; remove the option"
+                "[opensm_conf] key_mgr_seed differs from the seed in the "
+                "database, which can't be replaced. Ports keyed with the stored "
+                "seed need it: remove the option. Ports keyed with the option's "
+                "seed need the database that holds it: restore that database"
             )
 
     def _key(self, name):
@@ -743,10 +767,16 @@ class Manager:
         if self.config.driver != "managed":
             return
         groups = self.config.hardening_groups
+        overrides = dict(self.config.opensm_conf)
+        if "key_mgr_seed" in overrides:
+            # The stored spelling, which _keep_seed checked the override
+            # against, so that OpenSM can't parse it differently
+            overrides["key_mgr_seed"] = self.keys()["key_mgr_seed"]
         content = opensm_conf.render(
-            self.config.opensm_conf,
+            overrides,
             hardening=groups,
             keys=self.keys() if groups & {"m_key", "sm_key", "sa_key"} else None,
+            key_lease_period=self.config.key_lease_period,
         )
         # The keys are secrets.
         partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
@@ -769,9 +799,21 @@ class Manager:
             applied = session.get(db.Applied, 1)
             self._contested_fabric = bool(applied and applied.contested)
         LOG.info(
-            "OpenSM hardening: %s",
+            "OpenSM hardening: %s; keys %s",
             ", ".join(sorted(self.config.hardening_groups)) or "none",
+            f"expire after {self.config.key_lease_period} s without an SM"
+            if self.config.key_lease_period
+            else "are permanent",
         )
+        overridden = sorted(
+            name for name in self.config.opensm_conf if opensm_conf.is_key_lease(name)
+        )
+        if overridden:
+            # Easy to miss when key_lease_period is meant to cover every key
+            LOG.warning(
+                "[opensm_conf] sets %s, which wins over [opensm] key_lease_period",
+                ", ".join(overridden),
+            )
         self._start_opensm()
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
         self._thread.start()

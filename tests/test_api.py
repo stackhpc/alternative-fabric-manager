@@ -510,6 +510,30 @@ def test_start_generates_the_seed(manager, config, reloader, hardening, driver):
     assert reloader.starts == 2
 
 
+def test_key_lease_period_reaches_opensm_conf(manager, config, caplog):
+    config.driver = "managed"
+    config.key_lease_period = 60
+    with caplog.at_level("INFO"):
+        manager.start()
+        manager.stop()
+    with open(config.opensm_conf_file) as f:
+        assert "m_key_lease_period 60" in f.read().splitlines()
+    assert "keys expire after 60 s" in caplog.text
+    # The keys never appear in the log.
+    assert not any(v in caplog.text for v in manager.keys().values())
+
+
+def test_a_lease_override_is_warned_about(manager, config, caplog):
+    config.driver = "managed"
+    config.key_lease_period = 60
+    config.opensm_conf = {"m_key_lease_period": "0"}
+    manager.start()
+    manager.stop()
+    with open(config.opensm_conf_file) as f:
+        assert "m_key_lease_period 0" in f.read().splitlines()
+    assert "wins over [opensm] key_lease_period" in caplog.text
+
+
 @pytest.mark.parametrize("hardening", ["all", "m_key, sa_trust"])
 def test_opensm_conf_has_no_seed(manager, config, hardening):
     from alternative_fabric_manager import opensm_conf
@@ -529,18 +553,46 @@ def test_opensm_conf_has_no_seed(manager, config, hardening):
     )
 
 
-def test_a_seed_override_on_a_fresh_database_is_refused(manager, config, reloader):
-    # The operator can't choose the seed.
-    from alternative_fabric_manager import config as config_mod
-
+def test_a_seed_override_on_a_fresh_database_is_stored(manager, config, reloader):
+    # Ports may already be keyed with it, set by hand: a random seed would
+    # strand them.
     config.driver = "managed"
     config.opensm_conf = {"key_mgr_seed": "0x1"}
-    with pytest.raises(config_mod.ConfigError, match="key_mgr_seed") as e:
-        manager.start()
-    assert _seed(manager) not in str(e.value) and "0x1" not in str(e.value)
-    assert reloader.starts == 0
-    assert manager._thread is None
-    assert not pathlib.Path(config.opensm_conf_file).exists()
+    manager.start()
+    manager.stop()
+    assert _seed(manager) == "0x0000000000000001"
+    assert reloader.starts == 1
+    with open(config.opensm_conf_file) as f:
+        assert "key_mgr_seed 0x0000000000000001" in f.read().splitlines()
+
+
+def test_show_keys_stores_the_override_too(manager, config):
+    # --show-keys before the first start mustn't store a random seed that the
+    # start would then refuse the override for.
+    config.opensm_conf = {"key_mgr_seed": "18"}
+    assert manager.keys()["key_mgr_seed"] == "0x0000000000000012"
+    manager._keep_seed()
+
+
+def test_a_key_stored_meanwhile_is_read_back(manager, monkeypatch):
+    # Another instance storing the keys between our read and our commit is a
+    # conflict on the primary key; the stored keys win.
+    from alternative_fabric_manager import opensm_conf
+
+    real = opensm_conf.new_key
+    raced = []
+
+    def new_key():
+        if not raced:
+            raced.append(1)
+            with manager.sessionmaker() as other:
+                for name in opensm_conf.KEYS:
+                    other.add(db.Secret(name=name, value="0x00000000000000aa"))
+                other.commit()
+        return real()
+
+    monkeypatch.setattr(opensm_conf, "new_key", new_key)
+    assert set(manager.keys().values()) == {"0x00000000000000aa"}
 
 
 def test_a_changed_seed_is_refused(manager, config, reloader):
@@ -564,16 +616,18 @@ def test_a_changed_seed_is_refused(manager, config, reloader):
 
 
 def test_the_stored_seed_may_be_overridden_with(manager, config, reloader):
+    # Whatever the spelling, opensm.conf gets the stored one, which OpenSM
+    # can't read differently.
     config.driver = "managed"
     manager.start()
     manager.stop()
     seed = _seed(manager)
-    for spelling in (seed.upper(), hex(int(seed, 16)), str(int(seed, 16))):
+    for spelling in ("0X" + seed[2:].upper(), hex(int(seed, 16)), str(int(seed, 16))):
         config.opensm_conf = {"key_mgr_seed": spelling}
         manager.start()
         manager.stop()
         with open(config.opensm_conf_file) as f:
-            assert f"key_mgr_seed {spelling}" in f.read().splitlines()
+            assert f"key_mgr_seed {seed}" in f.read().splitlines()
     assert reloader.starts == 4
 
 

@@ -128,7 +128,9 @@ port is only a limited member. [docs/opensm-hardening.md](docs/opensm-hardening.
 explains each option, why, and what it costs, such as diagnostic tools
 needing the M_Key (`alternative-fabric-manager --show-keys`).
 `[opensm] hardening` chooses the groups of options in one line, for example
-`hardening = m_key, enforcement` for M_Key protection only.
+`hardening = m_key, enforcement` for M_Key protection only. The keys set on
+ports are permanent by default; `[opensm] key_lease_period` gives them all
+a lease in one line instead (see docs/opensm-hardening.md, Permanent keys).
 
 ### The partitions template
 

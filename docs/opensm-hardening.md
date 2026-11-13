@@ -15,13 +15,17 @@ to its own; `none` stands alone. `all` means the groups below, and keeps
 meaning them: a group added later stays out of it, so that an upgrade never
 turns it on by itself, and is chosen by naming it beside `all`. A single
 OpenSM option can still be overridden in `[opensm_conf]`, for example
-`m_key_lease_period = 120`, and wins over the groups.
+`sa_etm_max_num_mcgs = 256`, and wins over the groups.
+
+The keys the manager sets on ports are permanent by default: a port never
+drops its protection. `[opensm] key_lease_period` opts out of that for every
+such key at once (see Permanent keys).
 
 | Group | Option | OpenSM default | Hardened | Stops |
 | --- | --- | --- | --- | --- |
 | `m_key` | `m_key` | `0` | Random, shared | A host reading or changing port settings with SMPs |
 | `m_key` | `m_key_protection_level` | `0` | `2` | As above |
-| `m_key` | `m_key_lease_period` | `0` | `0` | A port giving up its protection, and its M_Key, while no SM runs |
+| `m_key` | `m_key_lease_period` | `0` | `[opensm] key_lease_period`, `0` by default | A port giving up its protection, and its M_Key, while no SM runs |
 | `sm_key` | `sm_key` | `0x1` | Random, shared | A rogue subnet manager taking over by handover |
 | `sa_key` | `sa_key` | `0x1` | Random, shared | Any client being trusted by the SA with the well-known key |
 | `sa_trust` | `sa_enhanced_trust_model` | `FALSE` | `TRUE` | Untrusted clients using SA requests beyond the minimal set |
@@ -59,13 +63,20 @@ database gives every manager the same keys, and keeps them across restarts.
 Only the keys of the chosen groups are written. A key set in
 `[opensm_conf]` wins over the generated one.
 
-The manager also generates `key_mgr_seed` on every start, whatever the
-groups, though no group writes it yet. OpenSM derives the class keys (VS, CC
-and N2N) from it, and a port keyed with a lost seed can't be managed again,
-so the seed is generated a release early, for database backups to hold it
-before it is ever used. `--show-keys` prints it, and it is as secret as the
-other keys. Unlike them, it can't be overridden: the manager refuses an
-`[opensm_conf] key_mgr_seed` that is 0 or differs from the stored seed.
+The manager also stores `key_mgr_seed`, if it's missing, whenever it starts
+OpenSM (in HA mode, when a node takes over), whatever the groups, though no
+group writes it yet. OpenSM derives the class keys (VS, CC and N2N) from it,
+and a port keyed with a lost seed can't be managed again, so the seed is
+stored a release early, for database backups to hold it before it is ever
+used. `--show-keys` prints it, and it is as secret as the other keys.
+
+Unlike the other keys, the stored seed can't be replaced. If
+`[opensm_conf] key_mgr_seed` is set when no seed is stored, as on a fabric
+whose class keys were set by hand, the manager stores that value rather than
+a random one, so that the ports' seed is kept. Otherwise the manager refuses
+an override that differs from the stored seed. The override must be a
+non-zero 64-bit value, in hexadecimal (`0x...`) or decimal without leading
+zeros.
 
 The keys are in:
 
@@ -113,8 +124,68 @@ The cost is recovery. With a lease of `0`, a fabric whose M_Key is lost, for
 example with the manager's database, can't be configured by a new subnet
 manager until every port is reset, by power-cycling or by firmware tools.
 Back up the database. A fabric that prefers recovery over that exposure can
-set a lease, `m_key_lease_period = 600` for example, longer than its longest
-expected subnet manager outage, and accept the window.
+give every key a lease with one option, as Permanent keys describes.
+
+## Permanent keys
+
+Some keys are stored on the ports themselves, not only in the subnet
+manager: today the M_Key, and the class keys once a group sets them. With a
+lease of `0`, the default, a port keeps its key and its protection for good.
+That is the safest setting against tenants, and the hardest to recover
+from: a port whose key is lost, with the database or by a mistake, stays
+locked until it's power-cycled or reset by firmware tools.
+
+`[opensm] key_lease_period` opts out of permanent keys in one line. It sets
+the lease of every key the manager puts on ports, now and in groups added
+later:
+
+```ini
+[opensm]
+# 0 (the default): permanent keys. Otherwise seconds, up to 65535.
+key_lease_period = 600
+```
+
+With a lease, a port that is sent a packet with the wrong key starts a
+countdown. When the countdown runs out, the port drops its protection,
+and a subnet manager with the right keys can then key it again. A subnet
+manager that has the right key stops the countdown, and OpenSM's sweeps do
+too. So a port keeps its protection for as long as an SM manages it, and
+loses it only after the lease passes with no SM managing it.
+
+Choose the lease with both sides in mind:
+
+- **Exposure.** While no subnet manager runs for longer than the lease, a
+  host that sends packets without the key gets a port's protection, and for
+  the M_Key the key itself, back. The manager stops OpenSM whenever it
+  restarts, and in HA mode during a takeover and whenever the database
+  can't be reached. Make the lease longer than the longest such outage you
+  expect: minutes, not seconds.
+- **Recovery.** A port keyed with a lost key recovers only once the lease
+  has passed. Don't count on that happening while a subnet manager runs.
+  In the hardware test of class keys, ports keyed with another seed stayed
+  unreachable for more than five minutes, despite a 60 s lease, while
+  OpenSM ran and polled them with the wrong key. They answered again after
+  OpenSM had been stopped for three minutes (see specs/secured-profile.md,
+  Results). Why isn't established yet. So to recover, stop every subnet
+  manager for longer than the lease, then start one with the right keys.
+
+A short lease, such as `60`, is useful for testing hardening on a fabric
+that nobody else depends on. Any mistake then recovers within minutes of
+stopping the manager. Don't run a tenant fabric with a lease that short:
+every restart of the manager opens the window.
+
+The option covers every key lease that a hardening group writes. A lease
+set for one key in `[opensm_conf]`, such as `m_key_lease_period = 0`, still
+wins over it, and the manager logs a warning at start, since that key is
+then not covered. The manager logs at start whether keys are permanent or
+expire, and after how long.
+
+Changing the option takes effect when the manager restarts, which restarts
+OpenSM. OpenSM sets the new lease on a port when it next configures it with
+the right key. So setting a lease doesn't unlock a port whose key is
+already lost: OpenSM can't reach that port to change its lease. The keys
+the subnet manager keeps to itself, the SM_Key and the SA_Key, aren't stored
+on ports, have no lease, and aren't affected.
 
 ### Turning M_Key protection off
 

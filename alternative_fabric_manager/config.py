@@ -17,6 +17,7 @@ import configparser
 import dataclasses
 import logging
 import os
+import re
 import socket
 
 # Every port is only a limited member of the default partition, so that ports
@@ -189,6 +190,13 @@ class Config:
     # be named with other groups, which adds them; none stands alone.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
+    # The lease, in seconds, of every key the manager sets on ports (the
+    # M_Key, and later the class keys). 0, the default, makes them permanent:
+    # a port never drops its protection. A positive lease lets ports keyed
+    # with a lost key recover once no SM has reached them for that long, at
+    # the cost of the window docs/opensm-hardening.md, Permanent keys,
+    # describes. [opensm_conf] can still override a single lease.
+    key_lease_period: int = 0
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)
@@ -284,6 +292,11 @@ class Config:
         for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
+        # The M_Key's lease is a 16-bit field of PortInfo.
+        if not 0 <= self.key_lease_period <= 65535:
+            raise ConfigError(
+                "[opensm] key_lease_period must be 0 (permanent keys) to 65535 s"
+            )
         for name, low, high in (
             ("ipoib_rate", 2, 22),
             ("ipoib_mtu", 1, 5),
@@ -311,14 +324,19 @@ class Config:
                 )
         # With a seed of 0, OpenSM derives the class keys from the M_Key. The
         # manager also refuses a seed other than the stored one, on start.
+        # Only spellings that Python and OpenSM's parser read alike: no
+        # underscores, signs or octal-looking leading zeros.
         seed = self.opensm_conf.get("key_mgr_seed")
         if seed is not None:
-            try:
-                seed = int(seed, 0)
-            except ValueError:
-                raise ConfigError("[opensm_conf] key_mgr_seed isn't a number") from None
-            if not seed:
-                raise ConfigError("[opensm_conf] key_mgr_seed can't be 0")
+            if not re.fullmatch(r"0[xX][0-9a-fA-F]{1,16}|[1-9][0-9]*", seed):
+                raise ConfigError(
+                    "[opensm_conf] key_mgr_seed must be hexadecimal (0x...) or "
+                    "decimal without leading zeros"
+                )
+            if not 0 < int(seed, 0) < 2**64:
+                raise ConfigError(
+                    "[opensm_conf] key_mgr_seed must be a non-zero 64-bit value"
+                )
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(
@@ -431,6 +449,7 @@ OPTIONS = (
             "host_config_dir",
             "partitions_template",
             "hardening",
+            "key_lease_period",
             "start_timeout",
             "sweep_timeout",
             "check_interval",
