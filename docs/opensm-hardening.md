@@ -31,12 +31,13 @@ can't read one way only, rather than guess:
 
 HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 
-A new group joins `all` once it has been tested on hardware. An upgrade that
-adds one turns it on unless you remove it, and the release notes say so.
-Check them before an upgrade, and remove any new group your fabric isn't
-ready for, for example `hardening = -class_keys`. A single OpenSM option can
-still be overridden in `[opensm_conf]`, for example
-`sa_etm_max_num_mcgs = 256`, and wins over the groups.
+Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
+experimental: not tested enough to be on by default, and not part of `all`.
+You can try it by hand on a fabric you control (see Experimental hardening).
+If a later release makes one of these a group in `all`, its release notes
+will say so, and `-group` removes it. A single OpenSM option can still be
+overridden in `[opensm_conf]`, for example `sa_etm_max_num_mcgs = 256`, and
+wins over the groups.
 
 The keys the manager sets on ports are permanent by default: a port never
 drops its protection. `[opensm] key_lease_period` opts out of that for every
@@ -338,6 +339,124 @@ manager gives each network's partition, and the flat partition (`indx0`).
 With `ALL=full` in the default partition, a guest could still add an IPoIB
 interface for it, `0x7fff`, and reach other tenants there; limited membership
 is what prevents that.
+
+## Experimental hardening
+
+These options close the rest of the gaps between AFM's hardening and
+NVIDIA UFM's Secured Cloud Profile. None is enabled by default or by `all`.
+Each is designed in specs/secured-profile.md, where it is planned as a
+group of its own, once hardware tests show it is safe. Until then you can
+try one by setting its OpenSM options in `[opensm_conf]`. The manager
+writes them as they are, and checks none of what the planned groups will.
+
+Try them only on a fabric you control, or with the agreement of everyone
+who shares it. Back up the database first (it holds the keys), and record
+what you set, so that you can undo it. With `[opensm] key_lease_period`
+set, keys that go wrong can be recovered without a power cycle, so prefer
+a short lease, such as `60`, while you experiment (see Permanent keys,
+including the exposure a short lease brings).
+
+Each change takes effect when the manager restarts, which restarts OpenSM.
+
+### Allowed subnet managers
+
+A tenant can run a subnet manager of its own. Without the SM_Key it can't
+take over by handover, and without the M_Key it can't set ports, but it may
+still win the election and send AFM's OpenSM to STANDBY, leaving the fabric
+without a working subnet manager. With `allowed_sm_guids`, OpenSM ignores
+every subnet manager whose port isn't in the list.
+
+```ini
+[opensm_conf]
+# The port GUIDs of every physical InfiniBand port that may run OpenSM: in
+# HA mode, every node's. Not virtual functions, which belong to tenants.
+allowed_sm_guids = 0x...,0x...
+```
+
+- **A wrong list can leave the fabric without a subnet manager.** If the
+  port OpenSM binds to isn't listed, OpenSM may refuse to run. Read the
+  GUIDs with `ibstat -p` on each host, and leave out virtual functions
+  (devices with a `device/physfn` link in `/sys/class/infiniband`).
+- **A malformed list turns the feature off.** OpenSM logs `ERR 7549` and
+  disables the feature. Check OpenSM's log after the restart.
+- **In HA mode, list every node's ports.** Otherwise one leader ignores the
+  next, and drops its request to stop (`ERR 2F1C`).
+- OpenSM logs `ERR 0F09` for each subnet manager it ignores. AFM doesn't
+  act on it yet. The planned group raises an alarm, and treats an ignored
+  subnet manager on a managed node's port as a contested fabric.
+- **Untested:** whether a tenant's subnet manager can send AFM's OpenSM to
+  STANDBY without the list, and whether a change to the list applies
+  without a restart.
+
+### Class keys
+
+Switches and adapters accept other classes of management packets than
+SMPs. Vendor-specific (VS) packets are what in-band `mlxlink`, `mlxreg`
+and `flint` use. Congestion control (CC) packets set the congestion
+parameters of every port. A tenant can send either to any switch unless
+the class is keyed. OpenSM derives each port's class keys from
+`key_mgr_seed`. The manager already keeps a seed in its database, so that
+backups hold it, but doesn't write it to `opensm.conf`.
+
+```ini
+[opensm_conf]
+vs_key_enable = 2
+vs_key_ci_protect_bits = 1
+cc_key_enable = 2
+cc_key_protect_bit = 1
+n2n_key_enable = 2
+n2n_key_protect_bit = 1
+# The stored seed (see below). Without it, OpenSM derives the class keys
+# from the M_Key. The manager refuses any other value.
+key_mgr_seed = <the stored seed>
+```
+
+Copy the stored seed into `afm.conf` without displaying it:
+
+```sh
+SEED=$(docker exec alternative-fabric-manager alternative-fabric-manager \
+  --show-keys | awk '/^key_mgr_seed/{print $2}')
+sudo sed -i "/^\[opensm_conf\]/a key_mgr_seed = $SEED" \
+  /etc/alternative-fabric-manager/afm.conf
+unset SEED
+```
+
+The leases follow `[opensm] key_lease_period` only once the planned group
+exists. Until then, set `vs_key_lease_period`, `cc_key_lease_period` and
+`n2n_key_lease_period` yourself, or OpenSM's default of 60 s applies.
+
+- **A lost or changed seed can leave ports keyed for good.** Never change
+  `key_mgr_seed` while ports are keyed, and keep the database backups.
+- **Turn them off by disabling first.** Set each `<class>_key_enable = 1`
+  and restart, so that OpenSM clears the keys from the ports. Only then
+  remove the options. Removing them at once leaves the ports keyed with keys
+  the subnet manager no longer manages.
+- **In-band tools need the VS key,** and which of them can take it is still
+  being worked out. `ibdiagnet` takes `--vs_key_file`, pointed at OpenSM's
+  `/var/cache/opensm/guid2vskey`, which makes that cache a secret.
+- **Not every device supports every class.** Ports that don't answer with
+  `ERR 9828` at every sweep. On the test fabric, only VS keys were
+  supported.
+- **Tested so far:** on one host, VS keys derive from the seed alone. Their
+  effect on tenants, turning them off, and a lease of 0 are untested (see
+  specs/secured-profile.md, Results).
+
+### SA request rate
+
+`sa_rate_threshold` limits how many SA requests a port may send per 100 ms.
+OpenSM drops the rest, and logs `ERR 4C11`.
+
+```ini
+[opensm_conf]
+sa_rate_threshold = 1000
+```
+
+- **It may limit neighbours together.** Whether OpenSM counts per port GUID
+  or per physical port is untested. If it counts per physical port, one
+  guest's flood would drop the requests of every guest on that port.
+- **Check it against your heaviest start-up.** An MPI job's start-up makes
+  the most path record requests. If OpenSM logs `4C11` for one, raise the
+  limit.
 
 ## Turning hardening on for a running fabric
 

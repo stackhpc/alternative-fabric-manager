@@ -510,6 +510,10 @@ instead.)
   `ALL_HARDENING_GROUPS`. It can be chosen only by naming it beside `all`,
   for example `hardening = all, allowed_sm`. Each new group waits for its
   hardware tests (see Hardware tests), so until then it is experimental.
+- **Before a group exists,** its options can be tried by hand in
+  `[opensm_conf]`, without the checks the group will add.
+  docs/opensm-hardening.md, Experimental hardening, documents them as
+  additional hardening that isn't on by default, with their risks.
 - **Once its tests pass,** it joins `all`. The release that adds it is
   fabric-affecting: its notes name the group, what it changes on the fabric,
   and how to opt out with `-group`. In HA mode the change needs an epoch,

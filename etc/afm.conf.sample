@@ -96,6 +96,8 @@ ipoib_sl = 0
 [opensm_conf]
 # opensm.conf options for the managed driver, as "key = value". These win
 # over the hardened options. OpenSM uses its defaults for the others.
-# partition_config_file and daemon are set by the manager.
+# partition_config_file and daemon are set by the manager. Experimental
+# hardening that isn't on by default (allowed SMs, class keys, an SA rate
+# limit) is tried here: see docs/opensm-hardening.md, Experimental hardening.
 #sm_priority = 15
 #log_flags = 0x07
