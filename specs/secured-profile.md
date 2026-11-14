@@ -301,13 +301,13 @@ A new hardening group, `class_keys`, sets:
 ```
 vs_key_enable 2
 vs_key_ci_protect_bits 1
-vs_key_lease_period 0
+vs_key_lease_period <key_lease_period>
 cc_key_enable 2
 cc_key_protect_bit 1
-cc_key_lease_period 0
+cc_key_lease_period <key_lease_period>
 n2n_key_enable 2
 n2n_key_protect_bit 1
-n2n_key_lease_period 0
+n2n_key_lease_period <key_lease_period>
 key_mgr_seed <stored>
 ```
 
@@ -517,9 +517,18 @@ instead.)
 - **Once its tests pass,** it joins `all`. The release that adds it is
   fabric-affecting: its notes name the group, what it changes on the fabric,
   and how to opt out with `-group`. In HA mode the change needs an epoch,
-  like any fabric-affecting change. On a fabric that others share, whoever
-  shares it must agree before the upgrade, or the operator removes the
-  group first, as AGENTS.md requires.
+  like any fabric-affecting change. The opt-out can only be written with the
+  upgrade itself, since the older release refuses `-newgroup` as unknown, and
+  a rollback must remove it again. On a fabric that others share, whoever
+  shares it agrees before the upgrade, or the deployment uses an explicit
+  list of groups, which no upgrade widens. AGENTS.md's rule on agreeing the
+  hardening is written for a change to `[opensm] hardening`; an upgrade that
+  widens `all` changes the fabric without one, so that rule, and the
+  deploy-host skill, need to cover it before the first group joins `all`.
+- **A group that leaves state on ports** (`class_keys`) needs a mechanical
+  guard, not only release notes: the first start in which `all` gains it is
+  refused until the operator names it or removes it explicitly. That's
+  designed when the first such group is implemented.
 - **`class_keys` leaves keys on every port,** which only its seed can
   remove. Before it joins `all`, the seed must have been in backups for a
   release (see The seed), and the hardening doc must give the procedure
@@ -696,8 +705,9 @@ After the run, OpenSM, with no class key options, logged no errors, and
 every physical port refused unkeyed SMPs and answered keyed ones: M_Key
 protection was back. Whether any port still holds a VS key from the test
 seeds isn't known, since no probe that shows it worked. If one does, it
-holds it with a 60 s lease, which runs out after a wrong-keyed VS MAD and a
-minute with none.
+holds it with a 60 s lease, which is expected to run out after a
+wrong-keyed VS MAD and a minute with none, if class key leases behave like
+the M_Key's. That isn't shown.
 
 Still to run for test 3:
 - a lease of 0, which must verify that `enable 1` clears the keys;

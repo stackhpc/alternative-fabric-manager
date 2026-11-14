@@ -370,6 +370,12 @@ def parse_hardening(text):
     itself, so that what's hardened is never a guess.
     """
     words = [w.strip().lower() for w in text.split(",") if w.strip()]
+    if not words:
+        # A blank line, or a template that rendered nothing, mustn't turn
+        # hardening off: none says so explicitly.
+        raise ConfigError(
+            "[opensm] hardening is empty: say all, a list of groups, or none"
+        )
     removed = {w[1:].strip() for w in words if w.startswith("-")}
     named = {w for w in words if not w.startswith("-")}
     known = set(HARDENING_GROUPS)
@@ -398,8 +404,6 @@ def parse_hardening(text):
             "[opensm] hardening can remove groups (-group) only from all; "
             "list the groups to keep instead"
         )
-    if not words:
-        return set()
     groups = named & known
     if starts_from_all and not named & set(NO_HARDENING):
         groups |= set(ALL_HARDENING_GROUPS)

@@ -34,8 +34,10 @@ HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
 experimental: not tested enough to be on by default, and not part of `all`.
 You can try it by hand on a fabric you control (see Experimental hardening).
-If a later release makes one of these a group in `all`, its release notes
-will say so, and `-group` removes it. A single OpenSM option can still be
+Once its hardware tests pass, each is planned to become a group in `all`.
+The release that adds one will say so in its notes, and `-group` will
+remove it. On a fabric that others share, prefer an explicit list of groups,
+so that nothing switches on at an upgrade without their agreement. A single OpenSM option can still be
 overridden in `[opensm_conf]`, for example `sa_etm_max_num_mcgs = 256`, and
 wins over the groups.
 
@@ -72,7 +74,7 @@ accident.
 | --- | --- |
 | Only OpenStack's hosts, guests and bare metal nodes (the default) | `all` |
 | With ConnectX-3 SR-IOV | `all`, with `sa_etm_allow_untrusted_guidinfo_rec = TRUE` in `[opensm_conf]` (see the SA enhanced trust model) |
-| Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `-sa_key, -sa_trust`, which keeps every other group, and groups added later |
+| Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `m_key, sm_key, enforcement`: an explicit list, so that no group switches on without the agreement of whoever shares the fabric. `babbling_ports` is left out because it disables ports that flood traps, which may be theirs |
 | Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it, a bare metal tenant can reconfigure switch ports |
 
 ## The keys
@@ -108,9 +110,11 @@ The keys are in:
   included ("Loading Cached Option:m_key = ..."), so the OpenSM container's
   log, and wherever it is shipped, holds them;
 - OpenSM's cache, `guid2mkey` in `/var/cache/opensm`, which holds each port's
-  M_Key.
+  M_Key, and with class keys, `guid2vskey` and the like;
+- `afm.conf`, if a key or the seed is set in `[opensm_conf]`, as trying class
+  keys does (see Experimental hardening).
 
-Keep all four from tenants and from log shipping. To print the keys:
+Keep them all from tenants and from log shipping. To print the keys:
 
 ```sh
 docker exec alternative-fabric-manager alternative-fabric-manager --show-keys
@@ -193,7 +197,9 @@ Choose the lease with both sides in mind:
   unkeyed queries to a switch, then three minutes with no subnet manager,
   dropped the switch's protection. It answered unkeyed queries, and so
   would have given out the M_Key, for some minutes after the subnet manager
-  started again (see specs/secured-profile.md, Results).
+  started again (see specs/secured-profile.md, Results). So don't count on
+  a running subnet manager to restore a lapsed port's protection promptly:
+  the window can outlast the outage.
 - **Recovery is expected, not yet shown.** A lease is meant to let a port
   whose key was lost be keyed again. The lapse above shows the first half
   happening, but no test has yet shown a port keyed with a lost M_Key keyed
@@ -351,10 +357,11 @@ writes them as they are, and checks none of what the planned groups will.
 
 Try them only on a fabric you control, or with the agreement of everyone
 who shares it. Back up the database first (it holds the keys), and record
-what you set, so that you can undo it. With `[opensm] key_lease_period`
-set, keys that go wrong can be recovered without a power cycle, so prefer
-a short lease, such as `60`, while you experiment (see Permanent keys,
-including the exposure a short lease brings).
+what you set, so that you can undo it. In HA mode, put the same
+`[opensm_conf]` lines on every node before restarting any: each node writes
+its own `opensm.conf`, and the manager doesn't yet check that they match.
+On a deployment whose configuration is managed, such as Kayobe's, add them
+there, not by hand, or the next reconfigure removes them.
 
 Each change takes effect when the manager restarts, which restarts OpenSM.
 
@@ -421,25 +428,38 @@ sudo sed -i "/^\[opensm_conf\]/a key_mgr_seed = $SEED" \
 unset SEED
 ```
 
-The leases follow `[opensm] key_lease_period` only once the planned group
-exists. Until then, set `vs_key_lease_period`, `cc_key_lease_period` and
-`n2n_key_lease_period` yourself, or OpenSM's default of 60 s applies.
+Re-running these commands adds the line twice: check `afm.conf` first.
+`afm.conf` then holds a secret, the seed, besides the database's password
+(see The keys).
 
+`[opensm] key_lease_period` doesn't apply to these options: it covers only
+leases that a hardening group writes. Their leases are OpenSM's default,
+60 s, unless you set `vs_key_lease_period`, `cc_key_lease_period` and
+`n2n_key_lease_period`. A lease is what would let a port keyed by mistake
+be keyed again without a power cycle, but that recovery hasn't been shown
+(see Permanent keys).
+
+- **Not in HA mode yet.** Seed-only derivation has been shown on one host,
+  not across a takeover by another. A node that takes over without the same
+  lines would leave the ports keyed with keys its OpenSM doesn't manage.
 - **A lost or changed seed can leave ports keyed for good.** Never change
-  `key_mgr_seed` while ports are keyed, and keep the database backups.
-- **Turn them off by disabling first.** Set each `<class>_key_enable = 1`
-  and restart, so that OpenSM clears the keys from the ports. Only then
-  remove the options. Removing them at once leaves the ports keyed with keys
-  the subnet manager no longer manages.
+  `key_mgr_seed` while ports are keyed, and keep the database backups. That
+  includes adding the line later: a fabric first keyed without it was keyed
+  from the M_Key, so adding the seed changes it.
+- **Turn them off by disabling first.** Set each `<class>_key_enable = 1`,
+  keeping the `key_mgr_seed` line, and restart. OpenSM is expected to clear
+  the keys from the ports, though that is untested. Only then remove the
+  options. Removing them at once leaves the ports keyed with keys the
+  subnet manager no longer manages.
 - **In-band tools need the VS key,** and which of them can take it is still
   being worked out. `ibdiagnet` takes `--vs_key_file`, pointed at OpenSM's
   `/var/cache/opensm/guid2vskey`, which makes that cache a secret.
-- **Not every device supports every class.** Ports that don't answer with
-  `ERR 9828` at every sweep. On the test fabric, only VS keys were
+- **Not every device supports every class.** For ports that don't, OpenSM
+  logs `ERR 9828` at every sweep. On the test fabric, only VS keys were
   supported.
 - **Tested so far:** on one host, VS keys derive from the seed alone. Their
-  effect on tenants, turning them off, and a lease of 0 are untested (see
-  specs/secured-profile.md, Results).
+  effect on tenants, turning them off, a takeover, and a lease of 0 are
+  untested (see specs/secured-profile.md, Results).
 
 ### SA request rate
 

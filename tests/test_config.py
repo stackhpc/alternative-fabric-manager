@@ -72,7 +72,6 @@ def test_missing_file(tmp_path):
             set(config_mod.HARDENING_GROUPS) - {"sa_trust", "sa_key"},
         ),
         ("- babbling_ports", set(config_mod.HARDENING_GROUPS) - {"babbling_ports"}),
-        ("", set()),
     ],
 )
 def test_hardening_option(tmp_path, value, groups):
@@ -109,6 +108,9 @@ def test_unknown_hardening_group_beside_all(tmp_path):
         ("all, sa_trust, -sa_trust", "both names and removes sa_trust"),
         ("m_key, sm_key, -sa_trust", "only from all"),
         ("none, -sa_trust", "either"),
+        # A blank value, as a template that rendered nothing gives
+        ("", "empty"),
+        (" , ", "empty"),
     ],
 )
 def test_unclear_removals_are_refused(tmp_path, value, match):
