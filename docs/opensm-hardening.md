@@ -37,9 +37,10 @@ You can try it by hand on a fabric you control (see Experimental hardening).
 Once its hardware tests pass, each is planned to become a group in `all`.
 The release that adds one will say so in its notes, and `-group` will
 remove it. On a fabric that others share, prefer an explicit list of groups,
-so that nothing switches on at an upgrade without their agreement. A single OpenSM option can still be
-overridden in `[opensm_conf]`, for example `sa_etm_max_num_mcgs = 256`, and
-wins over the groups.
+so that nothing switches on at an upgrade without their agreement.
+
+A single OpenSM option can still be overridden in `[opensm_conf]`, for
+example `sa_etm_max_num_mcgs = 256`, and wins over the groups.
 
 The keys the manager sets on ports are permanent by default: a port never
 drops its protection. `[opensm] key_lease_period` opts out of that for every
