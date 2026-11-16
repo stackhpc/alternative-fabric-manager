@@ -522,9 +522,8 @@ instead.)
   a rollback must remove it again. On a fabric that others share, whoever
   shares it agrees before the upgrade, or the deployment uses an explicit
   list of groups, which no upgrade widens. AGENTS.md's rule on agreeing the
-  hardening is written for a change to `[opensm] hardening`; an upgrade that
-  widens `all` changes the fabric without one, so that rule, and the
-  deploy-host skill, need to cover it before the first group joins `all`.
+  hardening, and the deploy-host skill, cover such an upgrade, as well as
+  a change to `[opensm] hardening`.
 - **A group that leaves state on ports** (`class_keys`) needs a mechanical
   guard, not only release notes: the first start in which `all` gains it is
   refused until the operator names it or removes it explicitly. That's
