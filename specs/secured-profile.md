@@ -677,8 +677,9 @@ group is named or any row exists, the manager reads `neighbors` and
 Each `neighbors` row replaces the row with its local (GUID, port), which
 handles a re-cabled port as OpenSM saw it. Each GUID it lists gets a row;
 its `holds` comes from its `guid2mkey` entry, compared with the old
-`m_key` and its derived key, or is `unknown` if it has no entry or one
-that's neither. Only GUIDs that `neighbors` lists are recorded, so
+`m_key` and its derived key, or is `unknown` if its entry is neither. A
+port with no entry keeps what its row holds, since a port OpenSM lost
+still holds its key, and a new row without one is `unknown`. Only GUIDs that `neighbors` lists are recorded, so
 virtual functions never get rows, and a recorded port that's absent from
 OpenSM's files keeps its row: a port that's down now may come back
 holding its key. A read that fails is logged, and leaves the rows as
