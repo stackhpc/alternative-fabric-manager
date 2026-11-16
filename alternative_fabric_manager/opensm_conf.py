@@ -30,7 +30,15 @@ CONTAINER_CONFIG_DIR = "/etc/opensm"
 # starts OpenSM (in HA mode, at a takeover), a release before any group can
 # key a port with it, and every backup of the database holds it by then (see
 # specs/secured-profile.md, The seed).
-KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed")
+#
+# No group writes m_key_base yet either. Per-port M_Keys derive from it, not
+# from m_key, which every port holds today and tenants may have read: deriving
+# from m_key would hand such a tenant every port's key. It is stored, if it's
+# missing, whatever the groups, as the seed is, so that every backup holds it
+# a release before any port is keyed from it (see specs/secured-profile.md,
+# Per-port M_Keys). It's never written into opensm.conf: only the options of
+# HARDENING's groups take keys.
+KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed", "m_key_base")
 
 # The hardened options, in groups that [opensm] hardening names. A group's
 # key, if it has one, is generated once and kept in the database.

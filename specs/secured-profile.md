@@ -1332,7 +1332,7 @@ and a re-cabled port.
       with its downgrade procedure.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
 - [x] Hardware test 5's first run (see Results).
-- [ ] `m_key_base` in `KEYS`, generated whatever the groups, a release
+- [x] `m_key_base` in `KEYS`, generated whatever the groups, a release
       before `m_key_per_port`.
 - [ ] `m_key_per_port` for single node, as Per-port M_Keys, The design
       says, with requirement 7's changes to README.md, docs/kayobe.md,

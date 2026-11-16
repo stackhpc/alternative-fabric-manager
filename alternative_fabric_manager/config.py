@@ -326,6 +326,13 @@ class Config:
                 raise ConfigError(
                     "[opensm_conf] key_mgr_seed must be a non-zero 64-bit value"
                 )
+        # The per-port M_Key base is the manager's, not an OpenSM option: as
+        # an override it would be written into opensm.conf for nothing.
+        if "m_key_base" in self.opensm_conf:
+            raise ConfigError(
+                "[opensm_conf] m_key_base isn't an OpenSM option: the manager "
+                "keeps the per-port M_Key base in its database"
+            )
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(

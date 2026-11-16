@@ -127,3 +127,20 @@ def test_no_group_writes_the_seed():
         content = opensm_conf.render({}, hardening=groups, keys=keys)
         assert "key_mgr_seed" not in content
         assert content == opensm_conf.render({}, hardening=groups, keys=without_seed)
+
+
+def test_the_base_is_never_rendered():
+    # No group writes the per-port M_Key base into opensm.conf yet, whichever
+    # groups are chosen.
+    import itertools
+
+    keys = dict(KEYS, key_mgr_seed="0x00000000000000ee", m_key_base="0xbbbbbbbb")
+    for size in range(len(ALL) + 1):
+        for groups in itertools.combinations(sorted(ALL), size):
+            content = opensm_conf.render({}, hardening=set(groups), keys=keys)
+            assert "m_key_base" not in content
+            assert "0xbbbbbbbb" not in content
+
+
+def test_the_base_is_a_key():
+    assert "m_key_base" in opensm_conf.KEYS

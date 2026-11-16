@@ -160,9 +160,36 @@ def test_show_keys(tmp_path, capsys):
         "sm_key",
         "sa_key",
         "key_mgr_seed",
+        "m_key_base",
     ]
     cli.main(["--config-file", str(path), "--show-keys"])
     assert capsys.readouterr().out == first
+
+
+def test_show_keys_doesnt_record_a_start(tmp_path):
+    # --show-keys may store the per-port M_Key base, but it isn't a start:
+    # only a start records whether the base was stored before it, and the
+    # first start after --show-keys stored it finds it stored.
+    from alternative_fabric_manager import cli, db, drivers
+    from alternative_fabric_manager import manager as manager_mod
+
+    path = tmp_path / "afm.conf"
+    path.write_text(
+        f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
+        f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["--config-file", str(path), "--show-keys"])
+    config = config_mod.Config.load(str(path))
+    sessionmaker = db.make_sessionmaker(config.database_url)
+    with sessionmaker() as session:
+        assert session.get(db.Secret, "m_key_base") is not None
+        assert session.get(db.State, manager_mod.BASE_KEPT) is None
+    manager = manager_mod.Manager(config, sessionmaker, drivers.NoOpenSM())
+    assert not manager.base_kept()
+    manager.start()
+    manager.stop()
+    assert manager.base_kept()
 
 
 def _seed_override_conf(tmp_path):
@@ -219,6 +246,7 @@ def test_a_refused_seed_stops_a_single_node_start(tmp_path, monkeypatch):
         ("[opensm_conf]\nlog_file = /tmp/x\n", "log_file"),
         ("[opensm]\nopensm_args = -P /x\n", "unknown"),
         ("[opensm_conf]\nkey_mgr_seed = 0\n", "key_mgr_seed"),
+        ("[opensm_conf]\nm_key_base = 0x12\n", "m_key_base"),
         ("[opensm_conf]\nkey_mgr_seed = 0x0\n", "key_mgr_seed"),
         ("[opensm_conf]\nkey_mgr_seed = seed\n", "key_mgr_seed"),
         ("[opensm_conf]\nkey_mgr_seed = 0x12_34\n", "key_mgr_seed"),

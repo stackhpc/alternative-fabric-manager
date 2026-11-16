@@ -510,6 +510,103 @@ def test_start_generates_the_seed(manager, config, reloader, hardening, driver):
     assert reloader.starts == 2
 
 
+def _base(manager):
+    with manager.sessionmaker() as session:
+        secret = session.get(db.Secret, "m_key_base")
+        return secret and secret.value
+
+
+@pytest.mark.parametrize(
+    "hardening, driver",
+    [
+        ("none", "none"),
+        ("none", "managed"),
+        ("m_key, sm_key", "managed"),
+        ("all", "docker"),
+        ("all", "managed"),
+    ],
+)
+def test_start_generates_the_base(manager, config, reloader, caplog, hardening, driver):
+    # Whatever the groups and driver, as the seed is, so that every backup
+    # holds the per-port M_Key base a release before any port is keyed from it
+    import logging
+    import re
+
+    caplog.set_level(logging.DEBUG)
+    config.hardening = hardening
+    config.driver = driver
+    manager.start()
+    manager.stop()
+    base = _base(manager)
+    assert re.fullmatch("0x[0-9a-f]{16}", base) and int(base, 16)
+    assert base not in (manager.keys()["m_key"], manager.keys()["key_mgr_seed"])
+    manager.start()
+    manager.stop()
+    assert _base(manager) == base
+    assert reloader.starts == 2
+    assert base not in caplog.text
+    if driver == "managed":
+        with open(config.opensm_conf_file) as f:
+            content = f.read()
+        assert base not in content and "m_key_base" not in content
+
+
+def test_the_base_is_kept_from_the_next_start(manager, config):
+    # A start that stored the base can't begin per-port keys; the next can.
+    assert not manager.base_kept()
+    manager.start()
+    manager.stop()
+    assert _base(manager)
+    assert not manager.base_kept()
+    manager.start()
+    manager.stop()
+    assert manager.base_kept()
+    manager.start()
+    manager.stop()
+    assert manager.base_kept()
+
+
+def test_the_base_kept_before_the_first_start(manager, config):
+    # --show-keys stored it: the first start finds it stored.
+    manager.keys()
+    assert not manager.base_kept()
+    manager.start()
+    manager.stop()
+    assert manager.base_kept()
+
+
+def test_a_lost_base_isnt_kept(manager, config):
+    # A restored database without the base: the start that stores it again
+    # records that it did, whatever an earlier start recorded.
+    manager.start()
+    manager.stop()
+    manager.start()
+    manager.stop()
+    assert manager.base_kept()
+    with manager.sessionmaker() as session:
+        session.delete(session.get(db.Secret, "m_key_base"))
+        session.commit()
+    manager.start()
+    manager.stop()
+    assert not manager.base_kept()
+
+
+def test_ha_starts_dont_record_the_base(manager, config):
+    # HA refuses per-port keys, and its starts don't write outside the
+    # term's compare-and-set.
+    from alternative_fabric_manager import manager as manager_mod
+
+    config.ha = True
+    manager.start()
+    manager.stop()
+    manager.start()
+    manager.stop()
+    assert _base(manager)
+    assert not manager.base_kept()
+    with manager.sessionmaker() as session:
+        assert session.get(db.State, manager_mod.BASE_KEPT) is None
+
+
 def test_key_lease_period_reaches_opensm_conf(manager, config, caplog):
     config.driver = "managed"
     config.key_lease_period = 60
@@ -573,8 +670,14 @@ def test_opensm_conf_has_no_seed(manager, config, hardening):
     with open(config.opensm_conf_file) as f:
         content = f.read()
     assert "key_mgr_seed" not in content
-    # As before the seed was kept
-    keys = {k: v for k, v in manager.keys().items() if k != "key_mgr_seed"}
+    assert "m_key_base" not in content
+    assert _base(manager) not in content
+    # As before the seed and the base were kept
+    keys = {
+        k: v
+        for k, v in manager.keys().items()
+        if k not in ("key_mgr_seed", "m_key_base")
+    }
     assert content == opensm_conf.render(
         {}, hardening=config.hardening_groups, keys=keys
     )

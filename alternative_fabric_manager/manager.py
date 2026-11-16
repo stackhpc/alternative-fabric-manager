@@ -44,6 +44,9 @@ LOG = logging.getLogger(__name__)
 
 GENERATION = "generation"
 APPLIES = "applies"
+# Whether the per-port M_Key base was stored before the manager's current
+# start: a start that stored it can't begin per-port keys
+BASE_KEPT = "m_key_base_kept"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
 # _needs_sync()'s reason for restoring the last swept file
@@ -739,7 +742,8 @@ class Manager:
         The seed is stored whatever the groups, so that backups hold it before
         any port is keyed with it, and it can't be replaced: ports keyed with
         another seed would have keys no SM can reproduce (see
-        specs/secured-profile.md, The seed).
+        specs/secured-profile.md, The seed). keys() stores every missing key,
+        so the per-port M_Key base is stored here too, for the same reason.
         """
         seed = self.keys()["key_mgr_seed"]
         override = self.config.opensm_conf.get("key_mgr_seed")
@@ -751,6 +755,45 @@ class Manager:
                 "seed need it: remove the option. Ports keyed with the option's "
                 "seed need the database that holds it: restore that database"
             )
+
+    def _base_stored(self):
+        """Whether the per-port M_Key base is stored already"""
+        with self._lock, self.sessionmaker() as session:
+            return session.get(db.Secret, "m_key_base") is not None
+
+    def _record_base_kept(self, kept):
+        """Record whether this start found the per-port M_Key base stored
+
+        A start that stored the base can't begin per-port keys: the next
+        start, after a backup that holds it, can (see
+        specs/secured-profile.md, Per-port M_Keys). --begin-port-keys runs
+        beside the running manager, so the start records it for that command
+        to read. Every start overwrites it.
+        """
+        for attempt in range(2):
+            with self._lock, self.sessionmaker() as session:
+                try:
+                    row = session.get(db.State, BASE_KEPT)
+                    if row is None:
+                        session.add(db.State(name=BASE_KEPT, value=int(kept)))
+                    else:
+                        row.value = int(kept)
+                    session.commit()
+                except sa.exc.IntegrityError:
+                    # Another process created the row first; overwrite it.
+                    session.rollback()
+                    if attempt:
+                        raise
+                    continue
+                return
+
+    def base_kept(self):
+        """Whether the running manager's start found the per-port M_Key base
+        already stored, so that it may begin per-port keys; False if no start
+        has recorded it"""
+        with self._lock, self.sessionmaker() as session:
+            row = session.get(db.State, BASE_KEPT)
+            return bool(row is not None and row.value)
 
     def _key(self, name):
         """The key OpenSM uses, if any: an override, or a hardened one"""
@@ -807,8 +850,15 @@ class Manager:
     def start(self):
         """Write the current state, start OpenSM, then keep it in sync"""
         # Before anything is written or started, so that a refused seed
-        # leaves OpenSM as it was
+        # leaves OpenSM as it was. Whether the base was stored is read first,
+        # since _keep_seed stores every missing key, the base too.
+        base_kept = self._base_stored()
         self._keep_seed()
+        if not self.config.ha:
+            # Only in single-node mode: in HA mode, starts at takeovers would
+            # write it outside the term's compare-and-set, and HA refuses
+            # per-port keys anyway, so a missing row, False, is right there.
+            self._record_base_kept(base_kept)
         self._stop.clear()
         # Counted afresh for each OpenSM this manager starts
         self.unanswered_checks = 0

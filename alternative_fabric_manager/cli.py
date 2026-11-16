@@ -32,8 +32,8 @@ def main(argv=None):
     parser.add_argument(
         "--show-keys",
         action="store_true",
-        help="Print the fabric's OpenSM keys and class key seed, which are "
-        "secrets, for diagnostic tools such as "
+        help="Print the fabric's OpenSM keys, class key seed and per-port "
+        "M_Key base, which are secrets, for diagnostic tools such as "
         "smpquery -y <m_key>, and exit",
     )
     parser.add_argument(
