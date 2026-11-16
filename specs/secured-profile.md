@@ -658,8 +658,11 @@ base doesn't match it refuses the target on (see Restores).
 and, once HA allows the group, by the leader under its term's
 compare-and-set:
 - `fabric_ports`: port GUID, its node GUID (the switch's port 0 for a
-  switch), `holds` (`m_key`, `derived` or `unknown`), `lapsed` (its
-  ProtectBits were 0 at the last Get), `reachable`, and `last_seen`.
+  switch), whether it's a switch (as its NodeInfo said; not known until
+  it answers one), `holds` (`m_key`, `derived` or `unknown`), `lapsed`
+  (its ProtectBits were 0 at the last Get), `reachable`, `released` (an
+  operator's `--release-port`, cleared when the port next answers its
+  key), and `last_seen`.
 - `fabric_links`: (GUID, port) to (GUID, port), both directions as in
   `neighbors`, with `last_seen`.
 
@@ -688,7 +691,12 @@ are reached first, and each switch's PortInfo for its ports gives their
 link state, so a port behind a link that's down isn't sent anything. It
 Gets PortInfo, which shows ProtectBits, and NodeInfo, whose GUID must
 match the row's, or the answer doesn't count. A port with ProtectBits 0
-answers any key, so it's recorded `lapsed`, with `holds` unchanged. Which
+answers any key, so it's recorded `lapsed`, with `holds` unchanged; only
+an answer with ProtectBits 2 shows which key a port holds. The script
+prints named fields only (GUIDs, node type, port count, link state,
+ProtectBits), so PortInfo's M_Key field never leaves the container, and
+it takes its routes and keys from its environment, not its own command
+line. This host's port is the one that answers the empty route. Which
 keys it may try is what keeps the old key from tenants:
 - the port's derived key, whenever the target is on or the row says
   `derived`;
@@ -798,7 +806,7 @@ A full verify, of every recorded port behind an up link and every
 switch port's link state, runs on a slower period
 (`[opensm] port_verify_interval`, 60 s by default, a positive number
 `Config.validate` checks, and a full verify must fit within one), beside
-OpenSM; the
+OpenSM, on the applier's thread, so that the rows have one writer; the
 check uses its last result, and fails if that result is older than two
 periods. It
 returns the switch node GUIDs that answered with the GUID recorded on
