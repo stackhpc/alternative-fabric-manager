@@ -769,7 +769,7 @@ check logs how many still hold `m_key`.
 
 That start succeeds only when OpenSM logs SUBNET UP and, within
 `start_timeout`, a cache read shows this host's port and every recorded
-switch holding its derived key: test 5 saw SUBNET UP from an OpenSM that
+switch that answered the pre-start verify holding its derived key: test 5 saw SUBNET UP from an OpenSM that
 reached only its own port, and the prober reaching a port with the
 row's key doesn't show that OpenSM did. Otherwise the manager stops
 OpenSM and runs the prober: if no port has left its recorded key, it
@@ -796,7 +796,9 @@ reach a re-keyed port, so the fabric check and `--confirm-switches` run
 the prober on the recorded switches only, under the check's timeout.
 A full verify, of every recorded port behind an up link and every
 switch port's link state, runs on a slower period
-(`[opensm] port_verify_interval`, 60 s by default), beside OpenSM; the
+(`[opensm] port_verify_interval`, 60 s by default, a positive number
+`Config.validate` checks, and a full verify must fit within one), beside
+OpenSM; the
 check uses its last result, and fails if that result is older than two
 periods. It
 returns the switch node GUIDs that answered with the GUID recorded on
@@ -833,7 +835,11 @@ hypervisor's, or any other host's) and doesn't answer its key in the
 last full verify fails the fabric check, with the port named, so no job
 completes until it's reached again or an operator runs `--release-port`
 for it. AFM can't tie a virtual function to its host's physical port
-(it has `Port.host`, not the GUID), so this is fabric-wide.
+(it has `Port.host`, not the GUID), so this is fabric-wide. A tenant
+who leaves their node refusing its key and then releases it makes its
+GUID non-Neutron, so the check fails fabric-wide until the port is
+reached or released: that fails closed, the alarm names the port, and
+the hardening doc says so, so that operators recognise it.
 
 The log lines are an extra trigger to fail closed. With rows present, a
 watched sweep that logs `ERR 5411` "DR SMP Send completed with error",
@@ -862,8 +868,9 @@ the ones to keep.
 A restored database that has the base but predates the turn-on (the
 usual case, since the base is stored a release early) has the target
 off, while the volume and the ports hold the base's derived keys. With
-the group named, a start whose folded or verified rows show ports on
-the stored base's derived keys adopts the target on, records the
+the group named, a start whose folded rows show ports on the stored
+base's derived keys adopts the target on, decided after step 1 and
+before step 2, so that the verify runs with the target on, records the
 fingerprint, and raises an alarm saying so, rather than re-keying the
 fabric back to the exposed `m_key`. Without the group named it's an
 ordinary turn-off.
@@ -872,7 +879,9 @@ ordinary turn-off.
 recorded port's GUID, `holds`, `lapsed` and `reachable`, never a key.
 `--port-m-key <guid>` prints that port's current key, for feeding `-y`
 under AGENTS.md's rule, never for display. `--add-link` records a link.
-`--release-port <guid>` completes a lost port's held jobs.
+`--release-port <guid>` completes a lost port's held jobs, and exempts a
+non-Neutron port from the fabric check's rule on lost ports, until the
+port answers its key again.
 `--forget-port-keys` drops every row, refused while the group is named or
 any row holds a derived key; `--forget-port <guid>` drops one port and
 its links, for removed hardware, refused for a port seen in the last day.
@@ -892,7 +901,7 @@ and an adapter that has reset its key. That matters only if a host can
 read the key of an SMP sent to it, which Why assumes it might. Ageing
 such rows to derived-only for adapters without a non-volatile M_Key is
 the likely answer, once the implemented run shows what a reset port
-holds.
+holds. It's settled before the group joins `all`.
 
 ### Choosing the group
 
