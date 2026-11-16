@@ -21,6 +21,7 @@ design.
 | No duplicate pkey at index 0 | A port's GUID is in only one network's partition | — |
 | Restrictive pkey posture | No full `ALL`, `ALL_CAS` or `ALL_VCAS` outside a network's partition | — |
 | MKEY | `m_key`: protection level 2, no lease | — |
+| A key per port | None: one M_Key for every port | `m_key_per_port` group |
 | SMKEY, SAKEY | `sm_key`, `sa_key` | — |
 | Enhanced SA trust model with registration limits | `sa_trust` | — |
 | Allowed SM GUIDs | None | `allowed_sm` group |
@@ -470,6 +471,137 @@ value, proposed as 1000 per 100 ms, is set from the test's results. That
 includes the SA's total capacity, since a limit near it protects little
 against several ports flooding at once.
 
+## Per-port M_Keys
+
+### Why
+
+Every port on the fabric has the same M_Key today. Anyone who learns it
+from any one port can send SubnSet to every switch: rewrite pkey tables,
+which breaks every tenant's isolation, move LIDs, or take ports down. A
+bare metal tenant has root on a host with a port on the fabric, and there
+are several ways for that port's key to leave it:
+
+- **The host's own adapter holds it.** mlx5's driver queries its own port
+  with the adapter's M_Key check bypassed (MAD_IFC's "ignore M_Key"), so
+  root, who can load a module of their own, can likely read the port's
+  PortInfo, M_Key included. This hasn't been tried here.
+- **A lease lapse returns it.** Hardware test 3 saw this happen: unkeyed
+  SMPs while no SM ran dropped two ports' protection, and their PortInfo
+  then gave the M_Key to anyone who asked (see Results).
+- **Adapters with a non-volatile M_Key** (`IB_PORT_CAP_HAS_NV_MKEY`) keep it
+  across reboots, so it goes wherever the card goes.
+
+So the shared M_Key is only as secret as the least protected port, and a
+tenant controls their own. With a key per port, a port's key opens only
+that port, which its tenant controls anyway.
+
+### How OpenSM derives the keys
+
+With `m_key_per_port TRUE`, OpenSM 5.17.2 gives each port the key that
+`osm_subn_calc_mkey` computes, read from its disassembly: SHA-1 over the
+`m_key` and then the port GUID, each as 8 bytes in network order, with
+the 20-byte digest folded into 8 bytes by XOR (digest byte `i` into key
+byte `i mod 8`), read in network order:
+
+```python
+def port_m_key(m_key, port_guid):
+    digest = hashlib.sha1(
+        m_key.to_bytes(8, "big") + port_guid.to_bytes(8, "big")
+    ).digest()
+    key = bytearray(8)
+    for i, b in enumerate(digest):
+        key[i % 8] ^= b
+    return int.from_bytes(key, "big")
+```
+
+A zero GUID gets `m_key` itself. With the option, OpenSM also forces
+`m_key_lookup TRUE` and protection level 2. Hardware test 5 checks the
+derivation against the keys OpenSM writes to `guid2mkey`, and that the
+GUID it hashes is the port GUID (switch port 0's, for a switch).
+
+The keys depend only on `m_key` and the GUID, so another host, or the
+manager, can compute them. That removes the objection this spec first
+raised (that a takeover couldn't know them), but not a second problem:
+
+### A cold cache can't find the ports
+
+At protection level 2, a port answers no SubnGet without its key, NodeInfo
+included (test 3's probe saw this on every physical port). OpenSM learns
+a port's GUID from NodeInfo, so it can't work out the key of a port it
+doesn't already know. Its `req_determine_mkey` looks the destination's
+GUID up in its topology, then in `guid2mkey`, and otherwise uses `m_key`
+itself, which a per-port keyed port refuses. So an OpenSM that starts
+without the fabric's `guid2mkey` and `neighbors` (OpenSM's map of which
+port links to which) is expected not to manage any per-port keyed port
+beyond its own: every HA takeover on another host, and any lost cache.
+With a lease of 0 those ports stay out of reach; with a lease they come
+back only by lapsing, which is the exposure above. Test 5 checks this.
+
+The same goes for AFM's own SMPs. The fabric check and the HA reach probe
+run `ibswitches -y <m_key>`, which takes one key for the whole fabric.
+`ibdiagnet` in OpenSM's image takes per-port keys:
+`--discovery_only --m_key_files <dir>` reads `guid2mkey`, `guid2lid` and
+`neighbors` from a directory.
+
+### The group
+
+A new hardening group, `m_key_per_port`, sets `m_key_per_port TRUE`. It
+needs `m_key`, and the managed driver (single node or HA), since the
+manager has to write OpenSM's cache: `Config.validate` refuses it
+otherwise.
+
+**The database records the fabric's ports.** A new table, `fabric_ports`,
+holds every port GUID the leader's OpenSM has known, with its node GUID,
+and `fabric_links` holds the links from OpenSM's `neighbors`, both
+updated after every sweep from OpenSM's cache files (GUIDs and port
+numbers only; the keys are never read or stored, since `m_key` and the
+GUID give them). Rows are kept when a port goes: a stale row costs a line
+in a file, and dropping one could lose a port that comes back. An
+operator can forget a GUID with the CLI.
+
+**The manager writes OpenSM's cache before every start.** It renders
+`guid2mkey` (each recorded GUID's derived key) and `neighbors`, and the
+driver merges them into OpenSM's cache directory before OpenSM runs:
+recorded GUIDs get the derived key, and entries for GUIDs it doesn't know
+are kept, since this host's OpenSM may have keyed them while the database
+couldn't be updated. The rendered files hold keys: they are written like
+`opensm.conf`, mode 600, in the host config directory.
+
+**The fabric check and the reach probe use `ibdiagnet`** with the rendered
+files when the group is on, and count switches from its discovery, as
+they count `ibswitches`'s today. Test 5 measures how long it takes, since
+the reach probe runs every few seconds.
+
+**A port keyed before it's recorded** is the window: if the leader keys a
+new port, and its host is lost before the next sweep's record, the next
+leader can't reach that port. An adapter without a non-volatile M_Key
+clears its key when reset, so a reboot brings it back. A switch may not.
+The record follows every sweep, so the window is one sweep, and a new
+switch arriving during a takeover is rare. The hardening doc gives
+`--port-m-key <guid>` for an operator who knows the GUID to reach the
+port and recover it.
+
+**Diagnostics:** `smpquery -y` needs the target port's key, which
+`alternative-fabric-manager --port-m-key <guid>` prints for a tool, as
+`--show-keys` does. `ibswitches` and `ibnetdiscover` no longer work with
+`-y`; `ibdiagnet --m_key_files` and `saquery` do.
+
+### Turning it on and off
+
+Turning it on is fabric-affecting: OpenSM re-keys every port at its next
+sweep, using `m_key`, which every port still has. Turning it off is the
+reverse, and needs every port's derived key, so the manager keeps writing
+`guid2mkey` for one start after the group is removed. AFM's own HA
+epochs order the change across nodes, like any change to the hardening.
+
+### Choosing the group
+
+`m_key_per_port` leaves state on ports: their keys change, and `m_key`
+alone no longer opens them. It is experimental until test 5 passes, and
+then joins `all` under the rules in Choosing the groups, including the
+mechanical guard for a group that leaves state on ports. Test 5 needs only
+one host.
+
 ## Not adopted
 
 - **Rotating keys.** UFM re-randomises its key seed periodically. AFM's
@@ -477,11 +609,6 @@ against several ports flooding at once.
   work. Rotating the M_Key safely needs every port to be re-keyed while
   both keys are known, and a takeover in the middle of a rotation to know
   which key each port has.
-- **`m_key_per_port`.** This gives every port its own M_Key, so a leaked
-  port key exposes only that port. It isn't adopted until it's known how
-  OpenSM derives the keys, for the same reason as the class keys' cache.
-  AFM's fence ask, fabric check and diagnostics would also need each target
-  port's key.
 - **The performance management class.** Neither UFM's profile nor OpenSM
   keys it, so a tenant can read, and reset, switch counters.
 - **All HCAs in the same pkey.** UFM's single-pkey bare metal profile
@@ -571,6 +698,14 @@ These go into specs/ha.md before the HA code changes:
   An alarm is raised while a live node is outside it.
 - **Required keys:** HA mode refuses `allowed_sm` until its dependencies
   (see HA) are in, and `class_keys` until hardware test 3 passes.
+- **Per-port M_Keys:** the shared state gains `fabric_ports` and
+  `fabric_links`, written only by the leader, with a compare-and-set on
+  its term like its other writes. A candidate's OpenSM starts only after
+  its driver has merged the rendered `guid2mkey` and `neighbors` into its
+  cache, and the reach probe uses `ibdiagnet` with the rendered files, so
+  that a candidate counts the switches it can reach with the fabric's
+  keys. `m_key_per_port` is in the configuration hash, as
+  fabric-affecting.
 
 ## Hardware tests
 
@@ -644,6 +779,27 @@ says which design choice its outcome decides.
    `4C11`.
 
    *Decides:* whether `sa_rate` is added, and its value.
+5. **Per-port M_Keys.** One host, with the managed driver, on a fabric
+   nobody else uses, and a lease of 0. The cache and the database are
+   backed up first; the backed-up `guid2mkey` and `neighbors` are the way
+   back, since `m_key` alone can't reach a per-port keyed port.
+   - Turn the option on. Every port's key in `guid2mkey` equals
+     `port_m_key`; an SMP Get with the derived key answers, and one with
+     `m_key` doesn't, on every port but the SM's own (comparisons only,
+     no key printed).
+   - Restart with `guid2mkey` and `neighbors` moved aside: record which
+     ports OpenSM manages, and what it logs. Then with only the manager's
+     rendered files, then with `guid2mkey` alone.
+   - `ibdiagnet --discovery_only --m_key_files` with the rendered files
+     finds every switch: record how long it takes, and that it sends no
+     Set.
+   - A port reset (driver reload on this host): record whether the
+     adapter keeps its key.
+   - Turn the option off with the cache in place: every port answers
+     `m_key` again.
+
+   *Decides:* whether `m_key_per_port` can join `all`, and whether the
+   manager must render `neighbors` as well as `guid2mkey`.
 
 ### Results
 
@@ -735,6 +891,10 @@ Still to run for test 3:
 - [ ] Hardware test 3 (first run done, see Results). Then `class_keys`,
       with its downgrade procedure.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
+- [ ] `m_key_per_port`: `fabric_ports` and `fabric_links`, the rendered
+      cache, `ibdiagnet` for the fabric check and the reach probe,
+      `--port-m-key`, the validation; experimental. Then hardware test 5,
+      and the group joins `all`.
 - [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
       downgrade procedure.
 
