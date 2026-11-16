@@ -20,15 +20,21 @@ SWEEP COMPLETE", and ends with "SUBNET UP".
 """
 
 import contextlib
+import datetime
+import io
 import logging
 import re
+import tarfile
 import time
 
 import docker
 import docker.errors
 import docker.utils
+import requests.exceptions
 
 from alternative_fabric_manager import opensm_conf
+from alternative_fabric_manager import prober as probes
+from alternative_fabric_manager.config import OPENSM_CACHE_DIR
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
     Fabric,
@@ -81,6 +87,54 @@ POLL_INTERVAL = 0.5
 # Seconds between attempts to pull OpenSM's image that failed
 PULL_RETRY = 60.0
 
+# libosmvendor's error for a directed-route SMP that failed to send, which
+# names no port. PerfMgr logs "PerfMgr: ERR 5411: Failed to send clear
+# counters MAD", which isn't one, so the text is matched, not the code.
+_DR_SEND_ERROR = re.compile(r"ERR 5411: DR SMP Send completed with error")
+# The MAD layer's "ERR 3113: MAD completed in error (%s): %s(%s), attr_mod
+# 0x%x, TID 0x%lx, dest_guid 0x%016lx", for a NodeInfo or PortInfo Get. Its
+# dest_guid needn't be the port's (see specs/ha.md), 0 included.
+_UNREACHED = re.compile(
+    r"ERR 3113: MAD completed in error \([^)]*\): SubnGet\((?:NodeInfo|PortInfo)\),"
+    r".*\bdest_guid 0x([0-9a-fA-F]{1,16})"
+)
+# A Bad M_Key trap (256), as OpenSM logs receiving it: "Received Generic
+# Notice type:%u num:%u (%s) Producer:%u (%s) from LID:%u%s TID:0x%016lx".
+# The notice dump that follows holds the key that was sent.
+_BAD_M_KEY_TRAP = re.compile(r"Received Generic Notice type:\d+ num:256\b")
+
+# OpenSM's log holds keys: a trap's notice dump, an SMP dump, an SA key
+# mismatch ("SM_Key: 0x%lx != SM_Key: 0x%lx") and debug lines about sending
+# an SMP all print one. Whatever names a key has its value masked; lines about
+# Bad M_Key traps, and "Sending"/"Setting ... MKey 0x..." lines, are dropped.
+_KEY_VALUE = re.compile(
+    r"(?i)(\b(?:m_?key|sm_?key|sa_?key|vs_?key|cc_?key|n2n_?key|am_?key|"
+    r"key_mgr_seed)\b[\s.:=]*)(?:0x)?[0-9a-f]+\b"
+)
+_DROPPED = re.compile(
+    r"Bad M_Key|\bnum:256\b|\b(?:Sending|Setting)\b.*\bMKey 0x", re.IGNORECASE
+)
+# Seconds each prober Get may take, and how many run at once
+PROBE_TIMEOUT = 3
+PROBE_PARALLEL = 16
+# The files of OpenSM's cache that the manager reads and renders
+CACHE_FILES = ("neighbors", "guid2mkey")
+_CACHE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+
+
+def _mask_keys(line):
+    """A line of OpenSM's that may be logged or put into an exception: its
+    keys masked, or None if it mustn't be shown at all"""
+    if _DROPPED.search(line):
+        return None
+    return _KEY_VALUE.sub(r"\1<masked>", line)
+
+
+def _shown(line):
+    """A line of OpenSM's as it may be shown"""
+    masked = _mask_keys(line.strip())
+    return "<a line about an M_Key, not shown>" if masked is None else masked
+
 
 def _is_partitions_error(line):
     # OpenSM skips a line of the partitions file that it can't parse, and
@@ -94,7 +148,7 @@ def _is_partitions_error(line):
 def _rejected(line):
     match = _PARSE_LINE.search(line)
     return PartitionsRejected(
-        f"OpenSM couldn't read the partitions file: {line.strip()}",
+        f"OpenSM couldn't read the partitions file: {_shown(line)}",
         line=int(match.group(1)) if match else None,
     )
 
@@ -115,7 +169,7 @@ def _note_pkey_error(report, line):
     if code in MAD_ERROR_CODES:
         if _PKEY_TABLE_ATTR.search(line):
             report.unattributed = True
-            LOG.warning("OpenSM couldn't set a pkey table: %s", line.strip())
+            LOG.warning("OpenSM couldn't set a pkey table: %s", _shown(line))
         return
     # What can't be traced fails closed: it holds every job of the sweep.
     if code in ENFORCEMENT_ERROR_CODES:
@@ -124,13 +178,69 @@ def _note_pkey_error(report, line):
             report.enforcement_errors.add(f"{int(switch, 16):016x}:{port}")
         if not ports:
             report.enforcement_errors.add(UNATTRIBUTED)
-        LOG.error("OpenSM cleared a switch port's enforcement: %s", line.strip())
+        LOG.error("OpenSM cleared a switch port's enforcement: %s", _shown(line))
     elif code in PKEY_ERROR_CODES:
         guids = {int(g, 16) for g in _PORT_GUID.findall(line)}
         report.pkey_errors |= guids
         if not guids:
             report.unattributed = True
-        LOG.warning("OpenSM couldn't set a pkey table: %s", line.strip())
+        LOG.warning("OpenSM couldn't set a pkey table: %s", _shown(line))
+
+
+def _note_fabric_error(report, line):
+    """Record what OpenSM logged about ports it couldn't reach, and Bad
+    M_Key traps, which are counted and never logged
+
+    Only collected: what they hold is the manager's decision.
+    """
+    if _BAD_M_KEY_TRAP.search(line):
+        report.bad_m_key_traps += 1
+    elif _DR_SEND_ERROR.search(line):
+        report.dr_errors = True
+    else:
+        match = _UNREACHED.search(line)
+        if match:
+            report.unreached.add(int(match.group(1), 16))
+
+
+def _note(report, line):
+    _note_pkey_error(report, line)
+    _note_fabric_error(report, line)
+
+
+def _untar(data, name):
+    """A cache file's text and modification time, from get_archive's tar"""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            member = tar.next()
+            if member is None or member.name != name or not member.isfile():
+                raise ReloadError(f"OpenSM's cache file {name} isn't a regular file")
+            text = tar.extractfile(member).read().decode("ascii")
+            mtime = datetime.datetime.fromtimestamp(member.mtime, datetime.timezone.utc)
+    except (tarfile.TarError, UnicodeDecodeError, ValueError, OverflowError):
+        # The file holds keys: the reason never quotes it.
+        raise ReloadError(f"OpenSM's cache file {name} can't be read") from None
+    return text, mtime
+
+
+def _tar(files):
+    """A tar of OpenSM's cache files, each root's and mode 0600, since
+    guid2mkey holds keys"""
+    data = io.BytesIO()
+    now = time.time()
+    with tarfile.open(fileobj=data, mode="w") as tar:
+        for name, text in files.items():
+            if not _CACHE_NAME.fullmatch(name):
+                raise ValueError(f"{name!r} isn't a file name in OpenSM's cache")
+            body = text.encode("ascii")
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            info.mode = 0o600
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            info.mtime = now
+            tar.addfile(info, io.BytesIO(body))
+    return data.getvalue()
 
 
 class DockerReloader:
@@ -175,27 +285,36 @@ class DockerReloader:
         except docker.errors.DockerException as e:
             raise ReloadError(f"Docker: {e}") from e
 
-    def fabric(self, m_key=None, sa_key=None):
+    def fabric(self, m_key=None, sa_key=None, switches=None):
         """Ask the fabric, from OpenSM's container, for its switches and the
-        subnet managers its SA knows"""
+        subnet managers its SA knows
+
+        switches, a set of switch node GUIDs, is given instead when the
+        prober has found them: with per-port keys, ibswitches -y <m_key>
+        can't reach a re-keyed port.
+        """
         try:
             container = self.client.containers.get(self.container_name)
             if container.status != "running":
                 raise ReloadError(
                     f"OpenSM container {self.container_name} isn't running"
                 )
-            m_key_args = ["-y", m_key] if m_key else []
-            switches = self._exec(container, ["ibswitches", *m_key_args])
+            if switches is None:
+                m_key_args = ["-y", m_key] if m_key else []
+                listed = self._exec(container, ["ibswitches", *m_key_args])
             sm_records = self._exec(
                 container, ["saquery", *(["--smkey", sa_key] if sa_key else []), "SMIR"]
             )
             ports = self._exec(container, ["ibstat", "-p"])
         except docker.errors.DockerException as e:
             raise ReloadError(f"Docker: {e}") from e
-        switch_guids = {
-            int(g, 16)
-            for g in re.findall(r"^Switch\s*:\s*0x([0-9a-fA-F]+)", switches, re.M)
-        }
+        if switches is None:
+            switch_guids = {
+                int(g, 16)
+                for g in re.findall(r"^Switch\s*:\s*0x([0-9a-fA-F]+)", listed, re.M)
+            }
+        else:
+            switch_guids = set(switches)
         sms = [
             (int(guid, 16), int(state))
             for guid, state in re.findall(
@@ -214,7 +333,9 @@ class DockerReloader:
         code, output = container.exec_run(command)
         output = output.decode(errors="replace")
         if code != 0:
-            raise ReloadError(f"{command[0]} failed: {output.strip()[:200]}")
+            # saquery's SMInfo records hold SM_Keys.
+            shown = " / ".join(_shown(line) for line in output.strip().splitlines())
+            raise ReloadError(f"{command[0]} failed: {shown[:200]}")
         return output
 
     @staticmethod
@@ -239,16 +360,16 @@ class DockerReloader:
                     raise _rejected(line)
                 if _is_partitions_error(line):
                     raise ReloadError(
-                        f"OpenSM couldn't read the partitions file: {line.strip()}"
+                        f"OpenSM couldn't read the partitions file: {_shown(line)}"
                     )
                 if started:
-                    _note_pkey_error(report, line)
+                    _note(report, line)
                 if HUP_MARKER in line:
                     handled = True
                 elif handled and any(m in line for m in SWEEP_START_MARKERS):
                     started = True
                 elif started and any(m in line for m in DONE_MARKERS):
-                    LOG.debug("OpenSM: %s", line.strip(" *"))
+                    LOG.debug("OpenSM: %s", _shown(line.strip(" *")))
                     return report
             time.sleep(POLL_INTERVAL)
         raise ReloadError(
@@ -265,6 +386,10 @@ class ManagedDocker(DockerReloader):
     policy, since the manager decides when it starts.
     """
 
+    # Whether start() pulls a missing image. Not in HA mode, where a start
+    # mustn't wait on a registry while it holds the lease.
+    pulls_on_start = True
+
     def __init__(self, config, client=None):
         super().__init__(config.container, config.sweep_timeout, client)
         self.config = config
@@ -278,7 +403,6 @@ class ManagedDocker(DockerReloader):
             # After the image's own -F, so that this one is used
             "command": ["-F", f"{opensm_conf.CONTAINER_CONFIG_DIR}/opensm.conf"],
             "name": config.container,
-            "detach": True,
             "network_mode": "host",
             "privileged": True,
             "read_only": True,
@@ -351,22 +475,39 @@ class ManagedDocker(DockerReloader):
         with contextlib.suppress(docker.errors.NotFound):
             self.client.containers.get(self.container_name).remove(force=True)
 
-    def start(self):
-        """Start OpenSM, with its files already written"""
+    def start(self, prepare=None):
+        """Start OpenSM, with its files already written
+
+        The container is created; then prepare(container), if given, may
+        read and write OpenSM's cache in its volume before OpenSM starts
+        (read_cache, write_cache, and the helper prober); then it's started.
+        Creating a container never pulls its image, as running one did, so
+        a single-node start pulls a missing one first: nothing else there
+        would bring back an image that was pruned while the manager ran.
+        """
         try:
+            if self.pulls_on_start:
+                self.ensure_image()
             # A container left by an earlier manager has stopped, since it
             # was in that manager's PID namespace, but its name is taken.
             self._remove()
-            container = self.client.containers.run(**self._run_kwargs())
+            container = self.client.containers.create(**self._run_kwargs())
+            if prepare is not None:
+                prepare(container)
+            container.start()
             LOG.info("Started OpenSM container %s", self.container_name)
             return self._wait_for_start(container)
         except (docker.errors.DockerException, ReloadError) as e:
             # An OpenSM that didn't start properly, for example one that
-            # rejected part of its partitions file, mustn't keep running.
+            # rejected part of its partitions file, mustn't keep running,
+            # and one whose cache wasn't prepared mustn't start.
             self.stop()
             if isinstance(e, ReloadError):
                 raise
             raise ReloadError(f"Docker: {e}") from e
+        except Exception:
+            self.stop()
+            raise
 
     def _wait_for_start(self, container):
         """Wait for OpenSM's first sweep as master, which reads the
@@ -376,29 +517,160 @@ class ManagedDocker(DockerReloader):
             lines = self._log(container)
             report = SweepReport()
             for line in lines:
-                _note_pkey_error(report, line)
+                _note(report, line)
                 if "PARSE ERROR" in line:
                     raise _rejected(line)
                 if _is_partitions_error(line):
                     raise ReloadError(
-                        f"OpenSM couldn't read the partitions file: {line.strip()}"
+                        f"OpenSM couldn't read the partitions file: {_shown(line)}"
                     )
                 if STANDBY_MARKER in line:
                     raise ReloadError(
                         "OpenSM entered STANDBY: another subnet manager is master"
                     )
                 if any(m in line for m in STARTED_MARKERS):
-                    LOG.info("OpenSM: %s", line.strip(" *"))
+                    LOG.info("OpenSM: %s", _shown(line.strip(" *")))
                     return report
             container.reload()
             if container.status not in ("created", "running"):
-                raise ReloadError(
-                    f"OpenSM exited while starting: {' / '.join(lines[-5:])}"
-                )
+                shown = [_mask_keys(line.strip()) for line in lines]
+                last = [line for line in shown if line is not None][-5:]
+                raise ReloadError(f"OpenSM exited while starting: {' / '.join(last)}")
             time.sleep(POLL_INTERVAL)
         raise ReloadError(
             f"OpenSM didn't start within {self.config.start_timeout} seconds"
         )
+
+    # OpenSM's cache and the prober (specs/secured-profile.md, Per-port
+    # M_Keys). guid2mkey and the prober's environment hold keys, so none of
+    # what they carry is logged or put into an exception.
+
+    def read_cache(self, container=None):
+        """neighbors and guid2mkey from OpenSM's cache, as {name: (text,
+        modification time)}, the time an aware UTC datetime
+
+        A file that doesn't exist is absent. get_archive works on a created
+        container, before OpenSM starts, and on a running one; container is
+        OpenSM's by default.
+        """
+        try:
+            if container is None:
+                container = self.client.containers.get(self.container_name)
+            files = {}
+            for name in CACHE_FILES:
+                try:
+                    stream, _stat = container.get_archive(f"{OPENSM_CACHE_DIR}/{name}")
+                    data = b"".join(stream)
+                except docker.errors.NotFound:
+                    continue
+                files[name] = _untar(data, name)
+            return files
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't read OpenSM's cache: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't read OpenSM's cache: {type(e).__name__}"
+            ) from e
+
+    def write_cache(self, container, files):
+        """Replace files of OpenSM's cache in a created container's volume
+        with these, {name: text}, each root's and mode 0600"""
+        data = _tar(files)
+        try:
+            written = container.put_archive(OPENSM_CACHE_DIR, data)
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't write OpenSM's cache: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't write OpenSM's cache: {type(e).__name__}"
+            ) from e
+        if not written:
+            raise ReloadError("Docker didn't write OpenSM's cache")
+
+    def prober(self, helper=False, timeout=PROBE_TIMEOUT, parallel=PROBE_PARALLEL):
+        """A runner for prober.verify: run(gets) -> (own_guids, answers),
+        one batch of Gets in parallel, which raises ReloadError (ProbeError
+        for what the script did) if it fails
+
+        By default the script runs in the running OpenSM's container; with
+        helper, in a container of its own from OpenSM's image, as before a
+        start, when no OpenSM runs. The Gets and their keys travel in the
+        script's environment, never its command line.
+        """
+
+        def run(gets):
+            environment = probes.environment(gets, timeout, parallel)
+            if helper:
+                # Each Get may take the timeout, a batch of them at a time
+                batches = -(-len(gets) // parallel)
+                wait = batches * (timeout + 2) + 30
+                code, output = self._probe_in_helper(environment, wait)
+            else:
+                code, output = self._probe_in_opensm(environment)
+            if code != 0:
+                raise probes.ProbeError(f"the prober exited with status {code}")
+            try:
+                text = output.decode("ascii")
+            except (AttributeError, UnicodeDecodeError):
+                raise probes.ProbeError("the prober's output isn't text") from None
+            return probes.parse(text, gets)
+
+        return run
+
+    def _probe_in_opensm(self, environment):
+        try:
+            container = self.client.containers.get(self.container_name)
+            if container.status != "running":
+                raise ReloadError(
+                    f"OpenSM container {self.container_name} isn't running"
+                )
+            return container.exec_run(
+                ["sh", "-c", probes.SCRIPT],
+                environment=environment,
+                stdout=True,
+                stderr=False,
+            )
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't run the prober: {e}") from e
+
+    def _probe_in_helper(self, environment, wait):
+        # Created, not run: containers.run() would pull a missing image, and
+        # a start mustn't wait on a registry.
+        try:
+            present = self.has_image()
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: {e}") from e
+        if not present:
+            raise ReloadError(f"OpenSM's image {self.config.image} isn't on this host")
+        container = None
+        try:
+            container = self.client.containers.create(
+                image=self.config.image,
+                entrypoint=["sh", "-c"],
+                command=[probes.SCRIPT],
+                environment=environment,
+                network_mode="host",
+                privileged=True,
+            )
+            container.start()
+            code = container.wait(timeout=wait)["StatusCode"]
+            return code, container.logs(stdout=True, stderr=False)
+        except (
+            docker.errors.DockerException,
+            requests.exceptions.RequestException,
+        ) as e:
+            raise ReloadError(
+                f"Docker: can't run the prober: {type(e).__name__}"
+            ) from e
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except (
+                    docker.errors.DockerException,
+                    requests.exceptions.RequestException,
+                ) as e:
+                    LOG.warning("Can't remove the prober's container: %s", e)
 
     def running(self):
         try:

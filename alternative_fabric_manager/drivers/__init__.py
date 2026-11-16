@@ -19,8 +19,13 @@ A driver has:
 - running(): whether OpenSM is still running;
 - reload(): make OpenSM apply the partitions file, and return a SweepReport
   once it has; raise PartitionsRejected if it couldn't parse it;
-- fabric(): return a Fabric, or None if there is no fabric to check;
+- fabric(): return a Fabric, or None if there is no fabric to check; given
+  switches, the switch GUIDs the prober found, it doesn't look for them;
 - stop(): stop OpenSM, if the driver started it.
+
+The managed driver's start() also takes prepare, called with the created
+container before OpenSM starts in it, and it has read_cache(),
+write_cache() and prober() for per-port M_Keys (specs/secured-profile.md).
 """
 
 
@@ -44,7 +49,15 @@ class SweepReport:
     """What OpenSM reported, while applying a partitions file, about ports
     whose pkey tables it couldn't set"""
 
-    def __init__(self, pkey_errors=(), enforcement_errors=(), unattributed=False):
+    def __init__(
+        self,
+        pkey_errors=(),
+        enforcement_errors=(),
+        unattributed=False,
+        dr_errors=False,
+        unreached=(),
+        bad_m_key_traps=0,
+    ):
         # Port GUIDs, as ints
         self.pkey_errors = set(pkey_errors)
         # Whether some pkey error named no port GUID
@@ -52,6 +65,15 @@ class SweepReport:
         # Switch ports whose partition enforcement OpenSM cleared, as
         # "<switch GUID>:<port>", or UNATTRIBUTED
         self.enforcement_errors = set(enforcement_errors)
+        # Whether a directed-route SMP failed to send (ERR 5411), which
+        # names no port
+        self.dr_errors = dr_errors
+        # The dest_guids of NodeInfo and PortInfo Gets that failed (ERR
+        # 3113), as ints, 0 included
+        self.unreached = set(unreached)
+        # How many Bad M_Key traps OpenSM received: only counted, since its
+        # log of one holds the key that was sent
+        self.bad_m_key_traps = bad_m_key_traps
 
 
 class Fabric:
@@ -77,7 +99,7 @@ class NoOpenSM:
     def reload(self):
         return SweepReport()
 
-    def fabric(self, m_key=None, sa_key=None):
+    def fabric(self, m_key=None, sa_key=None, switches=None):
         return None
 
     def stop(self):

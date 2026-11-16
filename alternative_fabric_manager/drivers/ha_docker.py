@@ -121,12 +121,16 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             os.path.join(inside, "opensm.conf"): self.config.opensm_conf_file,
         }
 
+    pulls_on_start = False
+
     def start(self):
         # A reach probed before the image went, or a frozen node's restart,
-        # mustn't make containers.run() pull it: the start would wait on the
-        # registry, holding the lease (see specs/ha.md, Timeouts). Failing
-        # instead, a takeover steps down for another candidate, and a frozen
-        # node retries once keep_image() has pulled it.
+        # mustn't pull it: the start would wait on the registry, holding the
+        # lease (see specs/ha.md, Timeouts). Creating the container doesn't
+        # pull, but this check also stops the node being eligible on a
+        # cached reach. Failing instead, a takeover steps down for another
+        # candidate, and a frozen node retries once keep_image() has pulled
+        # it.
         try:
             present = self.has_image()
         except docker.errors.DockerException as e:

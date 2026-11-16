@@ -23,6 +23,9 @@ class Container:
     def reload(self):
         pass
 
+    def start(self):
+        self.status = "running"
+
     def kill(self, **_kwargs):
         self.killed = True
 
@@ -46,7 +49,9 @@ class Client:
     def __init__(self, probe=b""):
         self.containers = self
         self.existing = None
+        # The reach probe's containers, and OpenSM's
         self.runs = []
+        self.created = []
         self.probe = probe
         self.images = Images()
         self.api = self.images
@@ -58,9 +63,12 @@ class Client:
 
     def run(self, **kwargs):
         self.runs.append(kwargs)
-        if kwargs.get("remove"):
-            return self.probe
-        self.existing = Container()
+        assert kwargs.get("remove")
+        return self.probe
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        self.existing = Container(status="created")
         return self.existing
 
 
@@ -81,7 +89,8 @@ def test_opensm_runs_under_the_watchdog_with_a_start_request(driver, config):
     driver.prepare("u", 3, 1e12)
     driver.write_lease("u", 3, 1e12)
     driver.start()
-    run = driver.client.runs[-1]
+    (run,) = driver.client.created
+    assert driver.client.existing.status == "running"
     assert run["entrypoint"][:2] == ["python3", f"{config.ha_state_dir}/watchdog.py"]
     assert run["command"][0] == "/start.sh"
     assert f"{config.ha_state_dir}:{config.ha_state_dir}" in run["volumes"]
@@ -254,5 +263,6 @@ def test_start_fails_rather_than_pull_a_missing_image(driver):
     with pytest.raises(ha_docker.docker_driver.ReloadError, match="isn't on this node"):
         driver.start()
     assert len(driver.client.runs) == probes
+    assert driver.client.created == []
     # Not eligible again on the reach cached before the image went
     assert driver.reach() is None
