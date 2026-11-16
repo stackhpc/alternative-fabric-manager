@@ -1,6 +1,6 @@
 # The secured cloud profile
 
-Status: proposed, 2026-11-13.
+Status: accepted 2026-11-13; implementation in progress (see Implementation plan).
 
 UFM's Secured Cloud Profile (`cloud_profile = 2` in UFM Enterprise 6.26)
 is NVIDIA's list of protections for a fabric that bare metal tenants share.
@@ -8,7 +8,8 @@ AFM's hardening (docs/opensm-hardening.md) already covers most of it. This
 spec adds the rest that OpenSM 5.17 can do, as new hardening groups, and
 says why the remaining items are left out.
 
-The new groups are opt-in and stay out of `all` (see Choosing the groups).
+Each new group joins `all`, the default, once its hardware tests pass, and
+can be removed with `-group` (see Choosing the groups).
 Each one waits for hardware tests whose outcomes decide parts of its
 design.
 
@@ -300,15 +301,23 @@ A new hardening group, `class_keys`, sets:
 ```
 vs_key_enable 2
 vs_key_ci_protect_bits 1
-vs_key_lease_period 0
+vs_key_lease_period <key_lease_period>
 cc_key_enable 2
 cc_key_protect_bit 1
-cc_key_lease_period 0
+cc_key_lease_period <key_lease_period>
 n2n_key_enable 2
 n2n_key_protect_bit 1
-n2n_key_lease_period 0
+n2n_key_lease_period <key_lease_period>
 key_mgr_seed <stored>
 ```
+
+The leases are `[opensm] key_lease_period` (see Leases). Hardware that
+doesn't support a class answers its KeyInfo with status `0xc`, which OpenSM
+logs as `ERR 9828` at every sweep: on the test fabric, CC and N2N keys
+weren't supported (see Results). The group doesn't treat `9828` as a
+failure, or it would fail on such hardware. It doesn't silently overstate
+itself either: the manager logs, once per start, which classes the ports
+rejected, so the operator knows that only VS keys protect those ports.
 
 ### The seed
 
@@ -337,24 +346,61 @@ is keyed:
   so adding it to `KEYS` doesn't change every node's hash.
 - `--show-keys` prints it. AGENTS.md's rule never to print OpenSM's keys
   covers it.
-- An `[opensm_conf] key_mgr_seed` override that is `0`, or differs from the
-  stored seed, is refused, as ha.md refuses keys other than the stored ones.
+- An `[opensm_conf] key_mgr_seed` override must be a non-zero 64-bit
+  value, in hexadecimal or decimal without leading zeros: spellings that
+  Python and OpenSM read alike. When no seed is stored yet, a valid
+  override is stored as the seed rather than a random one, since ports may
+  already be keyed with it, set by hand. Otherwise an override that differs
+  from the stored seed is refused, as ha.md refuses keys other than the
+  stored ones. An equal override is written as the stored value, never in
+  the operator's spelling.
+- `keys()` stores the seed too, as `--show-keys` and rendering call it, so
+  the class_keys step must record whether a start stored it, for the rule
+  above.
 
 OpenSM also caches class keys per port (`guid2vskey`, `guid2cckey`,
 `guid2_n2n_key`, beside `guid2mkey`) in `/var/cache/opensm`. If those
-caches, rather than the seed, decide a port's key, a database backup isn't
-enough, even on a single node. Hardware test 3 checks that an OpenSM with
-an empty cache and only the seed manages ports that another OpenSM keyed.
-Until it passes, the group is refused in single-node and HA modes.
+caches, rather than the seed, decided a port's key, a database backup
+wouldn't be enough, even on a single node. Hardware test 3's first run
+found that, on the same host, they don't for VS keys: an OpenSM restarted
+with the class key caches moved aside derived the same keys from the seed
+(see Results). That rules out the class key caches, not a derivation that
+also uses the SM's own port GUID or other local state, which is what an HA
+takeover by another host would expose. The second-host run decides HA.
+CC and N2N keys are still unverified, because the test fabric doesn't
+support them. Until the rest of test 3 passes, the group is refused in
+single-node and HA modes.
+
+A port keyed with another seed wasn't shown to recover while OpenSM ran.
+With a changed seed, OpenSM wrote its own derived keys to the cache, and its
+KeyInfo Gets to the switch timed out for more than five minutes despite a
+60 s lease. The switch answered unkeyed queries again after OpenSM had been
+stopped for three minutes. The cause isn't established, since the same
+timeouts also appeared with the right seed (see Results, Not explained
+yet). Either way, the seed rules above are the safe path: don't count on a
+running OpenSM to recover from a changed or lost seed.
 
 ### Leases
 
-The leases are 0 for the same reason as the M_Key's (see
-docs/opensm-hardening.md, The lease). AFM stops OpenSM during restarts and
-takeovers, and a lease that ran out while no SM ran would let a host clear
-a port's protection. Hardware test 3 checks that a lease of 0 means "never
-expires" for these classes, as it does for the M_Key. If it doesn't, the
-group uses the longest lease OpenSM accepts, and the doc says so.
+The leases follow `[opensm] key_lease_period`, like the M_Key's: one option
+sets every key lease the manager writes, 0 (permanent) by default, so that
+an operator opts out of permanent keys in one line (see
+docs/opensm-hardening.md, Permanent keys). The default is 0 for the same
+reason as the M_Key's (see docs/opensm-hardening.md, The lease): AFM stops
+OpenSM during restarts and takeovers, and a lease that ran out while no SM
+ran would let a host clear a port's protection. Hardware test 3 checks that
+a lease of 0 means "never expires" for these classes, as it does for the
+M_Key. If it doesn't, the default for these classes is the longest lease
+OpenSM accepts, and the doc says so.
+
+The cost of a lease of 0 is recovery. In the first run, ports keyed with a
+lost seed answered again after OpenSM had been stopped for longer than the
+60 s lease. Whether the lease or something else did it isn't established
+(see Results). With a lease of 0 the ports are expected to stay keyed until
+a power cycle clears them, which test 3 also checks. The default stays 0,
+the same choice made for the M_Key. An operator who prefers recovery sets
+`key_lease_period` and accepts the window. That is a policy choice the
+option makes, not something a test decides.
 
 ### Turning the keys off, and downgrades
 
@@ -362,7 +408,9 @@ Ports keep their keys until an SM that has them changes them. To turn a
 class off:
 
 1. Set `<class>_key_enable 1` (Disable) in `[opensm_conf]`, and restart.
-   OpenSM then clears the keys from the ports.
+   OpenSM then clears the keys from the ports. This needs the seed the
+   ports were keyed with: OpenSM reaches a port only with the key it
+   derives.
 2. Check that it has finished, as hardware test 3 establishes.
 3. Only then drop `class_keys`.
 
@@ -375,10 +423,24 @@ hardening doc's downgrade section, require step 1 before any downgrade.
 
 In-band tools that send VS MADs, such as `mlxlink`, `mlxreg`, in-band
 `flint`, `ibdiagnet`, and in-band switch firmware upgrades, need the VS key.
-Which of them can take it, and how, is an open question. The doc's
-Diagnostics section will list them once it's answered. AFM itself sends
-only SMPs and SA requests, so its fabric check, reach probe and fence ask
-are unaffected.
+`mlxlink` also sends SMPs, so it needs the M_Key as well, whatever the VS
+keys (see Results).
+
+An unkeyed `vendstat -N` (General Info) answered with
+`vs_key_ci_protect_bits 1`. Whether that is because General Info is
+unprotected, or because the VS keys weren't enforced at all, the first run
+can't tell.
+
+`mlxlink` has no key option. `ibdiagnet` takes `--vs_key_file`, pointed at
+OpenSM's `guid2vskey`, but in the test it couldn't open the adapter from
+OpenSM's container while OpenSM ran. Using it makes OpenSM's cache,
+`/var/cache/opensm`, a secret that operators handle, so the hardening doc's
+list of where keys live gains it when `class_keys` lands. Which tools can
+take the key, and how, is still an open question. The doc's Diagnostics
+section will list them once it's answered.
+
+AFM itself sends only SMPs and SA requests, so its fabric check, reach
+probe and fence ask are unaffected.
 
 ## SA request rate
 
@@ -438,18 +500,45 @@ seed must be backed up before any port is keyed.
 
 ## Choosing the groups
 
-`all` keeps meaning the six groups it has today. The new groups are named
-beside it, for example `hardening = all, allowed_sm`. `Config.validate`
-accepts `all` together with named groups, but still refuses `none` with
-anything else. So an upgrade never turns on a new group by itself, and
-each one is a deliberate choice that whoever shares the fabric has agreed
-to, as AGENTS.md requires.
+Everything is hardened by default, and an operator opts out of what their
+fabric can't take, by name: `hardening = -class_keys` hardens everything
+but the class keys. (An earlier version of this spec kept new groups out of
+`all` for good. The user chose hardening by default, with an easy opt-out,
+instead.)
 
-- `allowed_sm` and `sa_rate` leave no state on ports. Whether either
-  should later join `all`, with an upgrade that asks for an explicit
-  acknowledgement, is decided after deployments have used them.
-- `class_keys` stays out of `all` for good, because it leaves keys on every
-  port that only its seed can remove.
+- **While a group is untested,** it is in `HARDENING_GROUPS` but not
+  `ALL_HARDENING_GROUPS`. It can be chosen only by naming it beside `all`,
+  for example `hardening = all, allowed_sm`. Each new group waits for its
+  hardware tests (see Hardware tests), so until then it is experimental.
+- **Before a group exists,** its options can be tried by hand in
+  `[opensm_conf]`, without the checks the group will add.
+  docs/opensm-hardening.md, Experimental hardening, documents them as
+  additional hardening that isn't on by default, with their risks.
+- **Once its tests pass,** it joins `all`. The release that adds it is
+  fabric-affecting: its notes name the group, what it changes on the fabric,
+  and how to opt out with `-group`. In HA mode the change needs an epoch,
+  like any fabric-affecting change. The opt-out can only be written with the
+  upgrade itself, since the older release refuses `-newgroup` as unknown, and
+  a rollback must remove it again. On a fabric that others share, whoever
+  shares it agrees before the upgrade, or the deployment uses an explicit
+  list of groups, which no upgrade widens. AGENTS.md's rule on agreeing the
+  hardening, and the deploy-host skill, cover such an upgrade, as well as
+  a change to `[opensm] hardening`.
+- **A group that leaves state on ports** (`class_keys`) needs a mechanical
+  guard, not only release notes: the first start in which `all` gains it is
+  refused until the operator names it or removes it explicitly. That's
+  designed when the first such group is implemented.
+- **`class_keys` leaves keys on every port,** which only its seed can
+  remove. Before it joins `all`, the seed must have been in backups for a
+  release (see The seed), and the hardening doc must give the procedure
+  for turning it off.
+
+`[opensm] hardening` grammar: groups, `all`, and `-group`, separated by
+commas, or `none` alone. A list of removals alone starts from `all`.
+`Config.validate` refuses a list it can't read one way only: unknown
+groups (a misspelt removal would leave the group on), a group both named
+and removed, removals beside groups without `all`, and `none` with
+anything else. HA mode refuses removing `m_key` or `sm_key`.
 
 ## Changes to specs/ha.md
 
@@ -468,6 +557,9 @@ These go into specs/ha.md before the HA code changes:
 - **Configuration:** `opensm.conf` includes `allowed_sm_guids`, generated
   from the node rows. An override is part of the configuration hash; the
   generated list isn't. `applied` records the running list.
+  `key_lease_period` is in the hash, as fabric-affecting (already made in
+  ha.md). A lease no longer than a takeover's longest is warned about, not
+  refused, so that a test fabric can use a short one.
 - **Job completion, fabric checks:** `ERR 0F09` naming a known SM port
   fails the check and contests the fabric, until a direct query shows
   NOT-ACTIVE or IsSM clear. Naming another port, it raises the unknown-SM
@@ -553,19 +645,95 @@ says which design choice its outcome decides.
 
    *Decides:* whether `sa_rate` is added, and its value.
 
+### Results
+
+**Test 3, first run, 2026-11-13.** On the DevStack host's fabric, which its
+owner confirmed nobody else used during the test: one switch (LID 5) with
+its embedded CA (LID 8), this host's single physical port, and five other
+adapters. Hosts and switch run OpenSM
+5.17.2.MLNX20240610. With no second host, a restart of the same OpenSM
+stood in for a takeover. The leases were 60 s, not 0. Everything was
+reverted afterwards, and `afm.conf`, `opensm.conf` and the cache's file
+set matched the backup.
+
+- **Keys set:** with `vs_key_enable 2` and a seed, OpenSM wrote a VS key
+  for every port to `guid2vskey`.
+- **CC and N2N keys aren't supported here:** the switch and adapters
+  answer KeyInfo with status `0xc` (method or attribute not supported),
+  logged as `ERR 9828` at every sweep. The CC and N2N caches stayed empty.
+  `class_keys` must not treat `9828` as a failure, or it fails on such
+  hardware.
+- **Whether VS keys block unkeyed access wasn't shown.** The run used
+  unkeyed `mlxlink` as its probe, but `mlxlink` reads the device ID with an
+  SMP first, which the M_Key (protection level 2) refuses without the key.
+  Its failures, before and during the keyed runs, were the M_Key's doing.
+  Its successes after the quiet three minutes were the M_Key's protection
+  lapsing (see the next bullet). So nothing in this run shows VS key
+  protection working, or `enable 1` clearing it. The next run needs a VS
+  probe that sends no SMP, or `mlxlink` given the M_Key, and must verify
+  Turning the keys off, step 1. An unkeyed `vendstat -N` (General Info),
+  which sends VS MADs only, answered throughout, with and without VS keys.
+- **The M_Key lease lapsed, as Permanent keys warns.** The fabric ran with
+  `m_key_lease_period 60`. Unkeyed `mlxlink` probes, which send unkeyed
+  SMPs, started the switch's and its CA's countdowns. Three minutes with
+  no SM then dropped their protection, and unkeyed SMPs to them answered,
+  which at that level returns the M_Key, for some minutes after OpenSM
+  started again. They were protected again within half an hour. The fabric
+  had no other users, but this is the exposure
+  docs/opensm-hardening.md, Permanent keys, describes, happening in
+  practice. When a running OpenSM puts back a port's lapsed protection
+  isn't known: the next run should record it.
+- **The seed alone decides VS keys, on one host:** after moving the class
+  key caches aside, OpenSM derived identical keys (the same hash over the
+  8 ports: the switch, its CA and six adapters, this host's included),
+  and logged no key errors other than `9828`. `guid2mkey` and the rest of
+  the cache stayed.
+- **A changed seed didn't recover while OpenSM ran:** with a new seed,
+  OpenSM wrote new keys to its cache. KeyInfo Gets to the switch and its CA
+  then timed out every 10 s (`ERR 980B`, `ERR 5410`, class `0xa`, attribute
+  `0xf`), for more than five minutes, despite the 60 s lease. No VS probe
+  that avoids the M_Key was tried during those minutes, so whether the
+  ports kept their VS keys isn't known.
+- **Not explained yet:** the same timeouts also appeared on a restart with
+  the original seed. That restart followed unkeyed `mlxlink` probes of
+  the switch. They continued with `vs_key_enable 1`, and stopped only with
+  enable back at its default, when OpenSM sends no KeyInfo at all. The
+  rest of test 3 retests this with a probe-free run.
+
+After the run, OpenSM, with no class key options, logged no errors, and
+every physical port refused unkeyed SMPs and answered keyed ones: M_Key
+protection was back. Whether any port still holds a VS key from the test
+seeds isn't known, since no probe that shows it worked. If one does, it
+holds it with a 60 s lease, which is expected to run out after a
+wrong-keyed VS MAD and a minute with none, if class key leases behave like
+the M_Key's. That isn't shown.
+
+Still to run for test 3:
+- a lease of 0, which must verify that `enable 1` clears the keys;
+- unkeyed queries during a wrong-seed run, and a run with no unkeyed probes;
+- whether a power cycle clears class keys;
+- the stale-cache leg;
+- a keyed query by a tool that works while OpenSM runs;
+- a second host;
+- CC and N2N keys on hardware that supports them.
+
 ## Implementation plan
 
-- [ ] `key_mgr_seed` in `KEYS`, generated at startup, in `--show-keys`;
+- [x] `key_mgr_seed` in `KEYS`, generated at startup, in `--show-keys`;
       refuse a zero or changed override. Ship this a release before
       `class_keys`.
-- [ ] `all` with named extras in `Config.validate`.
+- [x] `all` with named extras in `Config.validate`.
+- [x] `-group` removals from `all`.
+- [ ] Each group joins `ALL_HARDENING_GROUPS` once its hardware tests
+      pass, with release notes.
 - [ ] Hardware tests 1 and 2. Then `allowed_sm` for single node, with the
       physical-port probe, override checks, `ERR 7549` as a failed start,
       the lock-out checks, the `0F09` rules, and the commands to record
       and drop known SM ports.
 - [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
       `allowed_sm` in HA mode, once its dependencies are in.
-- [ ] Hardware test 3. Then `class_keys`, with its downgrade procedure.
+- [ ] Hardware test 3 (first run done, see Results). Then `class_keys`,
+      with its downgrade procedure.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
 - [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
       downgrade procedure.

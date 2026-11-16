@@ -50,10 +50,24 @@ host_config_dir = /etc/opensm
 partitions_template =
 # The groups of hardened OpenSM options, from docs/opensm-hardening.md, to
 # write into opensm.conf, separated by commas: m_key, sm_key, sa_key,
-# sa_trust, enforcement, babbling_ports; or all, or none. For example
-# "m_key, enforcement" for M_Key protection only. [opensm_conf] overrides any
-# single option.
+# sa_trust, enforcement, babbling_ports; all; -group to remove one from all;
+# or none. all, the default, hardens everything; "-sa_trust" hardens
+# everything but sa_trust; "m_key, enforcement" hardens only those. A new
+# group joins all once tested, and an upgrade then turns it on: read the
+# release notes, and remove it with -group if needed. [opensm_conf]
+# overrides any single option.
 hardening = all
+# The lease, in seconds, of every key the manager sets on ports: the M_Key,
+# and the class keys once a group sets them. 0, the default, makes them
+# permanent: a port never drops its protection, and a port whose key is lost
+# stays locked until it's power-cycled. Up to 65535 opts out: a port drops
+# its protection once no subnet manager has reached it for that long. Any
+# tenant can then read the M_Key, which is shared by every port and can't be
+# rotated yet, so an outage longer than the lease compromises the fabric for
+# good. Use minutes, longer than any restart or takeover; 60 suits only a
+# test fabric. The same on every node in HA mode. See
+# docs/opensm-hardening.md, Permanent keys.
+key_lease_period = 0
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5
@@ -82,6 +96,8 @@ ipoib_sl = 0
 [opensm_conf]
 # opensm.conf options for the managed driver, as "key = value". These win
 # over the hardened options. OpenSM uses its defaults for the others.
-# partition_config_file and daemon are set by the manager.
+# partition_config_file and daemon are set by the manager. Experimental
+# hardening that isn't on by default (allowed SMs, class keys, an SA rate
+# limit) is tried here: see docs/opensm-hardening.md, Experimental hardening.
 #sm_priority = 15
 #log_flags = 0x07

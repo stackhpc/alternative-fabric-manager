@@ -17,6 +17,7 @@ import configparser
 import dataclasses
 import logging
 import os
+import re
 import socket
 
 # Every port is only a limited member of the default partition, so that ports
@@ -30,8 +31,11 @@ DEFAULT_VOLUMES = (
     "opensm_cache:/var/cache/opensm"
 )
 DRIVERS = ("managed", "docker", "none")
-# The hardening groups of opensm_conf.HARDENING
-HARDENING_GROUPS = (
+# The hardening groups that all means, the default: harden everything, and
+# opt out of a group by name, with -group. A new group joins all once its
+# hardware tests pass (specs/secured-profile.md, Choosing the groups); until
+# then it is in HARDENING_GROUPS only, chosen by naming it beside all.
+ALL_HARDENING_GROUPS = (
     "m_key",
     "sm_key",
     "sa_key",
@@ -39,6 +43,8 @@ HARDENING_GROUPS = (
     "enforcement",
     "babbling_ports",
 )
+# The hardening groups of opensm_conf.HARDENING: all's, then any outside it
+HARDENING_GROUPS = ALL_HARDENING_GROUPS
 # opensm.conf keys that the manager sets, which overrides can't change: the
 # manager depends on OpenSM reading its partitions file, staying in the
 # foreground, logging to its container's output, and enforcing partitions.
@@ -181,9 +187,19 @@ class Config:
 
     # The groups of hardened OpenSM options of docs/opensm-hardening.md to
     # write into opensm.conf (managed), separated by commas: m_key, sm_key,
-    # sa_key, sa_trust, enforcement, babbling_ports, or all or none.
+    # sa_key, sa_trust, enforcement, babbling_ports; all, the default; -group
+    # to remove one from all ("-sa_trust" alone starts from all); or none,
+    # alone. See parse_hardening.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
+    # The lease, in seconds, of every key the manager sets on ports (the
+    # M_Key, and later the class keys). 0, the default, makes them permanent:
+    # a port never drops its protection. A positive lease lets ports keyed
+    # with a lost key be keyed again, but any outage with no SM longer than
+    # the lease lets a tenant read the fabric's M_Key, for good
+    # (docs/opensm-hardening.md, Permanent keys). [opensm_conf] can still
+    # override a single lease. Fabric-affecting: the same on every HA node.
+    key_lease_period: int = 0
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)
@@ -191,10 +207,7 @@ class Config:
     @property
     def hardening_groups(self):
         """The hardening groups that [opensm] hardening names"""
-        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        if words & set(ALL_HARDENING):
-            return set(HARDENING_GROUPS)
-        return words - set(NO_HARDENING)
+        return parse_hardening(self.hardening)
 
     @property
     def partitions_file(self):
@@ -250,6 +263,8 @@ class Config:
         problems = _ha_problems(self)
         if problems:
             raise ConfigError("[ha] " + "; ".join(problems))
+        for warning in ha_warnings(self):
+            LOG.warning("%s", warning)
 
     def validate(self):
         if not self.token:
@@ -262,19 +277,15 @@ class Config:
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
-        words = {w.strip().lower() for w in self.hardening.split(",") if w.strip()}
-        unknown = words - set(HARDENING_GROUPS) - set(ALL_HARDENING) - set(NO_HARDENING)
-        if unknown:
-            raise ConfigError(
-                f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
-            )
-        if len(words) > 1 and words & (set(ALL_HARDENING) | set(NO_HARDENING)):
-            raise ConfigError(
-                "[opensm] hardening is either all, none, or a list of groups"
-            )
+        parse_hardening(self.hardening)
         for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
+        # The M_Key's lease is a 16-bit field of PortInfo.
+        if not 0 <= self.key_lease_period <= 65535:
+            raise ConfigError(
+                "[opensm] key_lease_period must be 0 (permanent keys) to 65535 s"
+            )
         for name, low, high in (
             ("ipoib_rate", 2, 22),
             ("ipoib_mtu", 1, 5),
@@ -299,6 +310,21 @@ class Config:
                 raise ConfigError(
                     f"[opensm_conf] log_flags must include 0x{REQUIRED_LOG_FLAGS:02x}, "
                     "whose messages the manager watches for"
+                )
+        # With a seed of 0, OpenSM derives the class keys from the M_Key. The
+        # manager also refuses a seed other than the stored one, on start.
+        # Only spellings that Python and OpenSM's parser read alike: no
+        # underscores, signs or octal-looking leading zeros.
+        seed = self.opensm_conf.get("key_mgr_seed")
+        if seed is not None:
+            if not re.fullmatch(r"0[xX][0-9a-fA-F]{1,16}|[1-9][0-9]*", seed):
+                raise ConfigError(
+                    "[opensm_conf] key_mgr_seed must be hexadecimal (0x...) or "
+                    "decimal without leading zeros"
+                )
+            if not 0 < int(seed, 0) < 2**64:
+                raise ConfigError(
+                    "[opensm_conf] key_mgr_seed must be a non-zero 64-bit value"
                 )
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
@@ -334,6 +360,88 @@ def ha_settings(config):
     )
 
 
+def parse_hardening(text):
+    """Return the hardening groups that an [opensm] hardening value names
+
+    It is a list separated by commas of group names, all (or true, yes),
+    and -group to remove a group; or none (or false, no) alone. all is the
+    default, so a list of removals alone, such as "-sa_trust", starts from
+    all. Raises ConfigError for a list that is unclear or contradicts
+    itself, so that what's hardened is never a guess.
+    """
+    words = [w.strip().lower() for w in text.split(",") if w.strip()]
+    if not words:
+        # A blank line, or a template that rendered nothing, mustn't turn
+        # hardening off: none says so explicitly.
+        raise ConfigError(
+            "[opensm] hardening is empty: say all, a list of groups, or none"
+        )
+    removed = {w[1:].strip() for w in words if w.startswith("-")}
+    named = {w for w in words if not w.startswith("-")}
+    known = set(HARDENING_GROUPS)
+    unknown = (named - known - set(ALL_HARDENING) - set(NO_HARDENING)) | (
+        removed - known
+    )
+    if unknown:
+        raise ConfigError(
+            f"[opensm] hardening has unknown groups: {', '.join(sorted(unknown))}"
+        )
+    if named & set(NO_HARDENING) and len(words) > 1:
+        raise ConfigError(
+            "[opensm] hardening is either none alone, or a list of groups, "
+            "which may include all and -group"
+        )
+    if named & removed:
+        raise ConfigError(
+            "[opensm] hardening both names and removes "
+            + ", ".join(sorted(named & removed))
+        )
+    # Removing from a list of groups that doesn't include all is either a
+    # no-op or a mistake: say which groups to keep instead.
+    starts_from_all = bool(named & set(ALL_HARDENING)) or not named
+    if removed and not starts_from_all:
+        raise ConfigError(
+            "[opensm] hardening can remove groups (-group) only from all; "
+            "list the groups to keep instead"
+        )
+    groups = named & known
+    if starts_from_all and not named & set(NO_HARDENING):
+        groups |= set(ALL_HARDENING_GROUPS)
+    return groups - removed
+
+
+def takeover_bound(config):
+    """The longest an HA takeover takes, from the old leader's last apply to
+    the new leader's OpenSM starting: as long as the fabric may go without a
+    subnet manager in an unclean takeover"""
+    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    return (
+        apply_bound
+        + config.lease_timeout
+        + config.ha_period
+        + config.reach_timeout
+        + 5
+        + config.watchdog_timeout
+        + config.start_timeout
+        + 5
+    )
+
+
+def ha_warnings(config):
+    """HA settings that are allowed but weaken the fabric's protection"""
+    warnings = []
+    takeover = takeover_bound(config)
+    if 0 < config.key_lease_period <= takeover:
+        # Not refused, so that a test fabric can use a short lease
+        warnings.append(
+            f"[opensm] key_lease_period is {config.key_lease_period} s, no longer "
+            f"than a takeover's longest, {takeover:.0f} s: any tenant can read "
+            "the M_Key during an unclean takeover (see docs/opensm-hardening.md, "
+            "Permanent keys)"
+        )
+    return warnings
+
+
 def _ha_problems(config):
     """The timing inequalities of specs/ha.md that a configuration breaks"""
     problems = []
@@ -347,17 +455,7 @@ def _ha_problems(config):
             "self_stop_timeout + ha_period + call_timeout must be less than "
             "lease_timeout"
         )
-    apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
-    takeover = (
-        apply_bound
-        + config.lease_timeout
-        + config.ha_period
-        + config.reach_timeout
-        + 5
-        + config.watchdog_timeout
-        + config.start_timeout
-        + 5
-    )
+    takeover = takeover_bound(config)
     if config.job_timeout <= takeover:
         problems.append(
             f"[opensm] job_timeout must exceed {takeover:.0f} s, a takeover's "
@@ -412,6 +510,7 @@ OPTIONS = (
             "host_config_dir",
             "partitions_template",
             "hardening",
+            "key_lease_period",
             "start_timeout",
             "sweep_timeout",
             "check_interval",

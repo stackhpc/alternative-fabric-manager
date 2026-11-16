@@ -1,3 +1,6 @@
+import contextlib
+import io
+
 import pytest
 
 from alternative_fabric_manager import config as config_mod
@@ -59,6 +62,16 @@ def test_missing_file(tmp_path):
         ("false", set()),
         ("m_key", {"m_key"}),
         ("m_key, Enforcement", {"m_key", "enforcement"}),
+        ("all, babbling_ports", set(config_mod.HARDENING_GROUPS)),
+        ("yes, m_key", set(config_mod.HARDENING_GROUPS)),
+        # Removing groups: from all, named or by default
+        ("all, -sa_trust", set(config_mod.HARDENING_GROUPS) - {"sa_trust"}),
+        ("-sa_trust", set(config_mod.HARDENING_GROUPS) - {"sa_trust"}),
+        (
+            "-sa_trust, -SA_KEY",
+            set(config_mod.HARDENING_GROUPS) - {"sa_trust", "sa_key"},
+        ),
+        ("- babbling_ports", set(config_mod.HARDENING_GROUPS) - {"babbling_ports"}),
     ],
 )
 def test_hardening_option(tmp_path, value, groups):
@@ -71,6 +84,60 @@ def test_hardening_option(tmp_path, value, groups):
 def test_unknown_hardening_group(tmp_path):
     with pytest.raises(config_mod.ConfigError, match="mkey"):
         _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = mkey\n")
+
+
+@pytest.mark.parametrize("value", ["all, none", "none, m_key", "no, all"])
+def test_no_hardening_stands_alone(tmp_path, value):
+    with pytest.raises(config_mod.ConfigError, match="either"):
+        _load(tmp_path, f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n")
+
+
+def test_unknown_hardening_group_beside_all(tmp_path):
+    with pytest.raises(config_mod.ConfigError, match="unknown groups: mkey"):
+        _load(tmp_path, "[api]\ntoken = x\n[opensm]\nhardening = all, mkey\n")
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [
+        # A misspelt removal would otherwise leave the group on unnoticed.
+        ("all, -sa_trusts", "unknown groups: sa_trusts"),
+        ("-all", "unknown groups: all"),
+        ("-none", "unknown groups: none"),
+        # Contradictions
+        ("all, sa_trust, -sa_trust", "both names and removes sa_trust"),
+        ("m_key, sm_key, -sa_trust", "only from all"),
+        ("none, -sa_trust", "either"),
+        # A blank value, as a template that rendered nothing gives
+        ("", "empty"),
+        (" , ", "empty"),
+    ],
+)
+def test_unclear_removals_are_refused(tmp_path, value, match):
+    with pytest.raises(config_mod.ConfigError, match=match):
+        _load(tmp_path, f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n")
+
+
+def test_ha_refuses_removing_its_required_keys():
+    # HA mode's Ask and fencing rest on them (specs/ha.md, Required keys).
+    config = config_mod.Config(ha=True, hardening="-m_key")
+    assert any("m_key" in p for p in config_mod._ha_problems(config))
+
+
+def test_hardening_groups_outside_all(tmp_path, monkeypatch):
+    # A group outside all, as later opt-in groups will be, is chosen only by
+    # naming it, so an upgrade never turns it on by itself.
+    six = set(config_mod.HARDENING_GROUPS)
+    monkeypatch.setattr(
+        config_mod, "HARDENING_GROUPS", config_mod.HARDENING_GROUPS + ("seventh",)
+    )
+    for value, groups in (
+        ("all", six),
+        ("all, seventh", six | {"seventh"}),
+        ("seventh, m_key", {"seventh", "m_key"}),
+    ):
+        text = f"[api]\ntoken = x\n[opensm]\nhardening = {value}\n"
+        assert _load(tmp_path, text).hardening_groups == groups
 
 
 def test_managed_opensm_options_cant_be_overridden(tmp_path):
@@ -92,9 +159,50 @@ def test_show_keys(tmp_path, capsys):
         "m_key",
         "sm_key",
         "sa_key",
+        "key_mgr_seed",
     ]
     cli.main(["--config-file", str(path), "--show-keys"])
     assert capsys.readouterr().out == first
+
+
+def _seed_override_conf(tmp_path):
+    # A seed that isn't the one the manager stores: a random seed is stored
+    # first, then the configuration overrides it.
+    from alternative_fabric_manager import cli
+
+    path = tmp_path / "afm.conf"
+    text = (
+        f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
+        f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
+    )
+    path.write_text(text)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["--config-file", str(path), "--show-keys"])
+    path.write_text(text + "[opensm_conf]\nkey_mgr_seed = 0x1\n")
+    return path
+
+
+def test_show_keys_with_a_refused_seed(tmp_path, capsys):
+    # The seed override is refused when OpenSM would start, not when an
+    # operator looks at the keys.
+    from alternative_fabric_manager import cli
+
+    path = _seed_override_conf(tmp_path)
+    cli.main(["--config-file", str(path), "--show-keys"])
+    names = [line.split()[0] for line in capsys.readouterr().out.splitlines()]
+    assert "key_mgr_seed" in names
+
+
+def test_a_refused_seed_stops_a_single_node_start(tmp_path, monkeypatch):
+    from alternative_fabric_manager import cli
+
+    served = []
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *a, **kw: served.append(a))
+    path = _seed_override_conf(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--config-file", str(path)])
+    assert "key_mgr_seed" in str(e.value.code)
+    assert not served
 
 
 @pytest.mark.parametrize(
@@ -102,17 +210,47 @@ def test_show_keys(tmp_path, capsys):
     [
         ("[opensm]\nhardening = none, m_key\n", "either"),
         ("[opensm]\ncheck_interval = 0\n", "positive"),
+        ("[opensm]\nkey_lease_period = -1\n", "key_lease_period"),
+        ("[opensm]\nkey_lease_period = 65536\n", "key_lease_period"),
         ("[opensm]\nipoib_mtu = 6\n", "ipoib_mtu"),
         ("[opensm]\nflat_pkey = 100\n", "flat_pkey"),
         ("[opensm_conf]\npart_enforce = off\n", "part_enforce"),
         ("[opensm_conf]\nlog_flags = 0x01\n", "log_flags"),
         ("[opensm_conf]\nlog_file = /tmp/x\n", "log_file"),
         ("[opensm]\nopensm_args = -P /x\n", "unknown"),
+        ("[opensm_conf]\nkey_mgr_seed = 0\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x0\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = seed\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x12_34\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 010\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = -1\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 0x1ffffffffffffffff\n", "key_mgr_seed"),
+        ("[opensm_conf]\nkey_mgr_seed = 18446744073709551616\n", "key_mgr_seed"),
     ],
 )
 def test_more_invalid(tmp_path, text, match):
     with pytest.raises(config_mod.ConfigError, match=match):
         _load(tmp_path, "[api]\ntoken = x\n" + text)
+
+
+def test_key_lease_period(tmp_path):
+    assert _load(tmp_path, "[api]\ntoken = x\n").key_lease_period == 0
+    config = _load(tmp_path, "[api]\ntoken = x\n[opensm]\nkey_lease_period = 60\n")
+    assert config.key_lease_period == 60
+
+
+@pytest.mark.parametrize("lease, warned", [(0, False), (60, True), (3600, False)])
+def test_a_lease_shorter_than_a_takeover_is_warned_about(lease, warned):
+    # Allowed, for test fabrics, but every unclean takeover is then a lapse.
+    config = config_mod.Config(key_lease_period=lease)
+    assert config_mod.takeover_bound(config) < 3600
+    assert bool(config_mod.ha_warnings(config)) is warned
+
+
+def test_a_seed_override_loads(tmp_path):
+    # Whether it's the stored seed is for the manager to check, on start.
+    config = _load(tmp_path, "[api]\ntoken = x\n[opensm_conf]\nkey_mgr_seed = 0x12\n")
+    assert config.opensm_conf["key_mgr_seed"] == "0x12"
 
 
 def test_hex_and_bool_options(tmp_path):

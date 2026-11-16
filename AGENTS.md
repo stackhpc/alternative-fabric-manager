@@ -92,13 +92,19 @@ Development usually happens on a DevStack host set up as networking-mlnx's
 DevStack guide describes, whose InfiniBand fabric others may share. AFM
 there manages the fabric's OpenSM, so:
 
-- **Never print OpenSM's keys** (M_Key, SM_Key, SA_Key). `--show-keys`
-  prints them; use it only to feed a diagnostic tool, as in
+- **Never print OpenSM's keys** (M_Key, SM_Key, SA_Key, and the
+  `key_mgr_seed` the class keys derive from). `--show-keys` prints them;
+  use it only to feed a diagnostic tool, as in
   `KEY=$(... --show-keys | awk '/^m_key/{print $2}')`, never to display.
-- **Agree the hardening with whoever shares the fabric** before changing
-  `[opensm] hardening`. With M_Key protection on, SMP tools (`ibswitches`,
-  `smpquery`, `ibportstate`) need `-y $KEY`. Never disable switch ports or
-  send SMInfo Sets on a fabric others share.
+- **Agree the hardening with whoever shares the fabric** before anything
+  that changes what OpenSM enforces: changing `[opensm] hardening` or
+  `[opensm] key_lease_period`, setting hardening options by hand in
+  `[opensm_conf]` (the experimental ones in docs/opensm-hardening.md), or
+  deploying a release that adds a group to `all`. A deployment with
+  `all` (or only removals) gains each group its release notes name; one
+  with an explicit list of groups gains none. With M_Key protection on,
+  SMP tools (`ibswitches`, `smpquery`, `ibportstate`) need `-y $KEY`.
+  Never disable switch ports or send SMInfo Sets on a fabric others share.
 - **AFM's database holds the fabric's keys.** Never drop or recreate it;
   back it up before every redeploy (see the `deploy-host` skill).
 - Don't connect to eswitchd on tcp://127.0.0.1:60001 by hand; it exits on

@@ -46,6 +46,41 @@ def test_overrides_win_over_hardening():
     assert "m_key 0x1234" in lines
 
 
+KEYS = {"m_key": "0x1234", "sm_key": "0x5678", "sa_key": "0x9abc"}
+
+
+def test_keys_are_permanent_by_default():
+    lines = opensm_conf.render({}, hardening=ALL, keys=KEYS).splitlines()
+    assert "m_key_lease_period 0" in lines
+
+
+def test_one_option_gives_every_key_a_lease(monkeypatch):
+    # Including groups added later, such as the class keys
+    monkeypatch.setitem(
+        opensm_conf.HARDENING,
+        "class_keys",
+        {"vs_key_lease_period": "0", "cc_key_lease_period": "0", "vs_key_enable": "2"},
+    )
+    lines = opensm_conf.render(
+        {}, hardening=ALL | {"class_keys"}, keys=KEYS, key_lease_period=60
+    ).splitlines()
+    leases = [line for line in lines if "lease_period" in line]
+    assert sorted(leases) == [
+        "cc_key_lease_period 60",
+        "m_key_lease_period 60",
+        "vs_key_lease_period 60",
+    ]
+    assert "vs_key_enable 2" in lines
+
+
+def test_an_override_wins_over_the_lease_option():
+    lines = opensm_conf.render(
+        {"m_key_lease_period": "120"}, hardening=ALL, keys=KEYS, key_lease_period=60
+    ).splitlines()
+    assert "m_key_lease_period 120" in lines
+    assert "m_key_lease_period 60" not in lines
+
+
 def test_no_hardening():
     content = opensm_conf.render({}, hardening=set(), keys={"m_key": "0x1234"})
     assert "m_key" not in content
@@ -80,3 +115,15 @@ def test_manager_sets_log_flags():
     assert (
         "log_flags 0x07" not in opensm_conf.render({"log_flags": "0xff"}).splitlines()
     )
+
+
+def test_no_group_writes_the_seed():
+    # The seed is kept a release before any group uses it (see
+    # specs/secured-profile.md, The seed), and changes no opensm.conf.
+    assert "key_mgr_seed" in opensm_conf.KEYS
+    keys = {name: opensm_conf.new_key() for name in opensm_conf.KEYS}
+    without_seed = {k: v for k, v in keys.items() if k != "key_mgr_seed"}
+    for groups in (ALL, {"m_key", "sa_trust"}, set()):
+        content = opensm_conf.render({}, hardening=groups, keys=keys)
+        assert "key_mgr_seed" not in content
+        assert content == opensm_conf.render({}, hardening=groups, keys=without_seed)

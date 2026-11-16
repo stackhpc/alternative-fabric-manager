@@ -15,9 +15,15 @@ driver" section, with `[sdn] url` pointing at AFM.
 Find out before changing anything:
 
 - **Who else uses the fabric.** If others share it, agree the hardening
-  first (`[opensm] hardening`; see `docs/opensm-hardening.md`): M_Key
+  first (`[opensm] hardening` and `key_lease_period`, and any hardening
+  options in `[opensm_conf]`; see `docs/opensm-hardening.md`): M_Key
   protection locks out SMP tools without the key, and SM_Key protection,
   which HA mode needs, keeps other subnet managers from taking over.
+  Deploying a newer release counts as a hardening change when its release
+  notes add a group to `all` and the deployment uses `all` or removals
+  only: agree it, or opt out of the new group with `-group` in the same
+  change (the older release refuses `-group` for a group it doesn't know,
+  so a rollback must remove it again).
 - **The mode**: single-node (`[database] database`, an SQLite file in the
   `afm_data` volume) or HA (`[ha] ha = true`, with `[database] connection`
   to MariaDB or Galera).

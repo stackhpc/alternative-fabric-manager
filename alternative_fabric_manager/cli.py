@@ -32,7 +32,8 @@ def main(argv=None):
     parser.add_argument(
         "--show-keys",
         action="store_true",
-        help="Print the fabric's OpenSM keys, for diagnostic tools such as "
+        help="Print the fabric's OpenSM keys and class key seed, which are "
+        "secrets, for diagnostic tools such as "
         "smpquery -y <m_key>, and exit",
     )
     parser.add_argument(
@@ -219,7 +220,11 @@ def main(argv=None):
         except Exception as e:  # noqa: BLE001 - as a daemon restart raises
             # The start below tries again, and reports what fails.
             logging.getLogger(__name__).error("Can't pull OpenSM's image: %s", e)
-    manager.start()
+    try:
+        manager.start()
+    except config_mod.ConfigError as e:
+        # A [opensm_conf] key_mgr_seed that isn't the stored seed
+        sys.exit(f"alternative-fabric-manager: {e}")
     try:
         uvicorn.run(
             app,
