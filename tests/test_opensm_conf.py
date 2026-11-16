@@ -1,7 +1,7 @@
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import opensm_conf
 
-ALL = set(config_mod.HARDENING_GROUPS)
+ALL = set(config_mod.ALL_HARDENING_GROUPS)
 
 
 def test_render():
@@ -129,18 +129,80 @@ def test_no_group_writes_the_seed():
         assert content == opensm_conf.render({}, hardening=groups, keys=without_seed)
 
 
-def test_the_base_is_never_rendered():
-    # No group writes the per-port M_Key base into opensm.conf yet, whichever
-    # groups are chosen.
+def test_the_base_is_rendered_only_with_per_port_keys_on():
+    # Naming m_key_per_port only permits per-port keys; until their target
+    # is on, no group writes the base, whichever groups are chosen.
     import itertools
 
     keys = dict(KEYS, key_mgr_seed="0x00000000000000ee", m_key_base="0xbbbbbbbb")
-    for size in range(len(ALL) + 1):
-        for groups in itertools.combinations(sorted(ALL), size):
-            content = opensm_conf.render({}, hardening=set(groups), keys=keys)
-            assert "m_key_base" not in content
-            assert "0xbbbbbbbb" not in content
+    every = set(config_mod.HARDENING_GROUPS)
+    for size in range(len(every) + 1):
+        for groups in itertools.combinations(sorted(every), size):
+            for port_keys in (False, True):
+                content = opensm_conf.render(
+                    {}, hardening=set(groups), keys=keys, port_keys=port_keys
+                )
+                assert "m_key_base" not in content
+                written = port_keys and "m_key_per_port" in groups
+                assert ("0xbbbbbbbb" in content) is written
+                if written:
+                    # Only ever as the m_key line
+                    assert [
+                        line for line in content.splitlines() if "0xbbbbbbbb" in line
+                    ] == ["m_key 0xbbbbbbbb"]
 
 
 def test_the_base_is_a_key():
     assert "m_key_base" in opensm_conf.KEYS
+
+
+PER_PORT_KEYS = dict(KEYS, m_key_base="0x00000000000000bb")
+
+
+def test_m_key_per_port_named_but_off_renders_as_without_it():
+    # The target, not the group, decides whether OpenSM gets per-port keys
+    # (specs/secured-profile.md, The design: the group permits them).
+    without = opensm_conf.render({}, hardening=ALL, keys=PER_PORT_KEYS)
+    for port_keys in ({}, {"port_keys": False}):
+        named = opensm_conf.render(
+            {}, hardening=ALL | {"m_key_per_port"}, keys=PER_PORT_KEYS, **port_keys
+        )
+        assert named == without
+    assert "m_key_per_port" not in without
+    assert "m_key_lookup" not in without
+    assert "m_key 0x1234" in without.splitlines()
+
+
+def test_m_key_per_port_on_writes_its_options_and_the_base():
+    content = opensm_conf.render(
+        {}, hardening=ALL | {"m_key_per_port"}, keys=PER_PORT_KEYS, port_keys=True
+    )
+    lines = content.splitlines()
+    for line in (
+        "m_key_per_port TRUE",
+        "m_key_lookup TRUE",
+        "m_key_protection_level 2",
+        # OpenSM derives each port's key from its m_key line: the base
+        "m_key 0x00000000000000bb",
+    ):
+        assert line in lines
+    # The stored m_key, which tenants may have read, appears nowhere: ports
+    # still holding it are reached through guid2mkey entries instead.
+    assert "0x1234" not in content
+    assert lines.count("m_key_protection_level 2") == 1
+
+
+def test_port_keys_without_the_group_writes_nothing_of_it():
+    content = opensm_conf.render({}, hardening=ALL, keys=PER_PORT_KEYS, port_keys=True)
+    assert content == opensm_conf.render({}, hardening=ALL, keys=PER_PORT_KEYS)
+
+
+def test_hardened_options_with_per_port_keys():
+    options = opensm_conf.hardened_options(
+        {"m_key", "m_key_per_port"}, PER_PORT_KEYS, port_keys=True
+    )
+    assert options["m_key"] == "0x00000000000000bb"
+    assert options["m_key_per_port"] == "TRUE"
+    assert "m_key_per_port" not in opensm_conf.hardened_options(
+        {"m_key", "m_key_per_port"}, PER_PORT_KEYS
+    )

@@ -43,8 +43,24 @@ ALL_HARDENING_GROUPS = (
     "enforcement",
     "babbling_ports",
 )
-# The hardening groups of opensm_conf.HARDENING: all's, then any outside it
-HARDENING_GROUPS = ALL_HARDENING_GROUPS
+# The hardening groups of opensm_conf.HARDENING: all's, then any outside it.
+# m_key_per_port leaves state on ports, their keys, so it stays outside all
+# until its single-node run passes (specs/secured-profile.md, Choosing the
+# group).
+HARDENING_GROUPS = ALL_HARDENING_GROUPS + ("m_key_per_port",)
+# What OpenSM's cache volume must be mounted at for per-port M_Keys: the
+# manager copies neighbors and guid2mkey into it before each start, which a
+# read-only root filesystem without the volume would refuse.
+OPENSM_CACHE_DIR = "/var/cache/opensm"
+# The options that m_key_per_port sets or depends on, which [opensm_conf]
+# can't override while it's named: the M_Key line is the base while the
+# target is on, and OpenSM forces the others with the option anyway.
+PER_PORT_OPTIONS = (
+    "m_key",
+    "m_key_per_port",
+    "m_key_protection_level",
+    "m_key_lookup",
+)
 # opensm.conf keys that the manager sets, which overrides can't change: the
 # manager depends on OpenSM reading its partitions file, staying in the
 # foreground, logging to its container's output, and enforcing partitions.
@@ -124,6 +140,11 @@ class Config:
     sweep_timeout: float = 30.0
     # Seconds between checks that OpenSM is running (managed).
     check_interval: float = 5.0
+    # Seconds between full verifies of per-port M_Keys (m_key_per_port):
+    # each Gets every recorded port behind a link that's up, which is too
+    # slow for every check, so the fabric check uses the last verify's
+    # result, and fails if it's older than two of these.
+    port_verify_interval: float = 60.0
     # Times to try applying a change in a row, before the manager waits for
     # the next check_interval.
     apply_attempts: int = 3
@@ -189,7 +210,9 @@ class Config:
     # write into opensm.conf (managed), separated by commas: m_key, sm_key,
     # sa_key, sa_trust, enforcement, babbling_ports; all, the default; -group
     # to remove one from all ("-sa_trust" alone starts from all); or none,
-    # alone. See parse_hardening.
+    # alone. See parse_hardening. m_key_per_port, experimental, isn't in all:
+    # it's chosen as "all, m_key_per_port", and only permits per-port M_Keys,
+    # which an operator's command begins.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
@@ -278,7 +301,13 @@ class Config:
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
         parse_hardening(self.hardening)
-        for name in ("start_timeout", "sweep_timeout", "check_interval", "job_timeout"):
+        for name in (
+            "start_timeout",
+            "sweep_timeout",
+            "check_interval",
+            "job_timeout",
+            "port_verify_interval",
+        ):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"[opensm] {name} must be positive")
         # The M_Key's lease is a 16-bit field of PortInfo.
@@ -333,6 +362,7 @@ class Config:
                 "[opensm_conf] m_key_base isn't an OpenSM option: the manager "
                 "keeps the per-port M_Key base in its database"
             )
+        self._validate_per_port_keys()
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(
@@ -342,6 +372,65 @@ class Config:
         for key, value in self.opensm_conf.items():
             if not key.replace("_", "").isalnum() or "\n" in value:
                 raise ConfigError(f"[opensm_conf] {key} isn't an OpenSM option")
+
+    def _validate_per_port_keys(self):
+        """Refuse m_key_per_port where the manager can't keep the ports' keys
+
+        See specs/secured-profile.md, Per-port M_Keys, The design: the
+        manager must write OpenSM's cache volume and run the prober in
+        OpenSM's image, and the options the group sets must be its own.
+        """
+        groups = self.hardening_groups
+        if "m_key_per_port" not in groups:
+            # By hand, the option would re-key every port with no record of
+            # which key each holds, which no later start could reach.
+            if "m_key_per_port" in self.opensm_conf:
+                raise ConfigError(
+                    "[opensm_conf] can't set m_key_per_port: name the "
+                    "m_key_per_port hardening group instead"
+                )
+            return
+        # Per-port keys are a form of M_Key protection: without the m_key
+        # group, nothing sets the protection they key.
+        if "m_key" not in groups:
+            raise ConfigError("[opensm] hardening m_key_per_port needs the m_key group")
+        # HA mode refuses the group in _ha_problems, which validate checks
+        # first.
+        if self.driver != "managed":
+            raise ConfigError(
+                "[opensm] hardening m_key_per_port needs the managed driver, "
+                "since the manager writes OpenSM's cache and runs its prober "
+                "in OpenSM's image"
+            )
+        if not cache_volume_writable(self.volumes):
+            raise ConfigError(
+                "[opensm] hardening m_key_per_port needs a writable volume at "
+                f"{OPENSM_CACHE_DIR} in [opensm] volumes, which the manager "
+                "writes OpenSM's cache into before each start"
+            )
+        overridden = sorted(set(self.opensm_conf) & set(PER_PORT_OPTIONS))
+        if overridden:
+            raise ConfigError(
+                f"[opensm_conf] can't set {', '.join(overridden)} with the "
+                "m_key_per_port hardening group, which sets them"
+            )
+
+
+def cache_volume_writable(volumes):
+    """Whether [opensm] volumes mounts something writable at OpenSM's cache
+
+    Each mount is source:destination[:mode]; the mode ro makes it
+    read-only, so the manager couldn't copy the cache into it.
+    """
+    for volume in volumes.split(","):
+        fields = volume.strip().split(":")
+        if len(fields) < 2 or not fields[0]:
+            continue
+        destination = fields[1].rstrip("/") or "/"
+        mode = fields[2].strip() if len(fields) > 2 else ""
+        if destination == OPENSM_CACHE_DIR and mode != "ro":
+            return True
+    return False
 
 
 def ha_settings(config):
@@ -492,6 +581,14 @@ def _ha_problems(config):
         )
     if str(config.opensm_conf.get("m_key_protection_level", "1")) == "0":
         problems.append("M_Key protection level must be 1 or more")
+    # HA needs configuration epochs, so that leaders with and without the
+    # group can't alternate, and a reach probe that works on re-keyed ports
+    # (specs/secured-profile.md, Per-port M_Keys, requirement 5).
+    if "m_key_per_port" in config.hardening_groups:
+        problems.append(
+            "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
+            "aren't supported in HA mode yet"
+        )
     return problems
 
 
@@ -521,6 +618,7 @@ OPTIONS = (
             "start_timeout",
             "sweep_timeout",
             "check_interval",
+            "port_verify_interval",
             "apply_attempts",
             "job_timeout",
             "default_partition",

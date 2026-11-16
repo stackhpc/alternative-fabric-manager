@@ -54,8 +54,9 @@ partitions_template =
 # or none. all, the default, hardens everything; "-sa_trust" hardens
 # everything but sa_trust; "m_key, enforcement" hardens only those. A new
 # group joins all once tested, and an upgrade then turns it on: read the
-# release notes, and remove it with -group if needed. [opensm_conf]
-# overrides any single option.
+# release notes, and remove it with -group if needed. m_key_per_port, per-port
+# M_Keys, is experimental and not in all: "all, m_key_per_port" permits them.
+# [opensm_conf] overrides any single option.
 hardening = all
 # The lease, in seconds, of every key the manager sets on ports: the M_Key,
 # and the class keys once a group sets them. 0, the default, makes them
@@ -71,6 +72,10 @@ key_lease_period = 0
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5
+# With the m_key_per_port group, seconds between full verifies of every
+# recorded port's M_Key; the fabric check fails if the last one is older
+# than two of these.
+port_verify_interval = 60
 apply_attempts = 3
 # Written as is. By default every port is only a limited member, so ports
 # can't reach each other in the default partition; flat networks' ports are
