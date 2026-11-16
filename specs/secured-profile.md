@@ -811,7 +811,9 @@ says which design choice its outcome decides.
    **Checking state** means a PortInfo Get with the key the port should
    hold, to every physical port, reading its protection bits (2), its
    lease, and its M_Key compared with the expected key: never another
-   wrong-key probe. Every wrong-key or zero-key SMP starts a port's lease
+   wrong-key probe. A state check that fails counts as a wrong-key SMP:
+   it is timed like one, and not retried in a loop. Every wrong-key or
+   zero-key SMP starts a port's lease
    countdown, and OpenSM's light sweeps may not query adapters, so each
    leg that sends one is timed from its first such SMP and restored within
    5 minutes. A port found lapsed (protection bits 0) is waited for until
@@ -822,9 +824,15 @@ says which design choice its outcome decides.
      equal to `m_key`; if not, stop.
    - **The lease:** with the option off, set the lease to 600, restart, and
      check state: every physical port's lease reads 600.
-   - **Trap control:** one deliberate wrong-key Get, to confirm OpenSM logs
-     the bad M_Key trap at this `log_flags`, so that its absence later
-     means something.
+   - **Trap control:** one deliberate wrong-key Get to one adapter behind
+     the switch, to confirm OpenSM logs the bad M_Key trap at this
+     `log_flags`, so that its absence later means something. Then check
+     that port's state, and again after 11 minutes. If it is still
+     protected, keyed Gets or sweeps stop a countdown, and the test goes on
+     as written. If it lapsed, every later step that sends a wrong key
+     (the gate included) is followed by a wait until OpenSM has protected
+     every port again, checked by state, before the next leg's
+     observations.
    - **Turn-on from a manager-written cache:** OpenSM stopped, `guid2mkey`
      replaced by derived keys while ports still hold `m_key`, then started
      with the option. Expected to fail (ports refuse the derived key).
