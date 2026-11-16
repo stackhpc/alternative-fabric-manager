@@ -541,7 +541,7 @@ starts without the fabric's `neighbors` knows no GUID beyond its own port,
 and sends 0, which a per-port keyed port refuses: every HA takeover on
 another host, and any lost cache. With a lease of 0 those ports stay out
 of reach; with a lease they come back only by lapsing, which is the
-exposure above. Whether `neighbors` alone is enough is test 5's question.
+exposure above. Test 5 found that `neighbors` alone is enough (see Results).
 
 AFM's own SMPs have the same problem. The fabric check and the HA reach
 probe run `ibswitches -y <m_key>`, with one key for the whole fabric.
@@ -952,6 +952,73 @@ Still to run for test 3:
 - a second host;
 - CC and N2N keys on hardware that supports them.
 
+**Test 5, 2026-11-16.** The same fabric and host as test 3, with its owner's
+agreement and nobody else using it; one switch (LID 5), its embedded CA,
+this host's port (LID 1) and five other adapters: 8 physical ports. The
+lease was 600 s throughout. Everything was reverted: every port holds
+`m_key` at protection level 2 with its original 60 s lease, and
+`afm.conf`, `opensm.conf` and the cache files are byte-identical to
+backup A.
+
+- **The derivation is right.** After a warm turn-on, every `guid2mkey`
+  entry equalled `port_m_key`, the switch's included, and every port,
+  this host's too, answered its derived key and refused `m_key`. OpenSM
+  writes `guid2mkey` with the option off: backup A held `m_key` for every
+  GUID.
+- **A keyed Get stops a countdown.** A port sent one wrong-key Get, and
+  then a keyed one, was still protected 11 minutes later. OpenSM logs the
+  Bad M_Key trap (256) at this `log_flags`, with the key that was sent.
+- **Turn-on from a cache of derived keys fails at the SM's own port.**
+  With ports still on `m_key`, OpenSM's first SMP, to its own port, was
+  refused at send (`ERR 5430`, "Invalid argument"), then `ERR 3309`/`3320`
+  "SM port ... is unknown": it never swept, and no other port saw a wrong
+  key. Local SMPs are key-checked, refused before they leave the host.
+- **`neighbors` alone is enough.** A cold OpenSM with only `neighbors`
+  managed every port, logged no error, caused no M_Key violation, and
+  wrote every port's derived key to `guid2mkey`. With `guid2mkey` alone,
+  or nothing, it reached only its own port: the switch refused key 0 (89
+  Bad M_Key traps in two sweeps) and the SA held no nodes.
+- **A missing or wrong `neighbors` row loses that port.** Without one
+  adapter's GUID, or with its row naming another GUID (its `guid2mkey`
+  entry intact), OpenSM managed the other nine nodes, and the adapter
+  refused it until its row came back. OpenSM still logged SUBNET UP, so
+  a fabric check that counts switches passes.
+- **`ibdiagnet` can't be the fabric check here.** It failed to open the
+  adapter ("Ibis failed to get CAs in the system", or "couldn't CA: mlx5_0
+  and port: 1" when named), by `docker exec` beside OpenSM and from a
+  separate container, in 0.3 s, before sending anything. `smpquery -D -y
+  <derived key> nodeinfo 0,1` reached the switch in 0.13 s.
+- **AFM in HA mode can't start OpenSM once the ports are re-keyed.** The
+  first restart through the manager after turn-on never took the lease:
+  the reach probe's `ibswitches -y <m_key>` failed at this host's own
+  port, so the node's reach was 0 and it wasn't eligible. The fabric had
+  no SM from 10:13:51 to about 10:23, when OpenSM was started by hand as
+  the managed driver runs it, with the manager stopped; existing links
+  stayed up, and no port lapsed. The rest of the test ran that way. Until
+  then, the fabric check and the reach probe failed every 5 s, refused at
+  send on this host's port, which logged a Bad M_Key trap each time.
+- **Turn-off with the cache in place works.** OpenSM re-keyed every port
+  to `m_key`, with no error, and wrote `m_key` back to `guid2mkey`.
+
+What it means for the design (Per-port M_Keys, The design):
+- The manager renders `neighbors` from `fabric_links`, not `guid2mkey`;
+  OpenSM derives the keys. `neighbors` holds GUIDs and port numbers only,
+  so it isn't a secret, and the manager never needs to write a key.
+  `guid2mkey` matters only as OpenSM's record of a rotation in progress
+  (requirement 1).
+- The fabric check, `--confirm-switches` and the reach probe use the
+  `smpquery -D` prober along recorded links (requirement 4); `ibdiagnet`
+  is dropped.
+- The reach probe must work before the group is turned on anywhere in
+  HA, since a node that can't count switches can't lead; the HA refusal
+  in requirement 5 stands until it does.
+- Requirement 2's unattributed timeouts are needed: a lost port doesn't
+  stop SUBNET UP.
+
+Still to run for test 5 (with the implemented group): a lease of 0, a
+port reset seen from a second host, a takeover on a second host, and a
+re-cabled port.
+
 ## Implementation plan
 
 - [x] `key_mgr_seed` in `KEYS`, generated at startup, in `--show-keys`;
@@ -970,8 +1037,9 @@ Still to run for test 3:
 - [ ] Hardware test 3 (first run done, see Results). Then `class_keys`,
       with its downgrade procedure.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
-- [ ] Hardware test 5. Then `m_key_per_port` to Per-port M_Keys, The
-      design, reviewed; experimental until its single-node test passes.
+- [x] Hardware test 5's first run (see Results).
+- [ ] `m_key_per_port` to Per-port M_Keys, The design, with test 5's
+      results, reviewed; experimental until its single-node run passes.
 - [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
       downgrade procedure.
 
