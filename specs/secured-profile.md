@@ -563,10 +563,10 @@ crash during the re-keying sweep leaves ports that no OpenSM can reach.
 This is Not adopted's objection to rotating keys, and the design has to
 answer it rather than avoid it.
 
-### The design, once test 5 has run
+### Requirements
 
-Test 5's results decide the design. It must meet these requirements,
-which the review of this section's first version set:
+The review of this section's first version set these requirements, and
+The design below meets them:
 
 1. **A per-port key state, never a key.** `fabric_ports` records, per port
    GUID, whether the port holds `m_key`, its derived key, or is changing,
@@ -612,6 +612,171 @@ which the review of this section's first version set:
    AGENTS.md, the deploy-host skill and `--show-keys`'s help name the
    per-port key for `-y`. `--port-m-key <guid>` prints a key, under
    AGENTS.md's rule on keys.
+
+### The design
+
+This first version is for single node with the managed driver. HA mode
+refuses the group (requirement 5), and so does any other driver, since
+the manager must write OpenSM's cache volume and run the prober in
+OpenSM's image.
+
+**The group.** `m_key_per_port` writes `m_key_per_port TRUE`,
+`m_key_lookup TRUE` and `m_key_protection_level 2`, written so that they
+show though OpenSM forces them. It needs the `m_key` group, and is in
+`HARDENING_GROUPS` only, so it's chosen as `all, m_key_per_port`.
+`Config.validate` refuses it without `m_key`, in HA mode, with another
+driver, with `m_key_per_port`, `m_key_protection_level` or `m_key_lookup`
+in `[opensm_conf]`, and refuses `m_key_per_port` in `[opensm_conf]`
+without the group.
+
+**A new base key at turn-on.** Every derived key is a function of the
+base key and a GUID, and a GUID isn't secret. The base is the `m_key`
+every port holds today, which is exactly the key the group exists
+because tenants may have read: test 3 saw it handed out by a lapsed
+port. Deriving from it would hand that tenant every port's key. So the
+first turn-on generates a new base, stored as `m_key_base` beside the
+other keys (in `KEYS`, in backups, never printed, and its own line in
+`--show-keys`), and OpenSM's `m_key` line is the base while the group is
+on. Ports still holding the old `m_key` are reached through their
+`guid2mkey` entries, which beat the derivation. Turning the group off
+re-keys every port to the stored `m_key`, the old key, not the base: a
+tenant who read it has it again, which turning off can't avoid, and the
+docs say so. A later turn-on uses the same base, so ports that kept their
+derived keys still match. The base is generated whatever the groups, as
+the seed is, so that backups hold it a release before any port is keyed
+with it. `[opensm_conf] m_key` is refused with the group, and the rows
+store a fingerprint of the base they were derived from (SHA-256 of a
+fixed label and the key, not the key), so a base that changed under them
+is refused at start.
+
+**What's recorded.** Two tables, written in single node by the manager
+and, once HA allows the group, by the leader under its term's
+compare-and-set:
+- `fabric_ports`: port GUID, its node GUID (from `neighbors`, the switch's
+  port 0 for a switch), `holds` (`m_key`, `derived` or `unknown`),
+  `reachable`, the base's fingerprint, and `last_seen`.
+- `fabric_links`: (GUID, port) to (GUID, port), both directions as in
+  `neighbors`, with `last_seen`.
+
+The `state` table records the target, `m_key_per_port` on or off, before
+the start that begins a transition. A port whose `holds` isn't what the
+target gives it (`derived` when on, `m_key` when off) is changing, which
+needs no state of its own: requirement 1's "changing" is that
+disagreement.
+
+**Reading OpenSM's cache.** At every fabric check interval, while the
+group is on or any row exists, the manager reads `neighbors` and
+`guid2mkey` from the running container (`get_archive`, never logged).
+Each `neighbors` row replaces the row with its local (GUID, port), which
+handles a re-cabled port as OpenSM saw it. Each `guid2mkey` entry sets
+that GUID's `holds` by comparing it with the old `m_key` and the port's
+derived key, and `unknown` if it's neither. Only GUIDs that `neighbors`
+lists are recorded, so virtual functions never get rows, and a recorded
+port that's absent from OpenSM's files keeps its row: a port that's down
+now may come back holding its key.
+
+**Verifying before each start.** OpenSM may set a port's key and stop
+before the manager reads its cache, and a restored database may be
+older than the ports. So before every start while rows exist, the prober
+Gets NodeInfo from every recorded linked port, by directed route from
+this host's port along `fabric_links`, and sets `holds` from the key
+that answers, checking the answer's port GUID against the row. Which keys
+it tries is what keeps the old key from tenants: it always tries the
+port's derived key first, and tries `m_key` only on a port recorded as
+holding `m_key`, which can't have learnt more from it. A port recorded
+`derived` or `unknown` that doesn't answer its derived key is marked
+unreachable and never sent `m_key`. A port that answers neither is left
+as it was recorded. A wrong-key Get counts as a violation and starts a
+lease countdown, which the right key's Get stops (test 5); with a lease
+of 0 there is no countdown. Verification runs in a helper container from
+OpenSM's image, as the reach probe does, before OpenSM starts, within
+`start_timeout`.
+
+**Rendering OpenSM's cache.** Then the manager writes OpenSM's
+`neighbors` from `fabric_links` and its `guid2mkey` from `holds`, both
+root-only, by copying them into the created, not yet started, container's
+`/var/cache/opensm` (`put_archive`, which Docker allows into a volume of
+a read-only container; checked on this host). `guid2mkey` gets an entry
+only for a port whose key differs from what OpenSM would send without
+one: with the group on, the old `m_key` for a port holding it; with it
+off, the derived key for a port holding that. A port with no entry, and
+an `unknown` one, gets OpenSM's own choice. These files replace OpenSM's
+own, which the manager read at its last check and verified since: merging
+would let a stale entry beat the derivation (requirement 3). With no rows
+and the group off, nothing is written, as today.
+
+**Turning it on.** OpenSM must know every port's GUID before the start
+that turns the group on, or it sends 0 and loses them (test 5's empty
+leg). So the group can begin a transition only with recorded links: a
+manager started with the group and no rows starts OpenSM without it,
+records the links at its fabric checks, and logs an error saying a
+restart turns it on. It doesn't restart OpenSM itself. With rows, the
+start writes the target, verifies, renders `m_key` entries for every
+port, and starts OpenSM with the option and the base, which re-keys each
+port it reaches. The transition is complete when every recorded port
+that's reachable holds its derived key. Until then the check logs the
+count of ports still holding `m_key`.
+
+**Turning it off.** Removing the group sets the target to off. The rows
+stay, so the start renders `neighbors` and a derived entry for every port
+holding one, and OpenSM, without the option, re-keys them to `m_key`, as
+test 5 did. Once every recorded port holds `m_key`, rows with the group
+off change nothing, and `--forget-port-keys` drops them.
+
+**The fabric check.** While rows exist, `ibswitches -y <m_key>` can't
+reach a re-keyed port, so the fabric check and `--confirm-switches` run
+the prober from OpenSM's container instead, Getting NodeInfo from every
+recorded switch by directed route, with its derived key or `m_key` as
+its row says, in one `docker exec` of a script, under the check's
+timeout. It returns the switch node GUIDs that answered with the GUID
+recorded on that route, as `ibswitches` does, so `_judge` is unchanged.
+A route through a switch that doesn't answer isn't followed. The SA query
+for SMInfo records is unchanged. A non-zero exit, or output it can't
+parse, is a failed query (`ReloadError`), as today.
+
+**Lost ports and jobs.** Test 5's lost port showed only `ERR 5411` DR SMP
+timeouts and Bad M_Key traps, and OpenSM still logged SUBNET UP. With the
+group on, a sweep that logs `ERR 5411`, or `ERR 3113` for a NodeInfo or
+PortInfo Get, is followed by a probe of every recorded linked port, with
+the key its row says. Then:
+- every port that answers is marked reachable;
+- if no port fails to answer, or the probe itself fails, the timeouts
+  are unattributed, and hold every job of the sweep;
+- otherwise they're attributed to the ports that didn't answer, which
+  are marked unreachable. A job is held if it binds one of those GUIDs,
+  and every job is held if any of them isn't the GUID of a bare metal
+  Neutron port, since a switch's or a hypervisor's port carries other
+  ports' partitions, and a virtual function's physical port isn't
+  recorded.
+
+So a tenant who makes their own port refuse its key holds only their own
+jobs, and every other loss fails closed. A Bad M_Key trap names its
+issuer's LID from the notice's own data, which the sender writes, so
+traps hold nothing and attribute nothing: they're logged as a count, with
+the key masked, since OpenSM's log line includes it. A port that becomes
+reachable again is marked so at the next probe.
+
+**Commands.** `--port-key-states` lists each recorded port's GUID, `holds`
+and `reachable`, never a key. `--port-m-key <guid>` prints that port's
+current key, for feeding `-y` under AGENTS.md's rule, never for display.
+`--forget-port-keys` drops every row, refused while the group is on or any
+row holds a derived key; `--forget-port <guid>` drops one port and its
+links, for removed hardware, refused for a port seen in the last day.
+
+**Downgrades.** A release without the group can't render the cache, so
+the notes say to turn the group off and wait for `--port-key-states` to
+show every port holding `m_key` first. Restoring a database backup from
+before the turn-on loses `m_key_base`, and with it every derived key; the
+manager refuses to start when `guid2mkey` in the volume names a port
+holding a key that's neither candidate and no row explains it, and the
+hardening doc gives the recovery (a lease lapse, or in-band MFT with each
+port's key from the newer backup). So backups taken after turn-on are the
+ones to keep.
+
+**Logs.** `opensm.log` now holds keys: Bad M_Key traps print the key that
+was sent. The hardening doc says the log volume is as secret as
+`opensm.conf`. The manager never logs a line of OpenSM's that holds a
+key, nor the prober's command line.
 
 ### Choosing the group
 
@@ -723,7 +888,7 @@ These go into specs/ha.md before the HA code changes:
   (see HA) are in, and `class_keys` until hardware test 3 passes.
 - **Per-port M_Keys:** `fabric_ports` (with each port's key state) and
   `fabric_links`, written only by the leader under its term's
-  compare-and-set; the cache rendered before every start and on a period
+  compare-and-set; `m_key_base` among the shared keys; the cache rendered before every start and on a period
   for the reach probe; `m_key_per_port` in the configuration hash; the
   fence ask with the target port's derived key. See Per-port M_Keys, The
   design.
@@ -1001,11 +1166,11 @@ backup A.
   to `m_key`, with no error, and wrote `m_key` back to `guid2mkey`.
 
 What it means for the design (Per-port M_Keys, The design):
-- The manager renders `neighbors` from `fabric_links`, not `guid2mkey`;
-  OpenSM derives the keys. `neighbors` holds GUIDs and port numbers only,
-  so it isn't a secret, and the manager never needs to write a key.
-  `guid2mkey` matters only as OpenSM's record of a rotation in progress
-  (requirement 1).
+- The manager renders `neighbors` from `fabric_links`, and OpenSM
+  derives the keys. `neighbors` holds GUIDs and port numbers only, so it
+  isn't a secret. `guid2mkey` needs an entry only for a port whose key
+  isn't the one OpenSM would choose: one still on `m_key` at turn-on, or
+  on its derived key at turn-off (requirement 1).
 - The fabric check, `--confirm-switches` and the reach probe use the
   `smpquery -D` prober along recorded links (requirement 4); `ibdiagnet`
   is dropped.
@@ -1015,9 +1180,10 @@ What it means for the design (Per-port M_Keys, The design):
 - Requirement 2's unattributed timeouts are needed: a lost port doesn't
   stop SUBNET UP.
 
-Still to run for test 5 (with the implemented group): a lease of 0, a
-port reset seen from a second host, a takeover on a second host, and a
-re-cabled port.
+Still to run for test 5 (with the implemented group): a turn-on with a
+new base key (`m_key` differing from the key `guid2mkey` names), a lease
+of 0, a port reset seen from a second host, a takeover on a second host,
+and a re-cabled port.
 
 ## Implementation plan
 
@@ -1038,8 +1204,10 @@ re-cabled port.
       with its downgrade procedure.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
 - [x] Hardware test 5's first run (see Results).
-- [ ] `m_key_per_port` to Per-port M_Keys, The design, with test 5's
-      results, reviewed; experimental until its single-node run passes.
+- [ ] `m_key_base` in `KEYS`, generated whatever the groups, a release
+      before `m_key_per_port`.
+- [ ] `m_key_per_port` for single node, as Per-port M_Keys, The design
+      says; experimental until its single-node run passes.
 - [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
       downgrade procedure.
 
