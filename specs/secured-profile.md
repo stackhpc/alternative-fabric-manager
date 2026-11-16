@@ -706,7 +706,10 @@ keys it may try is what keeps the old key from tenants:
   nothing can hold a derived key yet: no fingerprint is recorded, and no
   row or volume entry is `derived`;
 - both keys on this host's port and on switch port 0, which no tenant
-  controls.
+  controls. A row is a switch's because its NodeInfo said so, which an
+  adapter that answers as a switch could say too, so only the switches
+  an operator confirmed (`--confirm-switches`) count here; any other
+  gets a tenant port's rule.
 
 It tries the key the row records first, then the other one the rule
 allows, so a port on `m_key` during a slow transition isn't sent a wrong
