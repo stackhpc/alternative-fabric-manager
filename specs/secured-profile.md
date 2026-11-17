@@ -551,17 +551,36 @@ then add a denial of service between tenants. Nor is it known whether
 trusted requesters, which send the SA_Key, are limited, which would include
 the manager's own `saquery`.
 
-A new hardening group, `sa_rate`, sets `sa_rate_threshold`, only if
-hardware test 4 shows that:
+A new hardening group, `sa_rate`, sets `sa_rate_threshold`. OpenSM 5.17
+has the option (default 0, "unlimited", per its option dump) and logs
+`4C11` in the format above, both read from the binary. The group exists
+now, experimental and outside `all`, so that hardware test 4 can run it;
+it joins `all` only if the test shows that:
 
 - the count is per port GUID;
 - a flooding port is limited, and another port is unaffected;
 - the chosen value doesn't limit an MPI job's start-up.
 
-Otherwise the group isn't added, and the MAD limiter stays a gap. The
+Otherwise the group is removed again, and the MAD limiter stays a gap. The
 value, proposed as 1000 per 100 ms, is set from the test's results. That
 includes the SA's total capacity, since a limit near it protects little
-against several ports flooding at once.
+against several ports flooding at once. (The first version of this spec
+added the group only after the test; the user asked for it to be
+implemented, experimental, before.)
+
+The group writes only the option. `[opensm_conf] sa_rate_threshold`
+overrides its value, as for any option. While the group is named, or the
+option is set and not 0, the fabric check reads OpenSM's `4C11` lines and
+logs, for each OpenSM the manager starts, each GUID that OpenSM limited,
+once, with the count and threshold the line gives: that is the evidence
+test 4 records, and the warning an operator needs when the limit bites a
+legitimate client. It doesn't fail the check: a limited client is the
+limit working, and a tenant could otherwise stop every job by flooding.
+If the manager's own `saquery`, which sends the SA_Key, is limited, its
+fabric check fails as a failed query, which shows it. HA mode refuses
+the group, as it does the other experimental groups, until test 4 has
+run; it leaves nothing on ports, so it could be allowed there without
+further design.
 
 ## Per-port M_Keys
 
@@ -1528,7 +1547,11 @@ and a re-cabled port.
 - [ ] Hardware test 3 (first run done, see Results), the rest with the
       implemented group. Then `class_keys` in HA mode, after the
       second-host legs.
-- [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
+- [ ] `sa_rate` for single node, experimental and outside `all`, with
+      `4C11` logged. Implemented before hardware test 4, at the user's
+      request.
+- [ ] Hardware test 4. Then `sa_rate` joins `all`, or is removed with a
+      note that the gap stays.
 - [x] Hardware test 5's first run (see Results).
 - [x] `m_key_base` in `KEYS`, generated whatever the groups, a release
       before `m_key_per_port`.
