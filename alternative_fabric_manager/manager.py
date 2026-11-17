@@ -34,6 +34,7 @@ import sqlalchemy as sa
 
 from alternative_fabric_manager import (
     allowed_sm,
+    class_keys,
     db,
     effects,
     opensm_conf,
@@ -177,6 +178,8 @@ class Manager:
         self.allowed_sms = allowed_sm.AllowedSMs(self)
         # The allowed_sm_guids value of the start under way
         self._allowed_list = None
+        # Class keys: the seed rule and the turn-off guard
+        self.class_keys = class_keys.ClassKeys(self)
 
     # Requests
 
@@ -779,6 +782,11 @@ class Manager:
         with self._lock, self.sessionmaker() as session:
             return session.get(db.Secret, "m_key_base") is not None
 
+    def _seed_stored(self):
+        """Whether the class keys' seed is stored already"""
+        with self._lock, self.sessionmaker() as session:
+            return session.get(db.Secret, "key_mgr_seed") is not None
+
     def _record_base_kept(self, kept):
         """Record whether this start found the per-port M_Key base stored
 
@@ -839,7 +847,7 @@ class Manager:
         ports"""
         if self.config.driver != "managed":
             return
-        groups = self.config.hardening_groups
+        groups = self.class_keys.groups(self.config.hardening_groups)
         if port_keys:
             # On while the group is no longer named, at a turn-off whose
             # verify failed: OpenSM then stays on the previous target.
@@ -863,7 +871,8 @@ class Manager:
             hardening=groups,
             keys=(
                 self.keys()
-                if groups & {"m_key", "sm_key", "sa_key", port_keeper.GROUP}
+                if groups
+                & {"m_key", "sm_key", "sa_key", port_keeper.GROUP, class_keys.GROUP}
                 else None
             ),
             key_lease_period=self.config.key_lease_period,
@@ -872,6 +881,8 @@ class Manager:
         )
         # The keys are secrets.
         partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
+        # Which classes OpenSM may now key, for the turn-off guard
+        self.class_keys.record(groups, overrides)
 
     def _key_leases(self):
         """The key leases opensm.conf gets, as "name N s" or "name permanent",
@@ -880,7 +891,7 @@ class Manager:
             return ""
         leases = {
             name: str(self.config.key_lease_period)
-            for group in self.config.hardening_groups
+            for group in self.class_keys.groups(self.config.hardening_groups)
             for name in opensm_conf.HARDENING[group]
             if opensm_conf.is_key_lease(name)
         }
@@ -902,7 +913,9 @@ class Manager:
         # leaves OpenSM as it was. Whether the base was stored is read first,
         # since _keep_seed stores every missing key, the base too.
         base_kept = self._base_stored()
+        seed_kept = self._seed_stored()
         self.port_keeper.refuse_start()
+        self.class_keys.refuse_start(seed_kept)
         self._keep_seed()
         if not self.config.ha:
             # Only in single-node mode: in HA mode, starts at takeovers would
@@ -998,6 +1011,7 @@ class Manager:
         self._allowed_list = None
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
+        self.class_keys.reset()
         self._write_opensm_conf()
         # What OpenSM starts with is recorded as swept only if the driver saw
         # OpenSM's first sweep read it; a driver may not start OpenSM at all.
@@ -1451,8 +1465,12 @@ class Manager:
             # With per-port M_Key rows, the prober finds the switches.
             outcome = self.port_keeper.check()
             fabric = self._fabric(outcome.switches if outcome else None)
-            # The SMs OpenSM logged ignoring since the last check
-            sm_problems, sm_contested = self.allowed_sms.check()
+            # What OpenSM logged since the last check: SMs it ignored, and
+            # what its class key managers reported
+            findings = self._log_findings()
+            sm_problems, sm_contested = self.allowed_sms.check(findings)
+            if findings is not None and self.class_keys.watching():
+                self.class_keys.report(findings)
         except ReloadError as e:
             # Not knowing is no evidence either way: a contested fabric stays
             # contested until a check passes.
@@ -1494,6 +1512,15 @@ class Manager:
             applied.contested = self._contested_fabric
             session.commit()
         return ok
+
+    def _log_findings(self):
+        """What OpenSM logged since the last check, read only when a group
+        that judges it is in effect, or None"""
+        if not (self.allowed_sms.active() or self.class_keys.watching()):
+            return None
+        if not self.driver.running():
+            return None
+        return self.driver.log_findings()
 
     @staticmethod
     def _contested(fabric):

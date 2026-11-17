@@ -80,11 +80,18 @@ class SweepReport:
 
 class LogFindings:
     """What OpenSM logged since the driver last looked, that a fabric check
-    judges: the port GUIDs of the SMs it ignored (ERR 0F09), as ints, in the
-    order logged"""
+    judges, in the order logged:
+    - ignored_sms: the port GUIDs of the SMs it ignored (ERR 0F09), as ints;
+    - key_rejections: ports that answered a class key manager's KeyInfo with
+      an error status (ERR 9828, C10A), as (code, port GUID, status,
+      attribute ID);
+    - key_errors: a key manager's failures to set keys, as (code, port GUID
+      or None)"""
 
-    def __init__(self, ignored_sms=()):
+    def __init__(self, ignored_sms=(), key_rejections=(), key_errors=()):
         self.ignored_sms = list(ignored_sms)
+        self.key_rejections = list(key_rejections)
+        self.key_errors = list(key_errors)
 
 
 class Fabric:

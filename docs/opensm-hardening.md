@@ -33,8 +33,9 @@ HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 
 Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
 experimental, untested on hardware: not part of `all`, and not on by
-default. The experimental groups are `m_key_per_port` and `allowed_sm`, each
-chosen by naming it beside `all`, as `hardening = all, allowed_sm` (see
+default. The experimental groups are `m_key_per_port`, `allowed_sm` and
+`class_keys`, each chosen by naming it beside `all`, as `hardening = all,
+allowed_sm` (see
 Experimental hardening). Before naming one, read its "Before enabling"
 checklist: what to back up, what to check when it's turned on, what shows it
 works or failed, and how to turn it off. Once its hardware tests pass, each
@@ -70,6 +71,7 @@ such key at once (see Permanent keys).
 | `babbling_ports` | `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
 | `m_key_per_port` (experimental, untested on hardware; not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
 | `allowed_sm` (experimental, untested on hardware; not in `all`) | `allowed_sm_guids` | unset (every SM takes part) | This host's physical ports | A tenant's subnet manager winning the election |
+| `class_keys` (experimental, untested on hardware; not in `all`) | `vs_key_enable`, `cc_key_enable`, `n2n_key_enable` | `0` (Ignore) | `2` (Enable), with protect bits `1`, leases `[opensm] key_lease_period` and `key_mgr_seed` the stored seed | A host reconfiguring switches with vendor-specific or congestion control MADs |
 
 The `enforcement` group is OpenSM's defaults already. It is written anyway,
 so that `opensm.conf` shows the options and nothing weakens them by
@@ -97,8 +99,8 @@ Only the keys of the chosen groups are written. A key set in
 `[opensm_conf]` wins over the generated one.
 
 The manager also stores `key_mgr_seed`, if it's missing, whenever it starts
-OpenSM (in HA mode, when a node takes over), whatever the groups, though no
-group writes it yet. OpenSM derives the class keys (VS, CC and N2N) from it,
+OpenSM (in HA mode, when a node takes over), whatever the groups. Only the
+experimental `class_keys` group writes it. OpenSM derives the class keys (VS, CC and N2N) from it,
 and a port keyed with a lost seed can't be managed again, so the seed is
 stored a release early, for database backups to hold it before it is ever
 used. `--show-keys` prints it, and it is as secret as the other keys.
@@ -386,11 +388,12 @@ is what prevents that.
 These options close the rest of the gaps between AFM's hardening and
 NVIDIA UFM's Secured Cloud Profile. None is enabled by default or by `all`.
 Each is designed in specs/secured-profile.md. Some are groups already,
-experimental, untested on hardware: `m_key_per_port` and `allowed_sm`, each
-with the manager's checks, chosen by naming it beside `all`, and planned to
-join `all` once their hardware tests pass. The others you can try by
-setting their OpenSM options in `[opensm_conf]`: the manager writes them as
-they are, and checks none of what the planned groups will.
+experimental, untested on hardware: `m_key_per_port`, `allowed_sm` and
+`class_keys`, each with the manager's checks, chosen by naming it beside
+`all`, and planned to join `all` once their hardware tests pass. The
+others you can try by setting their OpenSM options in `[opensm_conf]`: the
+manager writes them as they are, and checks none of what the planned
+groups will.
 
 Each group has a "Before enabling" checklist, drawn from the hardware tests
 the spec plans for it. Its first enabling on a fabric is that test: follow
@@ -522,69 +525,122 @@ turns it off.
 
 ### Class keys
 
-Switches and adapters accept other classes of management packets than
-SMPs. Vendor-specific (VS) packets are what in-band `mlxlink`, `mlxreg`
-and `flint` use. Congestion control (CC) packets set the congestion
-parameters of every port. A tenant can send either to any switch unless
-the class is keyed. OpenSM derives each port's class keys from
-`key_mgr_seed`. The manager already keeps a seed in its database, so that
-backups hold it, but doesn't write it to `opensm.conf`.
+**Experimental, untested on hardware.** Switches and adapters accept other
+classes of management packets than SMPs. Vendor-specific (VS) packets are
+what in-band `mlxlink`, `mlxreg` and `flint` use. Congestion control (CC)
+packets set the congestion parameters of every port. A tenant can send
+either to any switch unless the class is keyed. OpenSM derives each port's
+class keys from `key_mgr_seed`, which the manager keeps in its database.
 
-```ini
-[opensm_conf]
-vs_key_enable = 2
-vs_key_ci_protect_bits = 1
-cc_key_enable = 2
-cc_key_protect_bit = 1
-n2n_key_enable = 2
-n2n_key_protect_bit = 1
-# The stored seed (see below). Without it, OpenSM derives the class keys
-# from the M_Key. The manager refuses any other value.
-key_mgr_seed = <the stored seed>
+The `class_keys` group, chosen with `hardening = all, class_keys` in
+single-node mode, writes:
+
+```
+vs_key_enable 2
+vs_key_ci_protect_bits 1
+vs_key_lease_period <[opensm] key_lease_period>
+cc_key_enable 2
+cc_key_protect_bit 1
+cc_key_lease_period <[opensm] key_lease_period>
+n2n_key_enable 2
+n2n_key_protect_bit 1
+n2n_key_lease_period <[opensm] key_lease_period>
+key_mgr_seed <the stored seed>
 ```
 
-Copy the stored seed into `afm.conf` without displaying it:
+- **HA mode refuses it** ("class keys aren't supported in HA mode yet"):
+  seed-only derivation has been shown on one host, not across a takeover
+  by another.
+- **Not on the start that stores the seed.** A start of the manager that
+  finds no seed stored, as on a fresh install or after restoring a backup
+  from before the seed, stores one and starts OpenSM without class keys,
+  logging "The class_keys group is named, but this start stored the class
+  key seed ... OpenSM starts without class keys". Back up the database,
+  which then holds the seed, and restart the manager.
+- **A lost or changed seed can leave ports keyed for good.** The manager
+  refuses an `[opensm_conf] key_mgr_seed` other than the stored one. Keep
+  the database backups: they hold the seed.
+- **Leases** are `[opensm] key_lease_period`, 0 (permanent) by default.
+  Whether 0 means "never expires" for these classes, as for the M_Key, is
+  untested. A lease is what would let a port keyed by mistake be keyed
+  again without a power cycle, but that recovery hasn't been shown (see
+  Permanent keys).
+- **Not every device supports every class.** For ports that don't, OpenSM
+  logs `ERR 9828` (or the congestion control manager's `ERR C10A`) at every
+  sweep. On the test fabric, only VS keys were supported. The manager
+  doesn't fail on it, and logs it, for each OpenSM it starts, as the set of
+  ports grows: "OpenSM's VS key manager reports N ports answering a KeyInfo
+  with status 0xc (ERR 9828, attr_id 0x...)". The line names the attribute,
+  not the class: those ports aren't protected by that class's key.
+- **Key errors** (`9803`, `9822`, `9823`, `9B03`, `9B22`, `C124`: "failed to
+  update port ... keyinfo") are logged once per code for each OpenSM
+  ("OpenSM's ... key manager failed to set class keys"). They don't fail
+  the fabric check.
 
-```sh
-SEED=$(docker exec alternative-fabric-manager alternative-fabric-manager \
-  --show-keys | awk '/^key_mgr_seed/{print $2}')
-sudo sed -i "/^\[opensm_conf\]/a key_mgr_seed = $SEED" \
-  /etc/alternative-fabric-manager/afm.conf
-unset SEED
-```
+#### Turning class keys off
 
-Re-running these commands adds the line twice: check `afm.conf` first.
-`afm.conf` then holds a secret, the seed, besides the database's password
-(see The keys).
+Ports keep their class keys until an SM that has them changes them. The
+manager records which classes the last `opensm.conf` it wrote enabled, and
+refuses a start that would skip step 1, with "Not starting OpenSM: ports
+may hold class keys ...":
 
-`[opensm] key_lease_period` doesn't apply to these options: it covers only
-leases that a hardening group writes. Their leases are OpenSM's default,
-60 s, unless you set `vs_key_lease_period`, `cc_key_lease_period` and
-`n2n_key_lease_period`. A lease is what would let a port keyed by mistake
-be keyed again without a power cycle, but that recovery hasn't been shown
-(see Permanent keys).
+1. Keep the group, set each `<class>_key_enable = 1` (Disable) in
+   `[opensm_conf]`, and restart. OpenSM clears the keys from the ports,
+   reaching them with the keys it derives from the seed, which the group
+   still writes.
+2. Check that OpenSM has finished: no port answers a VS query without the
+   key refused, and OpenSM's cache files `guid2vskey`, `guid2cckey` and
+   `guid2_n2n_key` no longer name keys. How to tell it has finished on
+   every port is what hardware test 3 is to establish; the manager can't.
+3. Only then remove the group and the `<class>_key_enable` lines.
 
-- **Not in HA mode yet.** Seed-only derivation has been shown on one host,
-  not across a takeover by another. A node that takes over without the same
-  lines would leave the ports keyed with keys its OpenSM doesn't manage.
-- **A lost or changed seed can leave ports keyed for good.** Never change
-  `key_mgr_seed` while ports are keyed, and keep the database backups. That
-  includes adding the line later: a fabric first keyed without it was keyed
-  from the M_Key, so adding the seed changes it.
-- **Turn them off by disabling first.** Set each `<class>_key_enable = 1`,
-  keeping the `key_mgr_seed` line, and restart. OpenSM is expected to clear
-  the keys from the ports, though that is untested. Only then remove the
-  options. Removing them at once leaves the ports keyed with keys the
-  subnet manager no longer manages.
+Removing the group at once, or setting a class's enable to 0 (Ignore),
+leaves the ports keyed with keys the subnet manager no longer manages: the
+manager refuses both while a class is recorded enabled. A downgrade to a
+release without the group, or restoring a database from before the record,
+has the same effect, and nothing refuses it: do step 1 before either.
 - **In-band tools need the VS key,** and which of them can take it is still
   being worked out. `ibdiagnet` takes `--vs_key_file`, pointed at OpenSM's
   `/var/cache/opensm/guid2vskey`, which makes that cache a secret.
 - **Not every device supports every class.** For ports that don't, OpenSM
   logs `ERR 9828` at every sweep. On the test fabric, only VS keys were
   supported.
-- **Tested so far:** on one host, VS keys derive from the seed alone. Their
-  effect on tenants, turning them off, a takeover, and a lease of 0 are
-  untested (see specs/secured-profile.md, Results).
+- **Tested so far:** on one host, by hand before the group existed, VS
+  keys derive from the seed alone. Their effect on tenants, turning them
+  off, a takeover, and a lease of 0 are untested (see
+  specs/secured-profile.md, Results).
+
+#### Before enabling class keys
+
+- **Back up** the database, which holds the seed, and OpenSM's cache volume
+  (`opensm_cache`), and check that the backup holds the seed without
+  showing it: `--show-keys | awk '$1 == "key_mgr_seed" {n++} END {print n +
+  0}'` prints 1. Restoring a database without that seed loses every keyed
+  port.
+- **Agree it** with whoever shares the fabric: in-band tools (`mlxlink`,
+  `mlxreg`, in-band `flint`, `ibdiagnet`, in-band firmware upgrades) need
+  the VS key once it's on, and which can take it isn't settled. For the
+  first run, prefer a fabric nobody else uses, and consider a lease, such
+  as `key_lease_period = 600`, so that a mistake may recover on its own.
+- **When turning it on,** restart the manager with `hardening = all,
+  class_keys`, and check that:
+  - the start didn't withhold the group ("... OpenSM starts without class
+    keys"): if it did, back up and restart again;
+  - `opensm.conf` has the lines above, and OpenSM reaches SUBNET UP;
+  - OpenSM wrote a VS key for every port to `guid2vskey` (count the lines,
+    never show them);
+  - the manager's log names which ports rejected which attribute (`ERR
+    9828`), and no key error;
+  - the fabric check passes, and a port's job completes.
+- **It works if** a VS query that sends no SMP, such as `vendstat -N` to a
+  switch, fails from a host without the VS key and answers with it, and a
+  restart of the manager, which restarts OpenSM, logs no key error.
+- **It failed if** the manager logs a key error ("failed to set class
+  keys"), OpenSM's KeyInfo Gets time out (`ERR 980B`), or VS queries answer
+  without the key while `guid2vskey` lists the port.
+- **To turn it off,** follow Turning class keys off. If the seed was lost,
+  the keyed ports need a lease lapse, a power cycle, or in-band firmware
+  tools given the old seed's keys.
 
 ### SA request rate
 
@@ -1145,6 +1201,8 @@ manager watches for. With `m_key_per_port` named, `[opensm_conf]` can't set
 `m_key`, `m_key_per_port`, `m_key_protection_level` or `m_key_lookup`
 either, and without it can't set `m_key_per_port` (see Per-port M_Keys).
 `[opensm_conf] allowed_sm_guids` is checked like the list the `allowed_sm`
-group writes (see Allowed subnet managers).
+group writes (see Allowed subnet managers). While a class key is recorded
+enabled, a start refuses removing `class_keys` or a `<class>_key_enable`
+of 0 (see Turning class keys off).
 OpenSM ignores an option it doesn't know, so check an override's spelling
 in `opensm -c` output.

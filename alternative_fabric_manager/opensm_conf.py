@@ -24,11 +24,12 @@ CONTAINER_CONFIG_DIR = "/etc/opensm"
 # Keys that every OpenSM of the fabric must share. The manager generates them
 # once and keeps them in its database.
 #
-# No group writes key_mgr_seed yet. OpenSM derives the class keys (VS, CC,
-# N2N) from it, and with leases of 0 a lost seed leaves ports keyed with keys
-# no SM can reproduce. So the manager stores it, if it's missing, whenever it
-# starts OpenSM (in HA mode, at a takeover), a release before any group can
-# key a port with it, and every backup of the database holds it by then (see
+# OpenSM derives the class keys (VS, CC, N2N) from key_mgr_seed, which only
+# the experimental class_keys group writes. With leases of 0 a lost seed
+# leaves ports keyed with keys no SM can reproduce. So the manager stores it,
+# if it's missing, whenever it starts OpenSM (in HA mode, at a takeover),
+# whatever the groups, and a start that stored it doesn't render class_keys:
+# every backup taken since holds it before a port is keyed with it (see
 # specs/secured-profile.md, The seed).
 #
 # Per-port M_Keys derive from m_key_base, not from m_key, which every port
@@ -97,6 +98,22 @@ HARDENING = {
     # ports, which the manager reads before each start
     # (specs/secured-profile.md, Allowed SM GUIDs). Experimental.
     "allowed_sm": {"allowed_sm_guids": GENERATED},
+    # Every port's vendor-specific, congestion control and node-to-node
+    # classes keyed, from the stored seed, so that a host can't reconfigure a
+    # switch with VS or CC MADs (specs/secured-profile.md, Class keys).
+    # Experimental. Ports keep the keys: turning it off is a procedure.
+    "class_keys": {
+        "vs_key_enable": "2",
+        "vs_key_ci_protect_bits": "1",
+        "vs_key_lease_period": "0",
+        "cc_key_enable": "2",
+        "cc_key_protect_bit": "1",
+        "cc_key_lease_period": "0",
+        "n2n_key_enable": "2",
+        "n2n_key_protect_bit": "1",
+        "n2n_key_lease_period": "0",
+        "key_mgr_seed": None,
+    },
 }
 
 

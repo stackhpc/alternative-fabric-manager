@@ -351,16 +351,16 @@ class AllowedSMs:
 
     # The fabric check
 
-    def check(self):
-        """Judge the SMs OpenSM logged ignoring since the last check: the
-        check's problems, and whether the fabric is contested
+    def check(self, findings):
+        """Judge the SMs OpenSM logged ignoring since the last check, given
+        the driver's LogFindings: the check's problems, and whether the
+        fabric is contested
 
-        Raises ReloadError if OpenSM's log can't be read, which the check
-        counts as a failed query: an SM it ignored meanwhile would be missed.
+        The manager reads the log, and a log that can't be read fails the
+        check as a failed query: an SM ignored meanwhile would be missed.
         """
-        if not self.active():
+        if not self.active() or findings is None:
             return [], False
-        findings = self.driver.log_findings()
         with self._session() as session:
             known = {
                 int(row.guid, 16) for row in session.scalars(sa.select(db.KnownSMPort))

@@ -48,7 +48,7 @@ ALL_HARDENING_GROUPS = (
 # Each joins all once its hardware tests pass (specs/secured-profile.md,
 # Choosing the groups). m_key_per_port leaves state on ports, their keys;
 # the implemented group hasn't run on hardware yet.
-EXPERIMENTAL_HARDENING_GROUPS = ("m_key_per_port", "allowed_sm")
+EXPERIMENTAL_HARDENING_GROUPS = ("m_key_per_port", "allowed_sm", "class_keys")
 HARDENING_GROUPS = ALL_HARDENING_GROUPS + EXPERIMENTAL_HARDENING_GROUPS
 # What OpenSM's cache volume must be mounted at for per-port M_Keys: the
 # manager copies neighbors and guid2mkey into it before each start, which a
@@ -222,8 +222,9 @@ class Config:
     # hardware, aren't in all, and are chosen by naming them beside it, as
     # "all, allowed_sm": m_key_per_port only permits per-port M_Keys, which
     # an operator's command begins; allowed_sm makes OpenSM ignore every SM
-    # outside this host's physical ports. Read docs/opensm-hardening.md,
-    # Before enabling, first.
+    # outside this host's physical ports; class_keys keys every port's VS,
+    # CC and N2N classes from the stored seed, and leaves keys on ports.
+    # Read docs/opensm-hardening.md, Before enabling, first.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
@@ -693,6 +694,13 @@ def _ha_problems(config):
         problems.append(
             "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
             "aren't supported in HA mode yet"
+        )
+    # A takeover by another host hasn't been shown to derive the same class
+    # keys (specs/secured-profile.md, The seed).
+    if "class_keys" in config.hardening_groups:
+        problems.append(
+            "[opensm] hardening can't include class_keys: class keys aren't "
+            "supported in HA mode yet"
         )
     # HA needs node rows with port GUIDs, configuration epochs, the managed
     # node SM rule and the fence ask first (specs/secured-profile.md,

@@ -1520,7 +1520,7 @@ and a re-cabled port.
       `all`.
 - [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
       `allowed_sm` in HA mode, once its dependencies are in.
-- [ ] `class_keys` for single node, experimental and outside `all`: the
+- [x] `class_keys` for single node, experimental and outside `all`: the
       seed rules, the logged rejections and key errors, and the turn-off
       guard, with its downgrade procedure in docs/opensm-hardening.md.
       Implemented before the rest of hardware test 3, at the user's

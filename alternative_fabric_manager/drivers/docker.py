@@ -111,6 +111,22 @@ _BAD_M_KEY_TRAP = re.compile(r"Received Generic Notice type:\d+ num:256\b")
 _ALLOWED_SM_REJECTED = re.compile(r"ERR 7549: allowed_sm_guids")
 # "ERR 0F09: Ignoring SM on port 0x%lx, is not part of the allowed port GUIDs"
 _IGNORED_SM = re.compile(r"ERR 0F09: Ignoring SM on port 0x([0-9a-fA-F]{1,16})\b")
+# A port that answered a class key manager's KeyInfo with an error status, as
+# the VS manager (9828) and the congestion control manager (C10A) log it:
+# "Received invalid status from port GUID 0x%lx, status:0x%x, attr_id:0x%x"
+_KEY_REJECTED = re.compile(
+    r"ERR (9828|C10A): Received invalid status from port GUID "
+    r"0x([0-9a-fA-F]{1,16}), status:0x([0-9a-fA-F]{1,8}), attr_id:0x([0-9a-fA-F]{1,8})"
+)
+# A key manager that failed to set keys: "failed to update port guid 0x%016lx
+# vskeyinfo" (9803, 9822), "... n2nkeyinfo" (9B03, 9B22), "failed to update
+# port (guid 0x%016lx) by CC keyinfo" (C124), "VS keys configuration has
+# failed" (9823)
+_KEY_FAILED = re.compile(
+    r"ERR (9803|9822|9B03|9B22|C124): failed to update port \(?guid "
+    r"0x([0-9a-fA-F]{1,16})"
+)
+_KEYS_FAILED = re.compile(r"ERR (9823): VS keys configuration has failed")
 # A line of the daemon's log with timestamps: RFC 3339, nanoseconds at most
 _LOG_TIME = re.compile(
     r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)"
@@ -174,6 +190,21 @@ def _note_finding(findings, line):
     match = _IGNORED_SM.search(line)
     if match:
         findings.ignored_sms.append(int(match.group(1), 16))
+        return
+    match = _KEY_REJECTED.search(line)
+    if match:
+        code, guid, status, attr = match.groups()
+        findings.key_rejections.append(
+            (code, int(guid, 16), int(status, 16), int(attr, 16))
+        )
+        return
+    match = _KEY_FAILED.search(line)
+    if match:
+        findings.key_errors.append((match.group(1), int(match.group(2), 16)))
+        return
+    match = _KEYS_FAILED.search(line)
+    if match:
+        findings.key_errors.append((match.group(1), None))
 
 
 def _is_partitions_error(line):

@@ -61,6 +61,9 @@ partitions_template =
 # "all, m_key_per_port" permits them.
 # allowed_sm, experimental, untested on hardware: "all, allowed_sm" makes
 # OpenSM ignore every subnet manager outside this host's physical ports.
+# class_keys, experimental, untested on hardware: "all, class_keys" keys
+# every port's VS, CC and N2N classes from the stored seed; it leaves keys on
+# ports, so turn it off by disabling first (docs/opensm-hardening.md).
 # [opensm_conf] overrides any single option.
 hardening = all
 # The lease, in seconds, of every key the manager sets on ports: the M_Key,
@@ -107,7 +110,7 @@ ipoib_sl = 0
 # opensm.conf options for the managed driver, as "key = value". These win
 # over the hardened options. OpenSM uses its defaults for the others.
 # partition_config_file and daemon are set by the manager. Experimental
-# hardening that isn't a group yet (class keys, an SA rate limit) is tried
+# hardening that isn't a group yet (an SA rate limit) is tried
 # here: see docs/opensm-hardening.md, Experimental hardening.
 # allowed_sm_guids replaces the allowed_sm group's list, with its checks.
 #sm_priority = 15

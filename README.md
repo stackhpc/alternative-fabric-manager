@@ -153,6 +153,13 @@ fabric's keys (`--record-sm-port`) fails the fabric check. See
 docs/opensm-hardening.md, Allowed subnet managers, and its Before enabling
 checklist.
 
+A third experimental group, untested on hardware, `class_keys`, chosen as
+`hardening = all, class_keys` in single-node mode, keys every port's
+vendor-specific, congestion control and node-to-node classes from the
+stored seed. It leaves keys on ports, and is turned off by disabling
+first: see docs/opensm-hardening.md, Class keys, and its Before enabling
+checklist.
+
 ### The partitions template
 
 `partitions.conf` is rendered from a Jinja template, in a sandbox. Set
