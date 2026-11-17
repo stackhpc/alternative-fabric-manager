@@ -795,18 +795,24 @@ naming the group doesn't begin it: an operator's `--confirm-fabric`
 does. One command confirms everything the turn-on rests on, so that the
 switches the prober trusts and the links OpenSM is given come from one
 look at the fabric, by one person. It replaces `--confirm-switches`,
-which is gone, with no alias: no release has had it. It runs beside the
+which is gone, with no alias: no stable release has had it. It runs beside the
 running manager, and:
 - while the group is named or rows exist, folds the links and ports
   that the running OpenSM's cache lists into the rows, as a check does;
 - records the switches the fabric check sees as the expected ones, as
   `--confirm-switches` did: `ibswitches`' with no rows, the prober's
-  with them (The prober), marking those it hadn't confirmed before;
+  with them (The prober). A switch the prober finds that wasn't
+  confirmed before is only recorded as pending, and marked in the
+  list: it isn't expected, trusted or routed through until a later run
+  finds it again, after the operator has read the list. Otherwise the
+  running manager would send both keys, at its next check, to whatever
+  answered as a switch. A prober run that's cut short confirms nothing,
+  rather than replacing the list with part of it;
 - then, if the group is named and the target is off, records the target
   on, and says that the next restart of the manager turns per-port keys
   on, provided that: the base was stored by an earlier start; links are
-  recorded; no switch was confirmed for the first time by this run (the
-  operator checks the list it printed, and runs it again); and the
+  recorded; no switch is left pending by this run (the operator checks
+  the list it printed, and runs it again); and the
   prober, run beside the running OpenSM with the switches just
   confirmed, finds every recorded port behind an up link holding
   `m_key`, and no row `unknown` behind an up link (one behind a down
