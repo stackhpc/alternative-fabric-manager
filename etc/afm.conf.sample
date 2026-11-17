@@ -57,7 +57,8 @@ partitions_template =
 # release notes, and remove it with -group if needed. The experimental
 # groups, untested on hardware, aren't in all, and are named beside it: read
 # their Before enabling checklists in docs/opensm-hardening.md first.
-# m_key_per_port, per-port M_Keys: "all, m_key_per_port" permits them.
+# m_key_per_port, per-port M_Keys, experimental, untested on hardware:
+# "all, m_key_per_port" permits them.
 # allowed_sm, experimental, untested on hardware: "all, allowed_sm" makes
 # OpenSM ignore every subnet manager outside this host's physical ports.
 # [opensm_conf] overrides any single option.

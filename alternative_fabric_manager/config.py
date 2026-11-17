@@ -46,7 +46,8 @@ ALL_HARDENING_GROUPS = (
 # The hardening groups of opensm_conf.HARDENING: all's, then the experimental
 # ones outside it, untested on hardware, chosen by naming them beside all.
 # Each joins all once its hardware tests pass (specs/secured-profile.md,
-# Choosing the groups). m_key_per_port leaves state on ports, their keys.
+# Choosing the groups). m_key_per_port leaves state on ports, their keys;
+# the implemented group hasn't run on hardware yet.
 EXPERIMENTAL_HARDENING_GROUPS = ("m_key_per_port", "allowed_sm")
 HARDENING_GROUPS = ALL_HARDENING_GROUPS + EXPERIMENTAL_HARDENING_GROUPS
 # What OpenSM's cache volume must be mounted at for per-port M_Keys: the

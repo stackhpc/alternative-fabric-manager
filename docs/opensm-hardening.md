@@ -68,7 +68,7 @@ such key at once (see Permanent keys).
 | `enforcement` | `allow_both_pkeys` | `FALSE` | `FALSE` | A port being both a full and a limited member of a partition |
 | `enforcement` | `sa_check_sgid_spoofing` | `TRUE` | `TRUE` | A client claiming another port's GID in an SA request |
 | `babbling_ports` | `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
-| `m_key_per_port` (experimental, not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
+| `m_key_per_port` (experimental, untested on hardware; not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
 | `allowed_sm` (experimental, untested on hardware; not in `all`) | `allowed_sm_guids` | unset (every SM takes part) | This host's physical ports | A tenant's subnet manager winning the election |
 
 The `enforcement` group is OpenSM's defaults already. It is written anyway,
@@ -83,7 +83,7 @@ accident.
 | With ConnectX-3 SR-IOV | `all`, with `sa_etm_allow_untrusted_guidinfo_rec = TRUE` in `[opensm_conf]` (see the SA enhanced trust model) |
 | Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `m_key, sm_key, enforcement`: an explicit list, so that no group switches on without the agreement of whoever shares the fabric. `babbling_ports` is left out because it disables ports that flood traps, which may be theirs |
 | Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it, a bare metal tenant can reconfigure switch ports |
-| Single node, with bare metal tenants, on a fabric you control or whose owner agrees, trying per-port M_Keys | `all, m_key_per_port`: experimental, and it leaves keys on ports (see Per-port M_Keys) |
+| Single node, with bare metal tenants, on a fabric you control or whose owner agrees, trying per-port M_Keys | `all, m_key_per_port`: experimental, untested on hardware, and it leaves keys on ports (see Per-port M_Keys) |
 | Single node, on a fabric where no other host should run a subnet manager, trying allowed SMs | `all, allowed_sm`: experimental, untested on hardware (see Allowed subnet managers) |
 
 ## The keys
@@ -629,7 +629,8 @@ would hand such a tenant every port's key. So the manager keeps a separate
 key, `m_key_base` (see The keys), and OpenSM's `m_key` line is the base
 only while per-port M_Keys are on.
 
-Per-port M_Keys are experimental, and not in `all`. Choose them with
+Per-port M_Keys are experimental, untested on hardware as a group, and
+not in `all`. Read Before enabling per-port M_Keys first. Choose them with
 `hardening = all, m_key_per_port`, or with `m_key_per_port` in an explicit
 list. The manager refuses the group:
 - in HA mode ("per-port M_Keys aren't supported in HA mode yet"), and with
@@ -1084,6 +1085,46 @@ record, and is sent the stored `m_key` when it comes back, perhaps with a
 new tenant, and an adapter that has reset its key. That matters only if a
 host can read the key of an SMP sent to it. That is settled before the
 group joins `all`.
+
+#### Before enabling per-port M_Keys
+
+Hardware test 5 ran the steps by hand, before the group existed; the
+implemented group hasn't been run on hardware yet (see Still to be shown).
+
+- **Back up** the database, which will hold `m_key_base`, and OpenSM's
+  whole cache volume (`opensm_cache`, `/var/cache/opensm`), and keep both
+  with `afm.conf`. Check that the backup holds the base without showing
+  it: `--show-keys | awk '$1 == "m_key_base" {n++} END {print n + 0}'`
+  prints 1.
+- **Agree it** with whoever shares the fabric. For the first run, prefer a
+  fabric nobody else uses, and consider a lease, such as `key_lease_period
+  = 600`, which hardware test 5 used, so that a mistake recovers on its own:
+  with a lease of 0, a port whose key is lost stays out of reach until it's
+  reset (see Permanent keys). Then run again with the lease you mean to
+  keep.
+- **Before the turn-on,** check that `--port-key-states` lists every
+  physical port you expect, each `m_key`, `reachable`, and none `lapsed`,
+  and that `--confirm-fabric` lists only real switches.
+- **When turning it on,** follow Turning them on, and check that:
+  - the start logs "Per-port M_Keys are on: OpenSM gave this host's port
+    and N switches their derived keys", then "Per-port M_Keys are on on
+    every reachable port";
+  - `--port-key-states` shows `target on, OpenSM last started on`, and
+    `derived` for every reachable port;
+  - the fabric check passes, and a port's job completes.
+- **It works if** a port answers a Get with the key `--port-m-key <guid>`
+  gives, taken into a variable, and refuses the stored `m_key`, the
+  switches included (test 5's gate); and a port reset on a second host
+  comes back keyed with its derived key.
+- **It failed if** the log shows "The start that turns per-port M_Keys on
+  failed", the fabric check fails with a detail from the table in Running
+  with them, the sweeps report Bad M_Key traps that keep rising, or a check
+  says "this host's port answers neither the stored M_Key nor its derived
+  key".
+- **To turn it off,** follow Turning them off, and wait for every port to
+  hold `m_key` before `--forget-port-keys`. If a start fails part-way, the
+  manager retries on the target (see Turning them on). If the database and
+  the cache volume don't belong together, see Backups and restores.
 
 ## Turning hardening on for a running fabric
 
