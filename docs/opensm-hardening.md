@@ -34,7 +34,10 @@ HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
 experimental: not tested enough to be on by default, and not part of `all`.
 You can try it by hand on a fabric you control (see Experimental hardening).
-Once its hardware tests pass, each is planned to become a group in `all`.
+One experimental group exists already, `m_key_per_port`, which is chosen by
+naming it beside `all`: `hardening = all, m_key_per_port` (see Per-port
+M_Keys). Once its hardware tests pass, each is planned to become a group in
+`all`.
 The release that adds one will say so in its notes, and `-group` will
 remove it. On a fabric that others share, prefer an explicit list of groups,
 so that nothing switches on at an upgrade without their agreement.
@@ -64,6 +67,7 @@ such key at once (see Permanent keys).
 | `enforcement` | `allow_both_pkeys` | `FALSE` | `FALSE` | A port being both a full and a limited member of a partition |
 | `enforcement` | `sa_check_sgid_spoofing` | `TRUE` | `TRUE` | A client claiming another port's GID in an SA request |
 | `babbling_ports` | `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
+| `m_key_per_port` (experimental, not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
 
 The `enforcement` group is OpenSM's defaults already. It is written anyway,
 so that `opensm.conf` shows the options and nothing weakens them by
@@ -77,6 +81,7 @@ accident.
 | With ConnectX-3 SR-IOV | `all`, with `sa_etm_allow_untrusted_guidinfo_rec = TRUE` in `[opensm_conf]` (see the SA enhanced trust model) |
 | Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `m_key, sm_key, enforcement`: an explicit list, so that no group switches on without the agreement of whoever shares the fabric. `babbling_ports` is left out because it disables ports that flood traps, which may be theirs |
 | Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it, a bare metal tenant can reconfigure switch ports |
+| Single node, with bare metal tenants, on a fabric you control or whose owner agrees, trying per-port M_Keys | `all, m_key_per_port`: experimental, and it leaves keys on ports (see Per-port M_Keys) |
 
 ## The keys
 
@@ -103,13 +108,23 @@ an override that differs from the stored seed. The override must be a
 non-zero 64-bit value, in hexadecimal (`0x...`) or decimal without leading
 zeros.
 
+The manager stores a fifth key in the same way, `m_key_base`, the base
+that per-port M_Keys derive each port's key from (see Per-port M_Keys). It
+is stored, if it's missing, whatever the groups, so that backups hold it
+before any port is keyed from it, and it is written to `opensm.conf`, as the
+`m_key` line, only while per-port M_Keys are on. It opens every port of the
+fabric once they are: `--show-keys` prints it as `m_key_base`, and it is
+the most secret of the keys.
+
 The keys are in:
 
 - the manager's database, which the manager creates readable only by root;
 - `opensm.conf`, which the manager writes readable only by root;
 - OpenSM's log: at startup OpenSM prints every option it loads, the keys
   included ("Loading Cached Option:m_key = ..."), so the OpenSM container's
-  log, and wherever it is shipped, holds them;
+  log, and wherever it is shipped, holds them. With per-port M_Keys on,
+  that `m_key` line is the base, and Bad M_Key traps print the key that was
+  sent (see Per-port M_Keys);
 - OpenSM's cache, `guid2mkey` in `/var/cache/opensm`, which holds each port's
   M_Key, and with class keys, `guid2vskey` and the like;
 - `afm.conf`, if a key or the seed is set in `[opensm_conf]`, as trying class
@@ -187,7 +202,9 @@ Choose the lease with both sides in mind:
   longer than the lease, the tenant reads the M_Key. That is one M_Key for
   every port of the fabric, and the manager can't rotate it yet. Once the
   subnet manager is back and the port is protected again, the tenant still
-  holds the key, and can read and set any port on the fabric for good. So
+  holds the key, and can read and set any port on the fabric for good.
+  (With per-port M_Keys on, a lapsed port gives away only its own key,
+  which opens only that port; see Per-port M_Keys.) So
   treat any outage with no subnet manager that lasts longer than the lease
   as a compromise of the M_Key. The manager stops OpenSM whenever it
   restarts, and in HA mode during a takeover, and while the database can't
@@ -262,6 +279,20 @@ Diagnostic tools that send SMPs from a host, such as `ibnetdiscover`,
 `iblinkinfo`, `smpquery`, `ibportstate`, `ibhosts` and `sminfo`, need the
 M_Key, with `-y <m_key>`. Tools that only read the local adapter, such as
 `ibstat`, don't.
+
+Take the key into a variable, never onto the screen:
+
+```sh
+KEY=$(docker exec alternative-fabric-manager alternative-fabric-manager \
+  --show-keys | awk '$1 == "m_key" {print $2}')
+smpquery -y $KEY nodeinfo <lid>
+unset KEY
+```
+
+Match the name exactly, as above: `/^m_key/` matches `m_key_base` too.
+With per-port M_Keys, each port has a key of its own, so one `-y` opens one
+port. Take it from `--port-m-key <guid>` instead, and query that port only
+(see Per-port M_Keys, Diagnostics with per-port M_Keys).
 
 ## SM_Key
 
@@ -355,6 +386,8 @@ Each is designed in specs/secured-profile.md, where it is planned as a
 group of its own, once hardware tests show it is safe. Until then you can
 try one by setting its OpenSM options in `[opensm_conf]`. The manager
 writes them as they are, and checks none of what the planned groups will.
+Per-port M_Keys are the exception: they are a group already, with the
+manager's checks, but not in `all` until their hardware tests pass.
 
 Try them only on a fabric you control, or with the agreement of everyone
 who shares it. Back up the database first (it holds the keys), and record
@@ -479,16 +512,487 @@ sa_rate_threshold = 1000
   the most path record requests. If OpenSM logs `4C11` for one, raise the
   limit.
 
+### Per-port M_Keys
+
+With the `m_key` group, every port on the fabric holds the same M_Key.
+Anyone who learns it from any one port can send SubnSet to every switch:
+rewrite pkey tables, which breaks every tenant's isolation, move LIDs, or
+take ports down. A bare metal tenant has root on a host with a port on the
+fabric, and there are several ways for that port's key to leave it: the
+host's own adapter may let root read it, a port whose lease lapses gives
+it to anyone who asks (this has happened on a test fabric; see Permanent
+keys), and an adapter with a non-volatile M_Key keeps it wherever the card
+goes. So the shared M_Key is only as secret as the least protected port.
+
+With per-port M_Keys, OpenSM gives each port its own key, derived from a
+base key and the port's GUID, so a key read from one port opens only that
+port, which its tenant controls anyway. Two limits remain. A tenant who
+knows their own port's GUID and key can search for the base offline, at
+about 2^63 SHA-1s. And a tenant who can make their adapter present another
+port's GUID is given that port's key, which only OpenSM's handling of
+duplicate GUIDs stands against.
+
+The base isn't the `m_key` that every port holds now. That is exactly the
+key tenants may have read, and since a GUID isn't secret, deriving from it
+would hand such a tenant every port's key. So the manager keeps a separate
+key, `m_key_base` (see The keys), and OpenSM's `m_key` line is the base
+only while per-port M_Keys are on.
+
+Per-port M_Keys are experimental, and not in `all`. Choose them with
+`hardening = all, m_key_per_port`, or with `m_key_per_port` in an explicit
+list. The manager refuses the group:
+- in HA mode ("per-port M_Keys aren't supported in HA mode yet"), and with
+  a driver other than `managed`: the manager must write OpenSM's cache and
+  run its prober in OpenSM's image;
+- without the `m_key` group;
+- without a writable volume at `/var/cache/opensm` in `[opensm] volumes`,
+  which the default `opensm_cache:/var/cache/opensm` is. A mode with `ro`
+  among its options, such as `ro,z`, makes it read-only;
+- with `m_key`, `m_key_per_port`, `m_key_protection_level` or
+  `m_key_lookup` in `[opensm_conf]`, which the group sets. Without the
+  group, `[opensm_conf]` can't set `m_key_per_port` either: by hand it
+  would re-key every port with no record of which key each holds.
+
+While any port holds its per-port key, a start also refuses `m_key_lookup`
+other than `TRUE` in `[opensm_conf]`, and a `hardening` without the `m_key`
+group: turning per-port M_Keys off depends on both.
+
+Per-port M_Keys leave state on ports: their keys change, and the stored
+`m_key` alone no longer opens them. On a fabric that others share, agree
+it with them before naming the group, before `--begin-port-keys`, and
+before removing the group again: each changes what OpenSM enforces, and
+the last two re-key every port.
+
+In the commands below, `docker exec alternative-fabric-manager
+alternative-fabric-manager` runs the command beside the running manager,
+as for `--show-keys`. Each command refuses in HA mode ("per-port M_Keys
+aren't available in HA mode"). GUIDs are hexadecimal, with or without
+`0x`.
+
+#### Before turning them on
+
+1. **Back up the database after the base is stored.** The first start of
+   a release with this group stores `m_key_base`, whatever the groups, and
+   so does `--show-keys`, which stores any missing key. A start that stored
+   the base can't begin per-port M_Keys: the next one, after a backup that
+   holds it, can. That check only sees what a start stored, so back up
+   after a `--show-keys` that stored it too. Ports keyed from a lost base,
+   with a lease of 0, can't be reached again (see Backups and restores
+   below).
+2. **Name the group and restart the manager.** That only permits per-port
+   M_Keys: OpenSM runs as before, with the shared `m_key`. The manager
+   starts recording the fabric's ports and links from OpenSM's cache at
+   every fabric check, and from then on the fabric check, job completion
+   and the sweeps follow the rules in Running with them, whichever key the
+   ports hold. Check the records with `--port-key-states`:
+
+   ```sh
+   docker exec alternative-fabric-manager alternative-fabric-manager \
+     --port-key-states
+   ```
+
+   Its first line is the target and what OpenSM last started with, such as
+   `target off, OpenSM last started off`. Each line after it is a recorded
+   port: its GUID, `switch`, `hca` or `-` (not yet known), the key it holds
+   (`m_key`, `derived` or `unknown`), and its flags (`lapsed`, `reachable`,
+   `released`, or `-`). It never shows a key.
+3. **Confirm the switches again, once ports are recorded,** and check the
+   list it prints:
+
+   ```sh
+   docker exec alternative-fabric-manager alternative-fabric-manager \
+     --confirm-switches
+   ```
+
+   With records, only a switch whose own GUID an operator confirmed counts
+   as one: only it is sent both the stored `m_key` and its derived key, is
+   routed through by the prober, and is counted by the fabric check. A Get
+   that passes through a node shows it the key, and a port that says it's
+   a switch, with any GUID it likes, could be a tenant's adapter answering
+   as one; any other port gets a tenant's port's rules. Until a switch is
+   confirmed, the prober reaches only this host's port and its peer, so
+   the fabric check finds the other ports lost. `--confirm-switches` now
+   runs the prober, follows every recorded port that answers as a switch,
+   confirmed or not, and records the GUIDs it found: check that each is
+   one of the fabric's switches, not an adapter, before relying on it.
+   It marks each GUID that wasn't confirmed before with "(new: check that
+   it's a switch)", and says how many there are.
+   These are the switches' port 0 GUIDs, where `ibswitches`, which
+   confirmed them before any port was recorded, gave node GUIDs. On a
+   switch whose two differ, the fabric check fails with "Missing switches:
+   ..." until you run `--confirm-switches` again with ports recorded.
+
+#### Turning them on
+
+OpenSM must know every port's GUID before the start that turns per-port
+M_Keys on, or it sends those ports a key of 0 and loses them. And that
+start must be one someone chose, not a restart after a crash. So once
+every port is recorded:
+
+```sh
+docker exec alternative-fabric-manager alternative-fabric-manager \
+  --begin-port-keys
+```
+
+It refuses, and changes nothing, unless:
+- the group is named, and the manager was restarted with it ("[opensm]
+  hardening doesn't name m_key_per_port: name it, and restart the manager,
+  first");
+- the base was already stored when the running manager started ("the
+  running manager's start stored the per-port M_Key base: restart the
+  manager after backing up the database, which then holds it, first");
+- the stored base is the one any ports were keyed from before ("its
+  fingerprint differs"; see Backups and restores);
+- links are recorded ("no links are recorded: OpenSM's cache hasn't listed
+  the fabric yet");
+- some switch is confirmed ("no switches are confirmed, so the prober can't
+  reach the ports beyond this host's: run --confirm-switches first");
+- the prober, run beside the running OpenSM, finds every recorded port
+  behind a link that's up answering the stored `m_key`, with protection
+  level 2. Otherwise it prints "every recorded port behind an up link must
+  answer the stored M_Key, with protection level 2", and the GUIDs that
+  didn't. If it found switches that aren't confirmed, it adds "switches
+  0x... aren't confirmed, so nothing beyond them was reached: check them,
+  and run --confirm-switches". Find out why each port didn't answer, for
+  example a lapsed port or one the prober can't route to, and run it
+  again.
+
+A port behind a link that's down doesn't stop it: it keeps its `m_key`
+record, and OpenSM re-keys it through that record when it comes back.
+
+The command records the target on, and prints "Per-port M_Keys will be
+turned on: restart the manager, whose start begins it". Restart the
+manager. That start verifies every recorded port, writes OpenSM's
+`neighbors` and a `guid2mkey` entry with the stored `m_key` for every port
+that holds it into OpenSM's cache volume, records a fingerprint of the base
+(a hash, not the key), and starts OpenSM with `m_key_per_port` and the
+base. OpenSM then re-keys every port it reaches. The log shows "Starting
+OpenSM with per-port M_Keys on (target on); N ports are changing".
+
+The start succeeds when OpenSM's cache, within `[opensm] start_timeout`,
+shows this host's port and every recorded switch that answered the verify
+holding its derived key. The log then shows "Per-port M_Keys are on:
+OpenSM gave this host's port and N switches their derived keys". While
+other ports are still changing, each fabric check logs "Per-port M_Keys
+turning on: N reachable ports still hold the stored M_Key", until "Per-port
+M_Keys are on on every reachable port". `--port-key-states` then shows
+`target on, OpenSM last started on`, and `derived` for every reachable
+port.
+
+If the start fails, whether OpenSM's cache doesn't show the keys in time
+or OpenSM doesn't start at all ("OpenSM didn't start: ..."), the manager
+logs "The start that turns per-port M_Keys on failed: ...", stops OpenSM,
+and runs the prober to find out whether any port left the key it held:
+- **No port moved, and no port is recorded as holding its derived key:**
+  the target is set back to off, and OpenSM is started
+  without per-port M_Keys: "... no port left the key it held, so the target
+  is set back to off and OpenSM is started without them; run
+  --begin-port-keys again once the cause is fixed". Fix the cause the
+  message names, and begin again.
+- **Some ports moved, or some port is recorded as holding its derived
+  key** (as one keyed by an earlier turn-on start that crashed would be):
+  the fabric is part-way, so the manager starts
+  OpenSM on the target again, from the verified records, and retries at
+  every check until a start succeeds: "... after OpenSM moved N ports (...)
+  to their derived keys: the fabric is part-way, so OpenSM is started on
+  the target again". Fix the cause if you can. If you can't, removing the
+  group turns per-port M_Keys off (see Turning them off), which gives the
+  moved ports the stored `m_key` back.
+- **The prober can't tell:** "... the prober can't tell which keys the
+  ports hold" or "can't tell whether any port moved": the manager doesn't
+  start OpenSM on either target until it can, and retries at every check.
+  No subnet manager runs meanwhile: the ports keep their keys, but nothing
+  new is configured and no job completes. Fix what stops the prober, which
+  the message names. Don't start OpenSM by hand: a start on the wrong
+  target loses the ports.
+
+If the verify before the first turn-on start fails or runs out of time,
+OpenSM starts as it last ran, without per-port M_Keys: "The verify before
+this start failed, so OpenSM starts with per-port M_Keys off, as it last
+ran, rather than beginning to turn them on; the next start tries again".
+The target stays on, so any later start, a restart after OpenSM stops
+included, tries again. But once OpenSM has started with them, before a
+start has met the success rule (for example after the manager restarts
+during a turn-on), the fabric may be part-way, and neither target is safe:
+a verify that fails then stops the start, "The verify before this start
+failed while per-port M_Keys are turning on, and the fabric may be
+part-way: OpenSM isn't started on either target until a verify succeeds",
+and it's retried. No subnet manager runs meanwhile, as above.
+
+Before every start, the manager reads OpenSM's cache from its volume. If
+the files can't be read or parsed, it writes nothing, since it would
+replace them unseen, and the start fails and is retried: "Can't read
+OpenSM's cache before starting it (...), so it isn't replaced unseen: the
+start is retried". Files that are absent are taken as a lost volume, and
+rebuilt from the records. So if OpenSM left a file truncated when it
+stopped, move that file out of the cache volume, with OpenSM stopped, and
+the next start rebuilds it.
+
+While the group is named or any port is recorded, a start of OpenSM that
+fails doesn't end the manager: it logs "Failed to start OpenSM, retrying
+at every check: ..." and the applier starts OpenSM again at every
+`[opensm] check_interval`, as it does when OpenSM stops. Read the reason
+in that line rather than waiting for the manager to exit. A start refused
+by the configuration (such as the `m_key` group removed while ports hold
+per-port keys) still ends it.
+
+#### Running with them
+
+**The records.** Two tables hold what the manager knows about the fabric,
+never a key. `fabric_ports` has, for each port GUID that OpenSM's
+`neighbors` lists, its node GUID, whether it's a switch (as its NodeInfo
+said), the key it holds (`m_key`, its derived key, or `unknown`), whether
+it lapsed (its protection was 0 at the last Get, so it answers any key),
+whether it's reachable, whether an operator released it, and when it was
+last seen. `fabric_links` has each link, both directions, as `neighbors`
+does. At every fabric check the manager reads `neighbors` and `guid2mkey`
+from the running OpenSM's cache into them. A `neighbors` line replaces the
+link recorded for its port, so a re-cabled port's new link replaces its
+old one, and the old switch port's link back to it is dropped. A link
+recorded in one direction only is neither followed nor written to
+OpenSM's cache: otherwise the port would be reached through a switch port
+it has left, and whatever is cabled there next taken for it. `--add-link`
+records both directions. Virtual functions never get a
+record, and a recorded port that disappears from OpenSM's files keeps its
+record, since a port that's down may come back holding its key. Before
+every start, the manager writes OpenSM's cache from the records.
+
+**The prober.** The manager can no longer run `ibswitches -y <m_key>`,
+which uses one key for the whole fabric. Instead it Gets NodeInfo and
+PortInfo with `smpquery` by directed route, from this host's port along the
+recorded links, in OpenSM's container, and only named fields of the
+answers leave it. A fabric check reaches the confirmed switches. A full
+verify, of every recorded port behind a link that's up and every switch
+port's link state, runs every `[opensm] port_verify_interval` seconds (60
+by default; it must be positive), and the fabric check uses its last
+result. Once any port can hold a derived key, the prober sends the stored
+`m_key` to a tenant's port only if its record says it holds it, and with
+per-port M_Keys on, never to one recorded `derived` or `unknown`, so that
+the old key isn't handed to tenants again. It tries the key a port's
+record names first, so that few Gets carry a wrong key: each such Get
+starts the port's lease countdown, if it has a lease, which the right
+key's Get stops.
+
+Before a start, when no OpenSM runs, the prober runs in a helper container
+from OpenSM's image, named after `[opensm] container` with `-prober`
+(`opensm-prober` by default), privileged and on the host network. Its
+configuration holds the Gets and their keys while it runs, so `docker
+inspect` of it shows keys: never inspect it or paste its configuration. It
+is removed after each run, and a start or stop of OpenSM removes one left
+behind.
+
+**Diagnostics with per-port M_Keys.** Each port answers only its own key,
+so a tool that walks the fabric with one `-y`, such as `ibnetdiscover`,
+`iblinkinfo` or `ibswitches`, reaches only the ports that hold that key.
+Use `--port-key-states` and the fabric check's detail to see the fabric,
+and query one port at a time, with its own key, taken into a variable and
+never displayed:
+
+```sh
+KEY=$(docker exec alternative-fabric-manager alternative-fabric-manager \
+  --port-m-key <guid>) && smpquery -y $KEY nodeinfo <lid>
+unset KEY
+```
+
+`--port-m-key` prints the key the port holds now, by its record: the
+stored `m_key`, or its derived key. It refuses a GUID with no record, or
+one whose key is `unknown`, and prints the stored `m_key` while nothing is
+recorded. For a switch, give the switch's GUID, as `--port-key-states`
+lists it. The key it prints opens that port, and a switch's opens that
+switch: keep it out of shells' history, logs and screens.
+
+**Jobs.** A job that binds or unbinds a recorded port GUID needs one more
+piece of evidence after its sweep: at a fabric check after that sweep, the
+prober's Get to the port answers with its key, or the switch port it's
+attached to shows its link down (OpenSM then sets its pkey table when the
+link comes up). A lapsed port, which answers any key, doesn't show that.
+Until then the job waits, with the error "Waiting for port 0x... to answer
+its M_Key, or show its link down, after the sweep: OpenSM may not reach
+it. --release-port completes its jobs as they are", and the log shows
+"Port 0x... hasn't answered its M_Key, nor shown its link down, since the
+sweep, so its jobs are held". Only that port's jobs wait: its own tenant
+can cause this, and it holds no one else's. If the port won't be reached
+again, for example on a node being retired, release it:
+
+```sh
+docker exec alternative-fabric-manager alternative-fabric-manager \
+  --release-port <guid>
+```
+
+That completes its jobs as they are. It changes nothing on the port, nor
+on its switch port, and lasts until the port next answers its key. A job
+on a GUID with no record, a virtual function's or a port not yet seen,
+completes as it did before.
+
+**Sweeps.** OpenSM's own log is an extra reason to hold jobs, since a lost
+port doesn't stop OpenSM logging SUBNET UP:
+- `ERR 5411` "DR SMP Send completed with error" names no port, so it holds
+  every job of the sweep ("OpenSM failed to send a directed-route SMP
+  during the sweep, which names no port, so no job of the sweep
+  completes").
+- `ERR 3113` for a NodeInfo or PortInfo Get names a `dest_guid`. If that is
+  a Neutron port's GUID, that port's jobs wait ("OpenSM couldn't reach
+  Neutron ports ... during the sweep; their jobs wait"); otherwise every
+  job of the sweep does ("... which aren't Neutron ports', so no job of the
+  sweep completes").
+- Bad M_Key traps are only counted ("OpenSM received N Bad M_Key traps
+  during the sweep"): a trap's sender writes the data that names it, so
+  traps hold no job.
+
+**The fabric check's failures.** Besides its usual checks, the fabric
+check fails, with these in its detail (after "Fabric check failed:" in the
+log), and no job completes meanwhile:
+
+| Detail | What it means, and what to do |
+| --- | --- |
+| "switch port 0x... port N has its link up with no recorded neighbour (record what's attached with --add-link)" | Something is attached that OpenSM hasn't recorded, which may be a port it can't reach. Find out what it is, then record the link: `--add-link <switch GUID>:<port> <peer GUID>:<port>` |
+| "ports that aren't Neutron ports' didn't answer their M_Keys: 0x... (no job completes until they're reached, or released with --release-port)" | A recorded port behind a link that's up, not a switch's nor a Neutron port's (a hypervisor's, or any other host's), didn't answer its key, or has lapsed, in the last full verify. Its virtual functions have no records, so their jobs would otherwise complete without evidence. Find out why it isn't reached, and once it is, the check passes again. For a port that won't be reached, `--release-port <guid>` |
+| "the last full verify of the ports' M_Keys is older than two port_verify_intervals" | Full verifies are failing or too slow: the log says why ("Can't verify every port's M_Key: ..."). A full verify must fit within one `port_verify_interval`: raise it on a large fabric |
+| "Missing switches: ..." | A confirmed switch wasn't reached. With ports recorded, the prober finds switches by their port 0 GUIDs, which may differ from the node GUIDs `ibswitches` confirmed: run `--confirm-switches` again and check its list. Until a switch is confirmed, nothing beyond it is reached |
+| "no full verify of the ports' M_Keys yet" | At a start, until the first full verify; if it stays, as above |
+| "Can't query the fabric: this host's port answers neither the stored M_Key nor its derived key" | OpenSM can't sweep from this host. Restore the database that holds its key, or wait for its lease to lapse, if it has one |
+
+**A tenant can hold every job of the fabric.** The rule on lost ports that
+aren't Neutron ports' is fabric-wide, since AFM can't tell which physical
+port a virtual function is on. So a bare metal tenant who leaves their node
+refusing its key and then releases the node, which makes its port's GUID
+no longer a Neutron port's, makes the fabric check fail: no job completes,
+anywhere on the
+fabric, until that port answers its key again or an operator runs
+`--release-port <guid>` for it. The check's detail names the port. This
+fails closed, by design: recognise it, check the port, and release it.
+
+**OpenSM's log holds keys.** Bad M_Key traps print the key that was sent,
+and at startup OpenSM prints the base as its `m_key` option. So OpenSM's
+log, the OpenSM container's output and the `opensm_logs` volume, is as
+secret as `opensm.conf`: keep it from tenants and from log shipping. The
+manager never logs a key, nor the prober's command lines: it masks keys in
+the lines of OpenSM's that it shows, and drops lines about Bad M_Key traps.
+The prober's keys are on `smpquery`'s command line, visible in `/proc` on
+this host, as `ibswitches -y` is without per-port M_Keys: this host must
+have no tenants.
+
+**Leases.** Per-port M_Keys use the same lease, `[opensm]
+key_lease_period` (see Permanent keys). With a lease of 0, a port that
+loses its key stays out of reach until it's reset. With a lease, a lapsed
+port gives away only its own key, but a port still on the stored `m_key`,
+during a turn-on or after a turn-off, gives away the shared key, as
+before.
+
+#### Backups and restores
+
+The database holds the base, and which key each port holds. Keep backups
+taken after the turn-on: those are the ones that can reach the ports.
+
+A start that finds the database and OpenSM's cache volume don't belong
+together keeps per-port M_Keys off, leaves the volume's files as they are,
+and starts OpenSM without them, so that OpenSM reaches each port through
+its own cache and gives it the stored `m_key`. It logs why: "The stored
+per-port M_Key base isn't the one the ports were keyed from (its
+fingerprint differs)", or "OpenSM's cache has M_Keys for N ports (...)
+that are neither the stored M_Key nor derived from the stored base",
+followed by "Keeping per-port M_Keys off, leaving OpenSM's cache as it is,
+and starting OpenSM without them". That happens, for example, with a
+database restored from before the base was stored. Every start keeps
+taking that path while the fingerprint differs, so once
+`--port-key-states` shows every port holding `m_key`, remove the group,
+restart, run `--forget-port-keys`, which also drops a fingerprint of
+another base, and begin again if you want per-port M_Keys.
+
+A database restored from after the base was stored but before the
+turn-on, the usual case, has the target off while the ports hold keys
+derived from its base, and no fingerprint, since that is recorded by the
+turn-on start. With the group named, the start adopts the target on rather
+than giving the ports the exposed `m_key` back, and logs "Ports hold keys
+derived from the stored base while the per-port M_Key target is off and no
+turn-on is recorded, as a database restored from before the turn-on would
+have: adopting the target on". An adopted target isn't held to the
+turn-on's success rule. Without the group named, it's an ordinary
+turn-off.
+
+With a fingerprint recorded, the database has seen a turn-on, so ports
+recorded as holding derived keys while the target is off are what a
+turn-off or a set-back left, such as a node that was down. If the group
+is named again, they're turned off like any others: the start logs
+"Per-port M_Keys are off, and ports recorded as holding derived keys are
+given the stored M_Key as OpenSM reaches them; --begin-port-keys turns
+per-port keys on". Once `--port-key-states` shows them holding `m_key`,
+`--begin-port-keys` turns per-port keys on again, after checking the
+fabric.
+
+Ports are lost only if the database is older than the base and OpenSM's
+cache volume is gone too: then nothing holds their keys. Recovering them
+needs a lease lapse (see Permanent keys), or in-band firmware tools (MFT)
+given each port's key, computed from a newer backup's base.
+
+#### Turning them off
+
+1. **Agree it** with whoever shares the fabric. Turning per-port M_Keys
+   off gives every port the stored `m_key` again, the old key, not the
+   base: a tenant who read it has it again, which turning off can't
+   avoid.
+2. **Remove the group, keeping `m_key`, and restart the manager.** The log
+   shows "The m_key_per_port group isn't named, so this start turns
+   per-port M_Keys off: OpenSM gives every port it reaches the stored
+   M_Key". The records stay: the start writes `neighbors` and an entry
+   with its derived key for every port that holds one, and OpenSM, without
+   the option, re-keys each port to the stored `m_key`.
+3. **Wait for every port.** Each fabric check logs "Per-port M_Keys turning
+   off: N reachable ports still hold their derived keys". Wait until
+   `--port-key-states` shows every port, HCAs included, holding `m_key`. A
+   port that's down keeps its derived key and its record until it comes
+   back.
+4. **Drop the records** with `--forget-port-keys`. It refuses while the
+   group is named or any port holds its derived key, but not for a port
+   whose key is `unknown`: check step 3 first. The base, and its
+   fingerprint, stay.
+
+Keep the managed driver until then: with another driver the records
+remain but nothing keeps them ("Per-port M_Key rows exist, but the ...
+driver can't keep them"). For hardware that has been removed, `--forget-port
+<guid>` drops one port and its links; it refuses a port seen in the last
+day.
+
+**Downgrades.** A release without the group can't write OpenSM's cache
+from the records, so ports holding derived keys would be lost. Before
+downgrading, turn per-port M_Keys off and wait for `--port-key-states` to
+show every port holding `m_key`, HCAs included. Restoring an older
+database is a downgrade too (see Backups and restores).
+
+#### Still to be shown
+
+The group joins `all` only after a run of the implemented group on one
+host, with a lease of 0 and the fabric owner's agreement, including its
+turn-off. Still to run:
+- a turn-on with a base that differs from the `m_key` the ports hold, and
+  a turn-on whose start fails and is set back;
+- a lease of 0, and a port reset seen from a second host;
+- a takeover on a second host, before HA mode allows the group, and a
+  re-cabled port.
+
+Not yet decided: a node that's down at the turn-on keeps its `m_key`
+record, and is sent the stored `m_key` when it comes back, perhaps with a
+new tenant, and an adapter that has reset its key. That matters only if a
+host can read the key of an SMP sent to it. That is settled before the
+group joins `all`.
+
 ## Turning hardening on for a running fabric
 
 OpenSM reads `opensm.conf` only when it starts, so the manager must be
 restarted, which restarts OpenSM. OpenSM then sets the M_Key on every port at
 its first sweep. Hosts that run diagnostic tools need the M_Key from then on.
 
+`m_key_per_port` is the exception: naming it and restarting doesn't change
+any port's key. Per-port M_Keys begin only at the start after
+`--begin-port-keys` (see Per-port M_Keys).
+
 ## Options the manager keeps
 
 Whatever `hardening` says, `[opensm_conf]` can't set `partition_config_file`,
 `daemon`, `log_file` or `no_partition_enforcement`, `part_enforce` must stay
 `both`, and `log_flags` must keep the levels `0x07`, whose messages the
-manager watches for. OpenSM ignores an option it doesn't know, so check an
-override's spelling in `opensm -c` output.
+manager watches for. With `m_key_per_port` named, `[opensm_conf]` can't set
+`m_key`, `m_key_per_port`, `m_key_protection_level` or `m_key_lookup`
+either, and without it can't set `m_key_per_port` (see Per-port M_Keys).
+OpenSM ignores an option it doesn't know, so check an override's spelling
+in `opensm -c` output.

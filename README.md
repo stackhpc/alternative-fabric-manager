@@ -133,6 +133,15 @@ group; `hardening = m_key, enforcement` only those. The keys set on
 ports are permanent by default; `[opensm] key_lease_period` gives them all
 a lease in one line instead (see docs/opensm-hardening.md, Permanent keys).
 
+An experimental group, `m_key_per_port`, chosen as `hardening = all,
+m_key_per_port` in single-node mode with the managed driver, gives each
+port an M_Key of its own, so that a key read from one port no longer opens
+every switch. It leaves keys on ports, and is turned on and off by an
+operator's procedure: see docs/opensm-hardening.md, Per-port M_Keys. With
+it, a diagnostic tool's `-y` needs the port's own key, from
+`alternative-fabric-manager --port-m-key <guid>` into a variable, rather
+than `m_key` from `--show-keys`.
+
 ### The partitions template
 
 `partitions.conf` is rendered from a Jinja template, in a sandbox. Set
