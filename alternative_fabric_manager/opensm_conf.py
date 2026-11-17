@@ -114,6 +114,11 @@ HARDENING = {
         "n2n_key_lease_period": "0",
         "key_mgr_seed": None,
     },
+    # At most this many SA requests per 100 ms from one port: OpenSM drops the
+    # rest, logging ERR 4C11. Experimental: hardware test 4 decides whether
+    # it counts per port GUID, and the value (specs/secured-profile.md, SA
+    # request rate).
+    "sa_rate": {"sa_rate_threshold": "1000"},
 }
 
 

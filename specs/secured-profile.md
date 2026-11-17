@@ -1547,7 +1547,7 @@ and a re-cabled port.
 - [ ] Hardware test 3 (first run done, see Results), the rest with the
       implemented group. Then `class_keys` in HA mode, after the
       second-host legs.
-- [ ] `sa_rate` for single node, experimental and outside `all`, with
+- [x] `sa_rate` for single node, experimental and outside `all`, with
       `4C11` logged. Implemented before hardware test 4, at the user's
       request.
 - [ ] Hardware test 4. Then `sa_rate` joins `all`, or is removed with a

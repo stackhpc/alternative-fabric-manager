@@ -48,7 +48,12 @@ ALL_HARDENING_GROUPS = (
 # Each joins all once its hardware tests pass (specs/secured-profile.md,
 # Choosing the groups). m_key_per_port leaves state on ports, their keys;
 # the implemented group hasn't run on hardware yet.
-EXPERIMENTAL_HARDENING_GROUPS = ("m_key_per_port", "allowed_sm", "class_keys")
+EXPERIMENTAL_HARDENING_GROUPS = (
+    "m_key_per_port",
+    "allowed_sm",
+    "class_keys",
+    "sa_rate",
+)
 HARDENING_GROUPS = ALL_HARDENING_GROUPS + EXPERIMENTAL_HARDENING_GROUPS
 # What OpenSM's cache volume must be mounted at for per-port M_Keys: the
 # manager copies neighbors and guid2mkey into it before each start, which a
@@ -223,7 +228,8 @@ class Config:
     # "all, allowed_sm": m_key_per_port only permits per-port M_Keys, which
     # an operator's command begins; allowed_sm makes OpenSM ignore every SM
     # outside this host's physical ports; class_keys keys every port's VS,
-    # CC and N2N classes from the stored seed, and leaves keys on ports.
+    # CC and N2N classes from the stored seed, and leaves keys on ports;
+    # sa_rate limits each port's SA requests (sa_rate_threshold).
     # Read docs/opensm-hardening.md, Before enabling, first.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
@@ -694,6 +700,13 @@ def _ha_problems(config):
         problems.append(
             "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
             "aren't supported in HA mode yet"
+        )
+    # Untested anywhere: experimental groups are single node until their
+    # hardware tests run (specs/secured-profile.md, SA request rate).
+    if "sa_rate" in config.hardening_groups:
+        problems.append(
+            "[opensm] hardening can't include sa_rate: the SA request rate "
+            "limit isn't supported in HA mode yet"
         )
     # A takeover by another host hasn't been shown to derive the same class
     # keys (specs/secured-profile.md, The seed).

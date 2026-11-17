@@ -158,7 +158,9 @@ A third experimental group, untested on hardware, `class_keys`, chosen as
 vendor-specific, congestion control and node-to-node classes from the
 stored seed. It leaves keys on ports, and is turned off by disabling
 first: see docs/opensm-hardening.md, Class keys, and its Before enabling
-checklist.
+checklist. A fourth, `sa_rate`, also experimental and untested on
+hardware, limits each port's SA requests (`hardening = all, sa_rate`; see
+SA request rate).
 
 ### The partitions template
 

@@ -127,6 +127,12 @@ _KEY_FAILED = re.compile(
     r"0x([0-9a-fA-F]{1,16})"
 )
 _KEYS_FAILED = re.compile(r"ERR (9823): VS keys configuration has failed")
+# OpenSM 5.17's "ERR 4C11: Number of sent SA queries %u for GUID 0x%lx Port
+# 0x%lx is bigger than sa_rate_threshold: %u"
+_SA_LIMITED = re.compile(
+    r"ERR 4C11: Number of sent SA queries (\d+) for GUID 0x([0-9a-fA-F]{1,16}) "
+    r"Port 0x([0-9a-fA-F]{1,16}) is bigger than sa_rate_threshold: (\d+)"
+)
 # A line of the daemon's log with timestamps: RFC 3339, nanoseconds at most
 _LOG_TIME = re.compile(
     r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)"
@@ -205,6 +211,13 @@ def _note_finding(findings, line):
     match = _KEYS_FAILED.search(line)
     if match:
         findings.key_errors.append((match.group(1), None))
+        return
+    match = _SA_LIMITED.search(line)
+    if match:
+        count, guid, port, threshold = match.groups()
+        findings.sa_limited.append(
+            (int(guid, 16), int(port, 16), int(count), int(threshold))
+        )
 
 
 def _is_partitions_error(line):

@@ -86,12 +86,15 @@ class LogFindings:
       an error status (ERR 9828, C10A), as (code, port GUID, status,
       attribute ID);
     - key_errors: a key manager's failures to set keys, as (code, port GUID
-      or None)"""
+      or None);
+    - sa_limited: SA requests OpenSM dropped over sa_rate_threshold (ERR
+      4C11), as (GUID, port, count, threshold)"""
 
-    def __init__(self, ignored_sms=(), key_rejections=(), key_errors=()):
+    def __init__(self, ignored_sms=(), key_rejections=(), key_errors=(), sa_limited=()):
         self.ignored_sms = list(ignored_sms)
         self.key_rejections = list(key_rejections)
         self.key_errors = list(key_errors)
+        self.sa_limited = list(sa_limited)
 
 
 class Fabric:

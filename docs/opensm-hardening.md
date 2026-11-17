@@ -33,9 +33,9 @@ HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 
 Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
 experimental, untested on hardware: not part of `all`, and not on by
-default. The experimental groups are `m_key_per_port`, `allowed_sm` and
-`class_keys`, each chosen by naming it beside `all`, as `hardening = all,
-allowed_sm` (see
+default. The experimental groups are `m_key_per_port`, `allowed_sm`,
+`class_keys` and `sa_rate`, each chosen by naming it beside `all`, as
+`hardening = all, allowed_sm` (see
 Experimental hardening). Before naming one, read its "Before enabling"
 checklist: what to back up, what to check when it's turned on, what shows it
 works or failed, and how to turn it off. Once its hardware tests pass, each
@@ -72,6 +72,7 @@ such key at once (see Permanent keys).
 | `m_key_per_port` (experimental, untested on hardware; not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
 | `allowed_sm` (experimental, untested on hardware; not in `all`) | `allowed_sm_guids` | unset (every SM takes part) | This host's physical ports | A tenant's subnet manager winning the election |
 | `class_keys` (experimental, untested on hardware; not in `all`) | `vs_key_enable`, `cc_key_enable`, `n2n_key_enable` | `0` (Ignore) | `2` (Enable), with protect bits `1`, leases `[opensm] key_lease_period` and `key_mgr_seed` the stored seed | A host reconfiguring switches with vendor-specific or congestion control MADs |
+| `sa_rate` (experimental, untested on hardware; not in `all`) | `sa_rate_threshold` | `0` (no limit) | `1000` per 100 ms | One port flooding the SA |
 
 The `enforcement` group is OpenSM's defaults already. It is written anyway,
 so that `opensm.conf` shows the options and nothing weakens them by
@@ -132,8 +133,8 @@ The keys are in:
   sent (see Per-port M_Keys);
 - OpenSM's cache, `guid2mkey` in `/var/cache/opensm`, which holds each port's
   M_Key, and with class keys, `guid2vskey` and the like;
-- `afm.conf`, if a key or the seed is set in `[opensm_conf]`, as trying class
-  keys does (see Experimental hardening).
+- `afm.conf`, if a key or the seed is set in `[opensm_conf]`. The
+  `class_keys` group writes the stored seed itself, so it needn't be.
 
 Keep them all from tenants and from log shipping. To print the keys:
 
@@ -388,12 +389,10 @@ is what prevents that.
 These options close the rest of the gaps between AFM's hardening and
 NVIDIA UFM's Secured Cloud Profile. None is enabled by default or by `all`.
 Each is designed in specs/secured-profile.md. Some are groups already,
-experimental, untested on hardware: `m_key_per_port`, `allowed_sm` and
-`class_keys`, each with the manager's checks, chosen by naming it beside
-`all`, and planned to join `all` once their hardware tests pass. The
-others you can try by setting their OpenSM options in `[opensm_conf]`: the
-manager writes them as they are, and checks none of what the planned
-groups will.
+experimental, untested on hardware: `m_key_per_port`, `allowed_sm`,
+`class_keys` and `sa_rate`, each with the manager's checks, chosen by
+naming it beside `all`, and planned to join `all` once their hardware
+tests pass. HA mode refuses all four.
 
 Each group has a "Before enabling" checklist, drawn from the hardware tests
 the spec plans for it. Its first enabling on a fabric is that test: follow
@@ -644,13 +643,17 @@ has the same effect, and nothing refuses it: do step 1 before either.
 
 ### SA request rate
 
-`sa_rate_threshold` limits how many SA requests a port may send per 100 ms.
-OpenSM drops the rest, and logs `ERR 4C11`.
+**Experimental, untested on hardware.** `sa_rate_threshold` limits how many
+SA requests a port may send per 100 ms. OpenSM drops the rest, and logs
+`ERR 4C11`. The `sa_rate` group, chosen with `hardening = all, sa_rate` in
+single-node mode, sets it to 1000. `[opensm_conf] sa_rate_threshold`
+overrides the value, and sets the limit even without the group. HA mode
+refuses the group.
 
-```ini
-[opensm_conf]
-sa_rate_threshold = 1000
-```
+The manager logs each GUID OpenSM limited, once for each OpenSM it starts:
+"OpenSM dropped SA requests from GUID 0x... (port 0x...): N in 100 ms,
+over sa_rate_threshold 1000 (ERR 4C11)". It never fails the fabric check
+on it: a tenant flooding the SA would otherwise stop every job.
 
 - **It may limit neighbours together.** Whether OpenSM counts per port GUID
   or per physical port is untested. If it counts per physical port, one
@@ -658,6 +661,29 @@ sa_rate_threshold = 1000
 - **Check it against your heaviest start-up.** An MPI job's start-up makes
   the most path record requests. If OpenSM logs `4C11` for one, raise the
   limit.
+- **The manager's own queries** send the SA_Key; whether trusted requesters
+  are limited is untested. If they are, the fabric check fails with
+  "saquery failed".
+
+#### Before enabling the SA request rate
+
+- **Back up** `afm.conf` and `opensm.conf`. The group leaves nothing on
+  ports.
+- **Agree it** with whoever shares the fabric: their clients' SA requests
+  are limited too.
+- **When turning it on,** restart the manager with `hardening = all,
+  sa_rate`, and check that `opensm.conf` has `sa_rate_threshold 1000`,
+  OpenSM reaches SUBNET UP, and the fabric check passes.
+- **It works if** (hardware test 4, on a fabric nobody else uses) a guest
+  flooding the SA, such as with `saquery` in a loop, is named in a `4C11`
+  line, and a guest on another virtual function of the same physical port
+  is still answered; and an MPI job's start-up across the fabric logs no
+  `4C11`.
+- **It failed if** `4C11` names a GUID that isn't the flooder's, such as
+  its neighbours' or this host's, the fabric check fails with "saquery
+  failed", or a job's start-up is limited.
+- **To turn it off,** remove the group (and any `sa_rate_threshold`) and
+  restart the manager, or raise the threshold.
 
 ### Per-port M_Keys
 

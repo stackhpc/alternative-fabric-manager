@@ -40,6 +40,7 @@ from alternative_fabric_manager import (
     opensm_conf,
     partitions,
     port_keeper,
+    sa_rate,
 )
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager.drivers import (
@@ -180,6 +181,8 @@ class Manager:
         self._allowed_list = None
         # Class keys: the seed rule and the turn-off guard
         self.class_keys = class_keys.ClassKeys(self)
+        # The SA request rate limit's drops, logged
+        self.sa_rate = sa_rate.SARate(self)
 
     # Requests
 
@@ -1012,6 +1015,7 @@ class Manager:
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
         self.class_keys.reset()
+        self.sa_rate.reset()
         self._write_opensm_conf()
         # What OpenSM starts with is recorded as swept only if the driver saw
         # OpenSM's first sweep read it; a driver may not start OpenSM at all.
@@ -1471,6 +1475,8 @@ class Manager:
             sm_problems, sm_contested = self.allowed_sms.check(findings)
             if findings is not None and self.class_keys.watching():
                 self.class_keys.report(findings)
+            if findings is not None and self.sa_rate.watching():
+                self.sa_rate.report(findings)
         except ReloadError as e:
             # Not knowing is no evidence either way: a contested fabric stays
             # contested until a check passes.
@@ -1516,7 +1522,11 @@ class Manager:
     def _log_findings(self):
         """What OpenSM logged since the last check, read only when a group
         that judges it is in effect, or None"""
-        if not (self.allowed_sms.active() or self.class_keys.watching()):
+        if not (
+            self.allowed_sms.active()
+            or self.class_keys.watching()
+            or self.sa_rate.watching()
+        ):
             return None
         if not self.driver.running():
             return None
