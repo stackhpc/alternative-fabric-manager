@@ -579,10 +579,10 @@ def test_port_key_commands_refuse_what_cant_be_done(tmp_path, args, match):
         _cli(path, *args)
 
 
-def test_begin_port_keys_needs_the_group(tmp_path):
-    path = _per_port_conf(tmp_path, hardening="all")
-    with pytest.raises(SystemExit, match="doesn't name m_key_per_port"):
-        _cli(path, "--begin-port-keys")
+def test_confirm_fabric_with_no_fabric_to_check_sees_no_switches(tmp_path):
+    path = _per_port_conf(tmp_path, hardening="all", extra="driver = none\n")
+    with pytest.raises(SystemExit, match="OpenSM sees no switches"):
+        _cli(path, "--confirm-fabric")
 
 
 def test_port_key_commands_are_refused_in_ha_mode(tmp_path, monkeypatch):

@@ -21,6 +21,10 @@ from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
 
 DEFAULT_CONFIG = "/etc/alternative-fabric-manager/afm.conf"
+# How --confirm-fabric marks a switch it found for the first time
+PENDING_MARK = (
+    " (new: not trusted until you confirm the fabric again; check that it's a switch)"
+)
 
 
 def main(argv=None):
@@ -38,10 +42,14 @@ def main(argv=None):
         "its own key: take -y's from --port-m-key instead",
     )
     parser.add_argument(
-        "--confirm-switches",
+        "--confirm-fabric",
         action="store_true",
         help="Record the switches OpenSM sees now as the fabric's expected "
-        "ones, which every fabric check must find, and exit",
+        "ones, which every fabric check must find, and, with per-port M_Keys, "
+        "the links its cache lists, and exit. With the m_key_per_port "
+        "hardening group named, it also arms the turn-on of per-port M_Keys, "
+        "which the manager's next start begins, once every port is found "
+        "ready; otherwise it says why not and exits non-zero",
     )
     enforcement = parser.add_mutually_exclusive_group()
     enforcement.add_argument(
@@ -101,13 +109,6 @@ def main(argv=None):
         "with or without 0x",
     )
     commands = ports.add_mutually_exclusive_group()
-    commands.add_argument(
-        "--begin-port-keys",
-        action="store_true",
-        help="Turn per-port M_Keys on at the manager's next start, once the "
-        "prober finds every recorded port behind an up link holding the "
-        "stored M_Key; lists the ports that don't",
-    )
     commands.add_argument(
         "--port-key-states",
         action="store_true",
@@ -225,29 +226,43 @@ def main(argv=None):
             print(f"{name} {value}")
         return
 
-    if args.confirm_switches:
+    if args.confirm_fabric:
         manager = manager_mod.Manager(
             config,
             db.make_sessionmaker(config.database_url),
             drivers.make_driver(config),
         )
-        # The prober follows any row that answers as a switch, which an
-        # adapter can: a switch it finds that wasn't confirmed before is
-        # marked, for the operator to check before trusting it.
-        prober = manager.port_keeper.uses_prober()
-        before = manager.port_keeper.confirmed_switches()
-        switches = manager.confirm_switches()
-        if not switches:
+        try:
+            confirmation = manager.confirm_fabric()
+        except drivers.ReloadError as e:
+            # The switches weren't recorded: the fabric couldn't be asked, as
+            # when this host's port answers no key the manager holds. The
+            # links OpenSM's cache lists may have been, as a check records
+            # them.
+            sys.exit(
+                f"alternative-fabric-manager: can't confirm the fabric: {e} "
+                "(no switch was confirmed)"
+            )
+        if not confirmation.switches:
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
-        new = [guid for guid in switches if guid not in before] if prober else []
-        for guid in switches:
-            mark = " (new: check that it's a switch)" if guid in new else ""
+        for guid in confirmation.switches:
+            mark = PENDING_MARK if guid in confirmation.pending else ""
             print(f"0x{guid:016x}{mark}")
-        if new:
+        if confirmation.pending:
             print(
-                f"{len(new)} switches weren't confirmed before: each is trusted "
-                "with both M_Keys now, so check that it's a switch, not an "
-                "adapter that answers as one"
+                f"{len(confirmation.pending)} switches are new, and pending: none "
+                "is expected or trusted until --confirm-fabric finds it again, "
+                "so check that each is a switch, not an adapter that answers as "
+                "one, and run it again"
+            )
+        if confirmation.note:
+            print(confirmation.note)
+        if confirmation.problems:
+            sys.stdout.flush()
+            sys.exit(
+                "alternative-fabric-manager: the switches are confirmed, but "
+                "per-port M_Keys aren't armed:\n"
+                + "\n".join(f"- {problem}" for problem in confirmation.problems)
             )
         return
 
@@ -260,8 +275,7 @@ def main(argv=None):
         return
 
     if (
-        args.begin_port_keys
-        or args.port_key_states
+        args.port_key_states
         or args.port_m_key is not None
         or args.add_link is not None
         or args.release_port is not None
@@ -323,15 +337,11 @@ def _port_keys(config, args):
     """The per-port M_Key commands, beside the running manager"""
     if config.ha:
         raise port_keeper.PortKeysError("per-port M_Keys aren't available in HA mode")
-    # Only --begin-port-keys runs the prober, beside the running OpenSM.
-    driver = drivers.make_driver(config) if args.begin_port_keys else drivers.NoOpenSM()
     manager = manager_mod.Manager(
-        config, db.make_sessionmaker(config.database_url), driver
+        config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
     )
     keeper = manager.port_keeper
-    if args.begin_port_keys:
-        print(keeper.begin())
-    elif args.port_key_states:
+    if args.port_key_states:
         print("\n".join(keeper.states()))
     elif args.port_m_key is not None:
         print(keeper.port_m_key(port_keeper.parse_guid(args.port_m_key)))

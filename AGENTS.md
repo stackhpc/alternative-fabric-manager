@@ -113,8 +113,12 @@ there manages the fabric's OpenSM, so:
   `[opensm] key_lease_period`, setting hardening options by hand in
   `[opensm_conf]` (the experimental ones in docs/opensm-hardening.md), or
   deploying a release that adds a group to `all`. Naming
-  `m_key_per_port`, running `--begin-port-keys` and removing the group
-  are such changes, and the last two re-key every port. A deployment with
+  `m_key_per_port` and removing it are such changes, and so is
+  **`--confirm-fabric` where the group is named and the keys are off: it
+  arms the turn-on** once its preconditions hold (base stored by an
+  earlier start, links recorded, no switch new to that run, every port on
+  `m_key`), and the next restart re-keys every port. Never run it there
+  as a routine step. A deployment with
   `all` (or only removals) gains each group its release notes name; one
   with an explicit list of groups gains none. With M_Key protection on,
   SMP tools (`ibswitches`, `smpquery`, `ibportstate`) need `-y $KEY`.

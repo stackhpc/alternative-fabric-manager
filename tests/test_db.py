@@ -86,6 +86,33 @@ def test_an_old_state_table_gains_its_text_column(tmp_path):
         assert session.get(db.FabricPort, "0" * 16).holds == "unknown"
 
 
+def test_an_old_expected_switches_table_gains_its_pending_column(tmp_path):
+    # Switches confirmed before are confirmed, not pending; a row added
+    # without the column, as by an older version, isn't pending either.
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE expected_switches (guid VARCHAR(16) NOT NULL PRIMARY KEY);
+        INSERT INTO expected_switches VALUES ('0000000000000051');
+        """
+    )
+    connection.commit()
+    connection.close()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000051").pending is False
+        session.execute(
+            sa.text("INSERT INTO expected_switches (guid) VALUES ('0000000000000052')")
+        )
+        session.add(db.ExpectedSwitch(guid="0000000000000053", pending=True))
+        session.commit()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000052").pending is False
+        assert session.get(db.ExpectedSwitch, "0000000000000053").pending is True
+
+
 def test_fabric_ports_and_links_round_trip(config):
     import datetime
 
@@ -204,6 +231,13 @@ def test_a_server_database_at_0003_gains_the_port_key_tables():
             db.FabricLink(guid="0" * 16, port=1, peer_guid="1" * 16, peer_port=2)
         )
         session.commit()
+    # A row an older version adds, without the pending column, isn't pending.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO expected_switches (guid) VALUES ('0000000000000051')"
+        )
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000051").pending is False
     engine.dispose()
     with root.begin() as connection:
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")

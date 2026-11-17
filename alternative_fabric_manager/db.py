@@ -200,6 +200,14 @@ class ExpectedSwitch(Base):
     __tablename__ = "expected_switches"
 
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    # Found by the prober for the first time by the last --confirm-fabric:
+    # not expected, trusted or routed through until a later run finds it
+    # again, since anything can answer as a switch. With a server default,
+    # so that a version without it can still add rows during a rolling
+    # upgrade.
+    pending: orm.Mapped[bool] = orm.mapped_column(
+        default=False, server_default=sa.false()
+    )
 
 
 class Lease(Base):
@@ -352,6 +360,9 @@ _ADDED_COLUMNS = {
     },
     "state": {
         "text": "VARCHAR(255)",
+    },
+    "expected_switches": {
+        "pending": "BOOLEAN NOT NULL DEFAULT 0",
     },
 }
 

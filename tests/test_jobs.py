@@ -34,7 +34,7 @@ def _fabric(switches=(SWITCH,), sms=((OWN, 3),)):
 def fabric(manager, reloader):
     """A fabric with one switch, confirmed"""
     reloader.fabric_result = _fabric()
-    assert manager.confirm_switches() == [SWITCH]
+    assert manager.confirm_fabric().switches == [SWITCH]
     return reloader
 
 
@@ -112,7 +112,7 @@ def test_unconfirmed_switches_hold_jobs(manager, reloader):
     job = manager.put_network(NETWORK_ID, conftest.network())
     manager.reconcile()
     assert _status(manager, job) == db.JobStatus.PENDING
-    manager.confirm_switches()
+    manager.confirm_fabric()
     manager.reconcile()
     assert _status(manager, job) == db.JobStatus.COMPLETED
 

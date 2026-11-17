@@ -408,7 +408,7 @@ def verify(
     trusted_switches, every row recorded as a switch counts.
 
     follow_unconfirmed routes through, and counts, every row that answers
-    as a switch, trusted or not, for --confirm-switches to find switches
+    as a switch, trusted or not, for --confirm-fabric to find switches
     to confirm; which keys a port is sent still follows trusted_switches.
     """
     return _Verify(

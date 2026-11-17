@@ -178,6 +178,20 @@ class _Evidence:
 
 
 @dataclasses.dataclass
+class Confirmation:
+    """What --confirm-fabric did: the switches it found, those of them it
+    recorded as pending (found by the prober for the first time, so not
+    trusted until a later run finds them again), and, with the group named,
+    whether it armed the turn-on, a line to say, and why it didn't arm it"""
+
+    switches: list = dataclasses.field(default_factory=list)
+    pending: list = dataclasses.field(default_factory=list)
+    armed: bool = False
+    note: str | None = None
+    problems: list = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class CheckOutcome:
     """What the per-port M_Key part of a fabric check found: the switches
     the prober reached, for _judge, or None to ask ibswitches as before;
@@ -281,9 +295,12 @@ class PortKeeper:
 
     def _trusted(self, session):
         """The switches an operator confirmed, which alone may be sent both
-        keys"""
+        keys, and routed through: not the pending ones"""
         return {
-            int(row.guid, 16) for row in session.scalars(sa.select(db.ExpectedSwitch))
+            int(row.guid, 16)
+            for row in session.scalars(
+                sa.select(db.ExpectedSwitch).where(db.ExpectedSwitch.pending.is_(False))
+            )
         }
 
     # Writing the rows: short transactions on fresh rows
@@ -327,7 +344,7 @@ class PortKeeper:
         yet, are reached one level of switches at a time
 
         Only the switches an operator confirmed are routed through, unless
-        follow_unconfirmed, which --confirm-switches alone passes.
+        follow_unconfirmed, which --confirm-fabric alone passes.
         """
         with self._session() as session:
             trusted = self._trusted(session)
@@ -548,7 +565,7 @@ class PortKeeper:
                 LOG.warning(
                     "Per-port M_Keys are off, and ports recorded as holding "
                     "derived keys are given the stored M_Key as OpenSM reaches "
-                    "them; --begin-port-keys turns per-port keys on"
+                    "them; --confirm-fabric arms per-port keys again"
                 )
             if port_keys.should_adopt(ports, named, target, recorded):
                 port_keys.save_target(session, True)
@@ -796,7 +813,7 @@ class PortKeeper:
         LOG.error(
             "Per-port M_Keys: %sno port left the key it held, so the target is "
             "set back to off and OpenSM is started without them; run "
-            "--begin-port-keys again once the cause is fixed",
+            "--confirm-fabric again once the cause is fixed",
             f"a start that turns them on failed ({problem}); " if problem else "",
         )
         return set()
@@ -991,7 +1008,7 @@ class PortKeeper:
         self._changing = count
 
     def uses_prober(self):
-        """Whether --confirm-switches finds the switches with the prober,
+        """Whether --confirm-fabric finds the switches with the prober,
         which follows any row that answers as a switch, rather than with
         ibswitches"""
         if not self.active():
@@ -1000,12 +1017,21 @@ class PortKeeper:
             return self._has_rows(session)
 
     def confirmed_switches(self):
-        """The switches an operator confirmed"""
+        """The switches an operator confirmed, pending ones aside"""
         with self._session() as session:
             return self._trusted(session)
 
+    def recorded_switches(self):
+        """The switches the last --confirm-fabric recorded, pending ones
+        included: one of these found again isn't pending any more"""
+        with self._session() as session:
+            return {
+                int(row.guid, 16)
+                for row in session.scalars(sa.select(db.ExpectedSwitch))
+            }
+
     def switches(self):
-        """The switches the prober reaches, for --confirm-switches, or None
+        """The switches the prober reaches, for --confirm-fabric, or None
         to ask ibswitches as before: beside the running OpenSM, writing no
         rows
 
@@ -1034,6 +1060,9 @@ class PortKeeper:
         )
         if result.own_port_lost:
             raise ReloadError("this host's port answers neither M_Key")
+        if not result.complete:
+            # Part of the list would replace the whole of it.
+            raise ReloadError("the prober's discovery of the switches ran out of time")
         return set(result.switches)
 
     # Sweeps and jobs, in the manager's session
@@ -1128,47 +1157,90 @@ class PortKeeper:
         if self.config.ha:
             raise PortKeysError("per-port M_Keys aren't available in HA mode")
 
-    def begin(self):
-        """--begin-port-keys: record the target on, once every recorded port
-        behind an up link is found holding the stored M_Key; returns what to
-        tell the operator"""
-        self._refuse_ha()
-        if not self.group_named:
-            raise PortKeysError(
-                "[opensm] hardening doesn't name m_key_per_port: name it, and "
-                "restart the manager, first"
-            )
+    def fold_running(self):
+        """--confirm-fabric: fold the links and ports the running OpenSM's
+        cache lists into the rows, as a check does; returns why it couldn't,
+        or None"""
+        if not self.active():
+            return None
+        m_key, base = self._m_keys()
+        try:
+            files = self.driver.read_cache()
+            now = _now()
+            neighbors = port_keys.parse_neighbors(files.get("neighbors", ("",))[0])
+            entries = port_keys.parse_guid2mkey(files.get("guid2mkey", ("",))[0])
+        except (ReloadError, ValueError) as e:
+            return f"can't read the running OpenSM's cache ({e})"
+        summary = self._fold(port_keys.fold_check, neighbors, entries, m_key, base, now)
+        LOG.info("Folded OpenSM's cache: %s", summary)
+        return None
+
+    def arm(self, confirmation, fold_problem=None):
+        """--confirm-fabric, once the switches are confirmed: with the group
+        named and the target off, record the target on if every
+        precondition of the turn-on holds, or say which failed (Turning it
+        on). The turn-on itself waits for the manager's next start."""
+        if self.config.ha or not self.group_named:
+            return
+        if self.config.driver != "managed":
+            return
         with self._session() as session:
             if port_keys.load_target(session):
-                return "Per-port M_Keys are already on; nothing changed"
+                confirmation.note = (
+                    "Per-port M_Keys are already on, or their turn-on is "
+                    "recorded: nothing more to do"
+                )
+                return
             ports, links = port_keys.load(session)
             recorded = port_keys.load_fingerprint(session)
+            confirmed = self._trusted(session)
+        problems = confirmation.problems
+        if fold_problem is not None:
+            problems.append(fold_problem)
         if not self.manager.base_kept():
-            raise PortKeysError(
+            problems.append(
                 "the running manager's start stored the per-port M_Key base: "
                 "restart the manager after backing up the database, which then "
-                "holds it, first"
+                "holds it, and confirm the fabric again"
             )
         m_key, base = self._m_keys()
         if recorded is not None and recorded != port_keys.fingerprint(base):
-            raise PortKeysError(
+            problems.append(
                 "the stored per-port M_Key base isn't the one the ports were "
                 "keyed from (its fingerprint differs)"
             )
+        if confirmation.pending:
+            problems.append(
+                f"switches {_guids(confirmation.pending)} are pending: check the "
+                "list above, and run --confirm-fabric again"
+            )
         if not links:
-            raise PortKeysError(
+            problems.append(
                 "no links are recorded: OpenSM's cache hasn't listed the fabric "
                 "yet, so OpenSM couldn't find the ports"
             )
-        with self._session() as session:
-            confirmed = self._trusted(session)
-        # The prober routes only through confirmed switches, by the GUIDs
-        # it records for them.
-        if not confirmed:
-            raise PortKeysError(
+        elif not confirmed:
+            problems.append(
                 "no switches are confirmed, so the prober can't reach the ports "
-                "beyond this host's: run --confirm-switches first"
+                "beyond this host's"
             )
+        else:
+            problems += self._turn_on_verify(ports, links, recorded, confirmed)
+        if problems:
+            return
+        with self._session() as session:
+            port_keys.save_target(session, True)
+            port_keys.save_confirmed(session, False)
+            session.commit()
+        confirmation.armed = True
+        confirmation.note = (
+            "Per-port M_Keys are armed: the next restart of the manager turns them on"
+        )
+
+    def _turn_on_verify(self, ports, links, recorded, confirmed):
+        """Why the prober, beside the running OpenSM, doesn't find every
+        recorded port behind an up link holding the stored M_Key, if it
+        doesn't"""
         try:
             result = self._verify(
                 ports,
@@ -1180,9 +1252,12 @@ class PortKeeper:
                 bound=self.config.port_verify_interval,
             )
         except ReloadError as e:
-            raise PortKeysError(f"can't verify the ports' M_Keys: {e}") from None
+            return [f"can't verify the ports' M_Keys: {e}"]
         if result.own_port_lost:
-            raise PortKeysError("this host's port answers neither M_Key")
+            return ["this host's port answers neither M_Key"]
+        problems = []
+        if not result.complete:
+            problems.append("the verify of the ports' M_Keys ran out of time")
         failing = sorted(
             guid
             for guid in ports
@@ -1191,33 +1266,25 @@ class PortKeeper:
                 guid in result.keyed and result.ports[guid].holds == port_keys.M_KEY
             )
         )
-        if not result.complete or failing:
-            lines = [
+        if failing:
+            line = (
                 "every recorded port behind an up link must answer the stored "
                 "M_Key, with protection level 2"
-                + ("; the verify ran out of time" if not result.complete else "")
-            ]
+            )
             unconfirmed = sorted(
                 guid
                 for guid, row in result.ports.items()
                 if row.switch is True and guid not in confirmed
             )
             if unconfirmed:
-                lines[0] += (
+                line += (
                     f"; switches {_guids(unconfirmed)} aren't confirmed, so "
-                    "nothing beyond them was reached: check them, and run "
-                    "--confirm-switches"
+                    "nothing beyond them was reached"
                 )
-            lines += [f"0x{guid:016x}" for guid in failing]
-            raise PortKeysError("\n".join(lines))
-        with self._session() as session:
-            port_keys.save_target(session, True)
-            port_keys.save_confirmed(session, False)
-            session.commit()
-        return (
-            "Per-port M_Keys will be turned on: restart the manager, whose start "
-            "begins it"
-        )
+            problems.append(
+                line + ", and these don't: " + ", ".join(f"0x{g:016x}" for g in failing)
+            )
+        return problems
 
     def states(self):
         """--port-key-states: each recorded port, and the target; no key"""

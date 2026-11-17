@@ -778,7 +778,7 @@ class Manager:
 
         A start that stored the base can't begin per-port keys: the next
         start, after a backup that holds it, can (see
-        specs/secured-profile.md, Per-port M_Keys). --begin-port-keys runs
+        specs/secured-profile.md, Per-port M_Keys). --confirm-fabric runs
         beside the running manager, so the start records it for that command
         to read. Every start overwrites it.
         """
@@ -1475,8 +1475,14 @@ class Manager:
         if fabric is None:
             return True, "No fabric to check"
         with self._lock, self.sessionmaker() as session:
+            # A pending switch isn't expected until it's confirmed again.
             expected = {
-                int(s.guid, 16) for s in session.scalars(sa.select(db.ExpectedSwitch))
+                int(s.guid, 16)
+                for s in session.scalars(
+                    sa.select(db.ExpectedSwitch).where(
+                        db.ExpectedSwitch.pending.is_(False)
+                    )
+                )
             }
         others = [
             (guid, state) for guid, state in fabric.sms if guid not in fabric.own_guids
@@ -1495,7 +1501,7 @@ class Manager:
         missing = expected - fabric.switches
         self.missing_checks = self.missing_checks + 1 if missing else 0
         if not expected:
-            return False, "No expected switches: confirm them with --confirm-switches"
+            return False, "No expected switches: confirm them with --confirm-fabric"
         if missing:
             return False, "Missing switches: " + ", ".join(
                 f"0x{guid:016x}" for guid in sorted(missing)
@@ -1506,17 +1512,41 @@ class Manager:
             )
         return True, "The fabric is complete"
 
-    def confirm_switches(self):
-        """Record the switches OpenSM sees as the fabric's expected ones"""
-        fabric = self._fabric(self.port_keeper.switches())
+    def confirm_fabric(self):
+        """Record the switches OpenSM sees as the fabric's expected ones,
+        and, with per-port M_Keys, the links OpenSM's cache lists; with the
+        m_key_per_port group named and the target off, arm the turn-on if
+        its preconditions hold (specs/secured-profile.md, Turning it on).
+        Returns a port_keeper.Confirmation."""
+        keeper = self.port_keeper
+        # A cache that can't be read stops only the turn-on, not the
+        # switches' confirmation.
+        fold_problem = keeper.fold_running()
+        # The prober follows any row that answers as a switch, which an
+        # adapter can: one it finds that wasn't confirmed or pending before
+        # is recorded as pending, which nothing trusts, for the operator to
+        # check, and is confirmed only when a later run finds it again.
+        # ibswitches' switches are confirmed at once, as they always were.
+        prober = keeper.uses_prober()
+        known = keeper.recorded_switches() if prober else set()
+        confirmation = port_keeper.Confirmation()
+        fabric = self._fabric(keeper.switches())
         if fabric is None:
-            return []
+            return confirmation
+        found = sorted(fabric.switches)
+        pending = [guid for guid in found if guid not in known] if prober else []
         with self._lock, self.sessionmaker() as session:
             session.execute(sa.delete(db.ExpectedSwitch))
-            for guid in sorted(fabric.switches):
-                session.add(db.ExpectedSwitch(guid=f"{guid:016x}"))
+            for guid in found:
+                session.add(
+                    db.ExpectedSwitch(guid=f"{guid:016x}", pending=guid in pending)
+                )
             session.commit()
-        return sorted(fabric.switches)
+        confirmation.switches = found
+        confirmation.pending = pending
+        if confirmation.switches:
+            keeper.arm(confirmation, fold_problem)
+        return confirmation
 
     def enforcement_errors(self):
         """The switch ports whose partition enforcement OpenSM cleared, as

@@ -1,4 +1,5 @@
-"""Per-port M_Key state: fabric ports and links, and state's text
+"""Per-port M_Key state: fabric ports and links, state's text, and
+pending expected switches
 
 Revision ID: 0004
 Revises: 0003
@@ -31,6 +32,15 @@ def upgrade():
     # share the database during a rolling upgrade
     if "text" not in {column["name"] for column in inspector.get_columns("state")}:
         op.add_column("state", sa.Column("text", sa.String(length=255), nullable=True))
+    # With a server default, for the same reason
+    expected = {c["name"] for c in inspector.get_columns("expected_switches")}
+    if "pending" not in expected:
+        op.add_column(
+            "expected_switches",
+            sa.Column(
+                "pending", sa.Boolean(), nullable=False, server_default=sa.false()
+            ),
+        )
     if not inspector.has_table("fabric_ports"):
         op.create_table(
             "fabric_ports",
@@ -59,4 +69,5 @@ def upgrade():
 def downgrade():
     op.drop_table("fabric_links")
     op.drop_table("fabric_ports")
+    op.drop_column("expected_switches", "pending")
     op.drop_column("state", "text")

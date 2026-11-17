@@ -796,7 +796,7 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 
    ```sh
    ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
-     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
    ```
 
 3. Run the networking-mlnx tempest plugin against the deployment.

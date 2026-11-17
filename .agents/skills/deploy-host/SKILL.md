@@ -43,8 +43,20 @@ ports (`--port-key-states` lists any), the deploy differs (see
   derives from. Keep a backup taken after the start that stored the base
   (the first start of a release with the group) and after any turn-on;
   an older one can lose the ports.
-- **Never begin or end them in a routine redeploy:** don't run
-  `--begin-port-keys`, don't name the group, and don't remove it, as part
+- **`--confirm-fabric` can turn them on.** On a deployment that names
+  `m_key_per_port` with per-port M_Keys off, `--confirm-fabric` arms the
+  turn-on when every precondition holds (the base stored by an earlier
+  start, links recorded, no switch confirmed for the first time by that
+  run, and every recorded port behind an up link answering the stored
+  `m_key`), and the manager's next restart then re-keys every port. So
+  there it needs the fabric owner's agreement, and is never a routine
+  step of a redeploy: skip step 5 on such a deployment unless that is the
+  agreed change. If a precondition fails it still confirms the switches,
+  prints "the switches are confirmed, but per-port M_Keys aren't armed:"
+  and why, and exits non-zero. With the group not named, or the keys
+  already on, it only confirms.
+- **Never begin or end them in a routine redeploy:** don't name the group,
+  don't remove it, and don't run `--confirm-fabric` to arm them, as part
   of a deploy. Each re-keys every port and needs the fabric owner's
   agreement.
 - **Check the states before and after**:
@@ -60,7 +72,7 @@ ports (`--port-key-states` lists any), the deploy differs (see
   wait until `--port-key-states` shows every port, HCAs included, holding
   `m_key`. Restoring an older database is a downgrade too.
 - **Confirmed switches gate the prober:** with ports recorded,
-  `--confirm-switches` runs the prober and records every port that
+  `--confirm-fabric` runs the prober and records every port that
   answers as a switch, by its port 0 GUID. Check the list it prints before
   relying on it (an adapter can answer as a switch). If the check reports
   "Missing switches" for a switch confirmed before ports were recorded,
@@ -132,11 +144,13 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    HA mode also needs the watchdog's tmpfs and the host's processes:
    `-v /run/alternative-fabric-manager:/run/alternative-fabric-manager`
    and `-v /proc:/host/proc:ro`.
-5. **On a new database, record the fabric's switches**, or no job ever
-   completes ("No expected switches"):
+5. **On a new database, confirm the fabric**, or no job ever completes
+   ("No expected switches: confirm them with --confirm-fabric"). On a
+   deployment that names `m_key_per_port` with the keys off, this can arm
+   their turn-on: see Per-port M_Keys above first.
    ```sh
    sudo docker exec alternative-fabric-manager alternative-fabric-manager \
-     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
    ```
 
 ## Verify
