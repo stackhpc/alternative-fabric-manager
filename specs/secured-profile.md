@@ -368,6 +368,26 @@ failure, or it would fail on such hardware. It doesn't silently overstate
 itself either: the manager logs, once per start, which classes the ports
 rejected, so the operator knows that only VS keys protect those ports.
 
+OpenSM 5.17's line doesn't name the class: "ERR 9828: Received invalid
+status from port GUID 0x%lx, status:0x%x, attr_id:0x%x". Its code range
+does, read from the binary: `98xx` is the VS key manager's (`9803`
+"failed to update port guid ... vskeyinfo"), `9Bxx` the N2N key
+manager's, and `C1xx` the congestion control manager's, whose own line of
+the same form is `ERR C10A`. So the manager logs, for each OpenSM it
+starts, each code, status and attribute ID it sees once, with the
+manager the code belongs to and the number of ports, from the fabric
+check's reading of OpenSM's log. Which class each rejection was for is
+then the operator's reading of the attribute ID; the first run of the
+group on hardware records it.
+
+The key managers' errors that mean a key wasn't set where it is supported
+(`9803`, `9822`, `9823`, `9B03`, `9B22` and `C124`, "failed to update port
+... keyinfo", and "VS keys configuration has failed") are logged as errors
+by the manager, once per code for each OpenSM it starts. They don't fail
+the fabric check: what they mean for the ports is what hardware test 3
+establishes, and failing every check on them would stop every job on a
+fabric where a class key couldn't be set on one port.
+
 ### The seed
 
 OpenSM derives each port's class keys from `key_mgr_seed`, or uses the
@@ -386,7 +406,11 @@ is keyed:
   `class_keys`. The backup that the deploy-host skill takes before an
   upgrade then holds it.
 - A start that generates the seed never renders `class_keys`. It refuses
-  the group with an alarm, and a later start may use it. That covers a
+  the group with an alarm, and a later start may use it. The refusal
+  leaves the group's options out of `opensm.conf`, and OpenSM starts
+  without them: a start of the manager that stored the seed renders
+  without class keys for every OpenSM it starts, and the next start of the
+  manager, after a backup, renders them. That covers a
   fresh install, a skipped release and a restore of an older backup: the
   seed is always in the database, and so in the next backup, before a
   port is keyed. After such a restore, a new seed is a refusal and an
@@ -417,8 +441,13 @@ with the class key caches moved aside derived the same keys from the seed
 also uses the SM's own port GUID or other local state, which is what an HA
 takeover by another host would expose. The second-host run decides HA.
 CC and N2N keys are still unverified, because the test fabric doesn't
-support them. Until the rest of test 3 passes, the group is refused in
-single-node and HA modes.
+support them. Until the rest of test 3 passes, the group is experimental:
+HA mode refuses it, and a single node can choose it beside `all`, so that
+test 3's remaining legs run the group itself, with the rules of this
+section and the turn-off guard (see Turning the keys off, and downgrades).
+That is a change from the first version of this spec, which refused it in
+both modes until the test passed: the user asked for the group to be
+implemented, experimental, before its tests, as for `allowed_sm`.
 
 A port keyed with another seed wasn't shown to recover while OpenSM ran.
 With a changed seed, OpenSM wrote its own derived keys to the cache, and its
@@ -467,6 +496,21 @@ Dropping the group at once sets enable to 0 (Ignore), which leaves ports
 protected by keys that the SM no longer manages. A downgrade to a release
 without the group has the same effect. So the release notes, and the
 hardening doc's downgrade section, require step 1 before any downgrade.
+
+Within a release that has the group, a start refuses to skip step 1. The
+manager records, in its database, which classes the last `opensm.conf` it
+wrote enabled (2). A start refuses, with a configuration error that names
+the classes, while any class is recorded enabled and:
+- the `class_keys` group isn't named: the group writes `key_mgr_seed`,
+  without which OpenSM derives the keys from the M_Key and can't reach the
+  ports to disable them; or
+- the class would be written as 0 or left out, which is Ignore.
+
+A start that writes enable 1 for a class clears its record, so step 3 is
+allowed after a start that disabled every class. Whether OpenSM had
+finished clearing the keys (step 2) is the operator's check: the manager
+can't tell. A database restored from before the record, or a downgrade,
+bypasses the guard, which the release notes cover.
 
 ### Cost
 
@@ -1152,7 +1196,8 @@ These go into specs/ha.md before the HA code changes:
   may take over as Changing the list says, which hardware test 1 decides.
   An alarm is raised while a live node is outside it.
 - **Required keys:** HA mode refuses `allowed_sm` until its dependencies
-  (see HA) are in, and `class_keys` until hardware test 3 passes.
+  (see HA) are in, and `class_keys` until hardware test 3 passes, with
+  its second-host legs.
 - **Per-port M_Keys:** `fabric_ports` (with each port's key state) and
   `fabric_links`, written only by the leader under its term's
   compare-and-set; `m_key_base` among the shared keys; in Job
@@ -1475,8 +1520,14 @@ and a re-cabled port.
       `all`.
 - [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
       `allowed_sm` in HA mode, once its dependencies are in.
-- [ ] Hardware test 3 (first run done, see Results). Then `class_keys`,
-      with its downgrade procedure.
+- [ ] `class_keys` for single node, experimental and outside `all`: the
+      seed rules, the logged rejections and key errors, and the turn-off
+      guard, with its downgrade procedure in docs/opensm-hardening.md.
+      Implemented before the rest of hardware test 3, at the user's
+      request.
+- [ ] Hardware test 3 (first run done, see Results), the rest with the
+      implemented group. Then `class_keys` in HA mode, after the
+      second-host legs.
 - [ ] Hardware test 4. Then `sa_rate`, or a note that the gap stays.
 - [x] Hardware test 5's first run (see Results).
 - [x] `m_key_base` in `KEYS`, generated whatever the groups, a release
