@@ -666,7 +666,11 @@ compare-and-set:
 - `fabric_links`: (GUID, port) to (GUID, port), both directions as in
   `neighbors`, with `last_seen`.
 
-The `state` table holds the target, per-port keys on or off. A port
+The `state` table holds the target, per-port keys on or off; the target
+OpenSM was last started on, written before that start, so that a start
+whose target differs from it is one that begins a transition; and whether
+a turn-on start has met its success rule (Turning it on), which every
+start with the target on is held to until one does. A port
 whose `holds` isn't what the target gives it (`derived` when on, `m_key`
 when off) is changing, which needs no state of its own: requirement 1's
 "changing" is that disagreement.
@@ -675,7 +679,11 @@ when off) is changing, which needs no state of its own: requirement 1's
 group is named or any row exists, the manager reads `neighbors` and
 `guid2mkey` from the running container (`get_archive`, never logged).
 Each `neighbors` row replaces the row with its local (GUID, port), which
-handles a re-cabled port as OpenSM saw it. Each GUID it lists gets a row;
+handles a re-cabled port as OpenSM saw it; the old peer's row, if it
+still points back, goes with it, and a link recorded in one direction
+only is neither followed nor rendered. Otherwise the port would be
+reached through its old switch port, whose link is down, and whatever
+is cabled there next would be taken for it. Each GUID it lists gets a row;
 its `holds` comes from its `guid2mkey` entry, compared with the old
 `m_key` and its derived key, or is `unknown` if its entry is neither. A
 port with no entry keeps what its row holds, since a port OpenSM lost
@@ -707,20 +715,35 @@ keys it may try is what keeps the old key from tenants:
   row or volume entry is `derived`;
 - both keys on this host's port and on switch port 0, which no tenant
   controls. A row is a switch's because its NodeInfo said so, which an
-  adapter that answers as a switch could say too, so only the switches
-  an operator confirmed (`--confirm-switches`) count here; any other
-  gets a tenant port's rule.
+  adapter that answers as a switch could say too, as it could give a
+  confirmed switch's node GUID. So only a row whose own GUID, which the
+  route's answer must match, is one an operator confirmed
+  (`--confirm-switches`) counts here, and only such a switch is routed
+  through or counted by the fabric check: a Get that passes through a
+  node shows it the key. Any other row gets a tenant port's rule. While
+  rows exist, `--confirm-switches` records the GUIDs the prober found
+  on its routes, following every row that answers as a switch, for the
+  operator to check. Those are the switches' port 0 GUIDs, where
+  `ibswitches` gave node GUIDs: on a switch whose two differ, the check
+  reports the switch missing until it's confirmed again with rows
+  present. Until some switch is confirmed, a verify reaches this host's
+  port and its peer only, and `--begin-port-keys` refuses.
 
 It tries the key the row records first, then the other one the rule
 allows, so a port on `m_key` during a slow transition isn't sent a wrong
 key at every check. A port whose row is `unknown` tries its derived key
 first. With the target on, a
 port recorded `derived` or `unknown` that doesn't answer its derived key
-is marked unreachable and never sent `m_key`. A wrong-key Get counts as
+is marked unreachable and never sent `m_key`. Routes go only through
+rows already known to be switches, so a verify is repeated, within its
+bound, while it learns that more rows are: rows new from OpenSM's cache
+are reached one level of switches at a time. A wrong-key Get counts as
 a violation and starts a lease countdown, which the right key's Get
 stops (test 5); with a lease of 0 there is no countdown. Keys are on
 `smpquery`'s command line, visible in `/proc` on the manager's host, as
-`ibswitches -y` is today; that host has no tenants. The prober runs in
+`ibswitches -y` is today; that host has no tenants. A helper container
+has a fixed name, and a start removes one left behind, since its
+configuration holds the plan. The prober runs in
 the running OpenSM's container (`docker exec`) for checks, and in a
 helper container from its image, as the reach probe does, before a
 start.
@@ -732,7 +755,9 @@ manager:
    the rows as a check does, except that for each (GUID, port) whichever
    of the row and the file is newer wins (`last_seen` against the file's
    time): the file is newer after a crash within a check interval of a
-   new port being keyed, and the rows after a lost volume;
+   new port being keyed, and the rows after a lost volume. Files that
+   are absent are a lost volume; files that can't be read or parsed fail
+   the start, which is retried, since step 3 would replace them unseen;
 2. verifies every recorded port behind a link that's up with the
    prober, setting `holds`, `lapsed` and `reachable`. It probes
    this host's port and the switches first, and keeps their results
@@ -740,7 +765,9 @@ manager:
    `start_timeout`; if it fails or runs out, the start goes on from the
    rows as they are, which came from OpenSM's own cache,
    except that a start that would begin a transition starts OpenSM on
-   the previous target instead, with an alarm;
+   the previous target instead, with an alarm, and a start with the
+   target on whose turn-on hasn't succeeded yet doesn't start OpenSM at
+   all, and is retried: the fabric may be part-way;
 3. writes `neighbors` from `fabric_links` and `guid2mkey` from `holds`,
    root-only, by copying them into that container's `/var/cache/opensm`
    (`put_archive`; Docker allows this into a volume of a read-only
@@ -783,12 +810,22 @@ That start succeeds only when OpenSM logs SUBNET UP and, within
 `start_timeout`, a cache read shows this host's port and every recorded
 switch that answered the pre-start verify holding its derived key: test 5 saw SUBNET UP from an OpenSM that
 reached only its own port, and the prober reaching a port with the
-row's key doesn't show that OpenSM did. Otherwise the manager stops
-OpenSM and runs the prober: if no port has left its recorded key, it
+row's key doesn't show that OpenSM did. Otherwise, as when OpenSM doesn't
+start at all, the manager stops
+OpenSM and runs the prober: if no port has left its recorded key, and
+none answers its derived key (one that an earlier, interrupted turn-on
+keyed; a port that's down with a derived row is a turn-off's leftover,
+which a set-back's own start handles), it
 sets the target back to off, starts OpenSM without the option, and
-raises an alarm. If some port has moved, it starts OpenSM on the target
+raises an alarm; the fingerprint stays recorded, since OpenSM ran with
+the option and may have keyed a port the prober can't see. A port that
+answered its key before the start and answers nothing now counts as the
+prober failing, not as nothing having moved. If some port has moved, it
+starts OpenSM on the target
 from the verified rows, and keeps retrying that, with the alarm, since
-the fabric is then part-way. If the prober itself fails, it retries it,
+the fabric is then part-way. While the group is named or rows exist, a
+start that fails doesn't end the manager: the applier retries it at
+every check interval, as it does when OpenSM stops. If the prober itself fails, it retries it,
 with the alarm, and doesn't start OpenSM on either target blind: the
 ports keep their keys meanwhile, and a start on the wrong target is the
 outage test 5 had. The
@@ -830,7 +867,8 @@ manager's are, does no discovery, and test 5's lost port still let
 OpenSM log SUBNET UP. So job completion doesn't wait for log lines. With
 rows present, a job that binds or unbinds a recorded port GUID needs one
 more piece of evidence, after its sweep and before it completes: a
-prober Get to that port that answers with its key, or its switch port's
+prober Get to that port that answers with its key (a lapsed port, which
+answers any key, hasn't shown that), or its switch port's
 PortInfo showing the link down (then OpenSM sets its pkey table when the
 link comes up, as for any port that's down today). These Gets go only to
 the GUIDs of open jobs, at each check, so their cost follows the jobs,
@@ -880,11 +918,17 @@ the ones to keep.
 A restored database that has the base but predates the turn-on (the
 usual case, since the base is stored a release early) has the target
 off, while the volume and the ports hold the base's derived keys. With
-the group named, a start whose folded rows show ports on the stored
-base's derived keys adopts the target on, decided after step 1 and
+the group named and no fingerprint recorded, a start whose folded rows
+show ports on the stored base's derived keys adopts the target on
+(with a fingerprint, the database has seen a turn-on, and the rows are
+a turn-off's or a set-back's leftovers, which `--begin-port-keys` must
+check), decided after step 1 and
 before step 2, so that the verify runs with the target on, records the
 fingerprint, and raises an alarm saying so, rather than re-keying the
-fabric back to the exposed `m_key`. Without the group named it's an
+fabric back to the exposed `m_key`. An adopted target isn't held to the
+turn-on's success rule, whose set-back would do exactly that, and is
+recorded as the target OpenSM last ran on, so that a verify that fails
+doesn't start OpenSM without the option either. Without the group named it's an
 ordinary turn-off.
 
 **Commands.** `--begin-port-keys` as above. `--port-key-states` lists each
@@ -895,7 +939,9 @@ under AGENTS.md's rule, never for display. `--add-link` records a link.
 non-Neutron port from the fabric check's rule on lost ports, until the
 port answers its key again.
 `--forget-port-keys` drops every row, refused while the group is named or
-any row holds a derived key; `--forget-port <guid>` drops one port and
+any row holds a derived key; it also drops a recorded fingerprint that
+isn't the stored base's, which would otherwise keep every later start
+on Restores' path; `--forget-port <guid>` drops one port and
 its links, for removed hardware, refused for a port seen in the last day.
 
 **Downgrades.** A release without the group can't render the cache, so
