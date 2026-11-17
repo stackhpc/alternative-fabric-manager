@@ -340,6 +340,25 @@ class FabricLink(Base):
     )
 
 
+class KnownSMPort(Base):
+    """A port whose SM may hold the fabric's keys, so that OpenSM ignoring an
+    SM there contests the fabric (specs/secured-profile.md, Allowed SM
+    GUIDs, The fabric check). Kept when it's no longer this host's: its
+    old host's files still hold the keys."""
+
+    __tablename__ = "known_sm_ports"
+
+    # The port GUID, as 16 lower-case hex digits
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    # This host's physical port, as the last start's probe found it, which
+    # can't be dropped; otherwise an operator recorded it, or a probe no
+    # longer finds it
+    own: orm.Mapped[bool] = orm.mapped_column(default=False, server_default=sa.false())
+    recorded: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+
+
 # Columns added to existing tables since the first release, until the
 # schema is managed by Alembic
 _ADDED_COLUMNS = {

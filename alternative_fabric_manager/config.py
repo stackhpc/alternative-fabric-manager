@@ -43,11 +43,12 @@ ALL_HARDENING_GROUPS = (
     "enforcement",
     "babbling_ports",
 )
-# The hardening groups of opensm_conf.HARDENING: all's, then any outside it.
-# m_key_per_port leaves state on ports, their keys, so it stays outside all
-# until its single-node run passes (specs/secured-profile.md, Choosing the
-# group).
-HARDENING_GROUPS = ALL_HARDENING_GROUPS + ("m_key_per_port",)
+# The hardening groups of opensm_conf.HARDENING: all's, then the experimental
+# ones outside it, untested on hardware, chosen by naming them beside all.
+# Each joins all once its hardware tests pass (specs/secured-profile.md,
+# Choosing the groups). m_key_per_port leaves state on ports, their keys.
+EXPERIMENTAL_HARDENING_GROUPS = ("m_key_per_port", "allowed_sm")
+HARDENING_GROUPS = ALL_HARDENING_GROUPS + EXPERIMENTAL_HARDENING_GROUPS
 # What OpenSM's cache volume must be mounted at for per-port M_Keys: the
 # manager copies neighbors and guid2mkey into it before each start, which a
 # read-only root filesystem without the volume would refuse.
@@ -70,6 +71,12 @@ MANAGED_OPENSM_KEYS = (
     "log_file",
     "no_partition_enforcement",
 )
+# allowed_sm_guids as OpenSM 5.17 reads it: 0 alone, or GUIDs separated by
+# commas, spaces, tabs or newlines (osm_update_allowed_sm_guids splits with
+# strtok_r on ", \t\n"). Only 0x-prefixed GUIDs are accepted, so that Python
+# and OpenSM can't read one differently.
+_ALLOWED_SM_GUID = re.compile(r"0[xX][0-9a-fA-F]{1,16}")
+_ALLOWED_SM_SEPARATORS = re.compile(r"[,\s]+")
 # The log levels whose messages the manager watches for: errors, info and
 # verbose, which has the sweep banners
 REQUIRED_LOG_FLAGS = 0x07
@@ -210,9 +217,12 @@ class Config:
     # write into opensm.conf (managed), separated by commas: m_key, sm_key,
     # sa_key, sa_trust, enforcement, babbling_ports; all, the default; -group
     # to remove one from all ("-sa_trust" alone starts from all); or none,
-    # alone. See parse_hardening. m_key_per_port, experimental, isn't in all:
-    # it's chosen as "all, m_key_per_port", and only permits per-port M_Keys,
-    # which an operator's command begins.
+    # alone. See parse_hardening. The experimental groups, untested on
+    # hardware, aren't in all, and are chosen by naming them beside it, as
+    # "all, allowed_sm": m_key_per_port only permits per-port M_Keys, which
+    # an operator's command begins; allowed_sm makes OpenSM ignore every SM
+    # outside this host's physical ports. Read docs/opensm-hardening.md,
+    # Before enabling, first.
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
@@ -231,6 +241,15 @@ class Config:
     def hardening_groups(self):
         """The hardening groups that [opensm] hardening names"""
         return parse_hardening(self.hardening)
+
+    @property
+    def allowed_sm_in_effect(self):
+        """Whether OpenSM gets an allowed_sm_guids list: the group named, or
+        the option overridden, which gets the group's checks too"""
+        return (
+            "allowed_sm" in self.hardening_groups
+            or "allowed_sm_guids" in self.opensm_conf
+        )
 
     @property
     def partitions_file(self):
@@ -363,6 +382,7 @@ class Config:
                 "keeps the per-port M_Key base in its database"
             )
         self._validate_per_port_keys()
+        self._validate_allowed_sm()
         managed = set(self.opensm_conf) & set(MANAGED_OPENSM_KEYS)
         if managed:
             raise ConfigError(
@@ -414,6 +434,63 @@ class Config:
                 f"[opensm_conf] can't set {', '.join(overridden)} with the "
                 "m_key_per_port hardening group, which sets them"
             )
+
+    def _validate_allowed_sm(self):
+        """Refuse allowed_sm where an ignored SM could act unseen, or where
+        the manager can't read this host's ports
+
+        See specs/secured-profile.md, Allowed SM GUIDs, Required groups and
+        Overrides. HA mode refuses it in _ha_problems, which validate checks
+        first.
+        """
+        override = self.opensm_conf.get("allowed_sm_guids")
+        if override is not None and parse_allowed_sm_guids(override) is None:
+            raise ConfigError(
+                "[opensm_conf] allowed_sm_guids must be 0, or port GUIDs (0x "
+                "and up to 16 hex digits, not 0) separated by commas: OpenSM "
+                "would otherwise disable the list"
+            )
+        if not self.allowed_sm_in_effect:
+            return
+        what = (
+            "[opensm] hardening allowed_sm"
+            if "allowed_sm" in self.hardening_groups
+            else "[opensm_conf] allowed_sm_guids"
+        )
+        # The fabric check ignores an SM outside the list only because it has
+        # neither key: without them, one could set unprotected ports, or hand
+        # over, unseen.
+        missing = sorted({"m_key", "sm_key"} - self.hardening_groups)
+        if missing:
+            raise ConfigError(f"{what} needs the {' and '.join(missing)} group(s)")
+        level = str(self.opensm_conf.get("m_key_protection_level", "2")).strip()
+        if level in ("0", "0x0"):
+            raise ConfigError(f"{what} needs M_Key protection level 1 or more")
+        if self.driver != "managed":
+            raise ConfigError(
+                f"{what} needs the managed driver, which reads this host's "
+                "ports in OpenSM's image and writes opensm.conf"
+            )
+
+
+def parse_allowed_sm_guids(text):
+    """The GUIDs of an allowed_sm_guids value, as a sorted tuple of ints, ()
+    for 0 (no other SM), or None if OpenSM wouldn't read it as a list"""
+    words = [w for w in _ALLOWED_SM_SEPARATORS.split(text.strip()) if w]
+    if words == ["0"]:
+        return ()
+    if not words or not all(_ALLOWED_SM_GUID.fullmatch(w) for w in words):
+        return None
+    guids = {int(w, 16) for w in words}
+    # OpenSM stops at a GUID of 0 that isn't alone, and disables the list.
+    if 0 in guids:
+        return None
+    return tuple(sorted(guids))
+
+
+def format_allowed_sm_guids(guids):
+    """An allowed_sm_guids value in the manager's spelling: 0 for none"""
+    return ",".join(f"0x{guid:016x}" for guid in sorted(guids)) or "0"
 
 
 def parse_volumes(volumes):
@@ -615,6 +692,15 @@ def _ha_problems(config):
         problems.append(
             "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
             "aren't supported in HA mode yet"
+        )
+    # HA needs node rows with port GUIDs, configuration epochs, the managed
+    # node SM rule and the fence ask first (specs/secured-profile.md,
+    # Allowed SM GUIDs, HA). A list typed by hand gets the group's rules, so
+    # it's refused too.
+    if config.allowed_sm_in_effect:
+        problems.append(
+            "[opensm] hardening can't include allowed_sm, nor [opensm_conf] "
+            "set allowed_sm_guids: allowed SMs aren't supported in HA mode yet"
         )
     return problems
 

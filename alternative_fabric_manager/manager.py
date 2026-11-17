@@ -32,14 +32,15 @@ import time
 
 import sqlalchemy as sa
 
-from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import (
+    allowed_sm,
     db,
     effects,
     opensm_conf,
     partitions,
     port_keeper,
 )
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
     PartitionsRejected,
@@ -171,6 +172,11 @@ class Manager:
         # Per-port M_Keys, which act only while the m_key_per_port group is
         # named or rows exist, in single node with the managed driver
         self.port_keeper = port_keeper.PortKeeper(self)
+        # Allowed SMs, which act only while the list is in effect, in single
+        # node with the managed driver
+        self.allowed_sms = allowed_sm.AllowedSMs(self)
+        # The allowed_sm_guids value of the start under way
+        self._allowed_list = None
 
     # Requests
 
@@ -843,6 +849,15 @@ class Manager:
             # The stored spelling, which _keep_seed checked the override
             # against, so that OpenSM can't parse it differently
             overrides["key_mgr_seed"] = self.keys()["key_mgr_seed"]
+        generated = {}
+        if self.allowed_sms.active():
+            if self._allowed_list is None:
+                raise ReloadError("No allowed_sm_guids list was worked out")
+            generated[allowed_sm.OPTION] = self._allowed_list
+            if allowed_sm.OPTION in overrides:
+                # The manager's spelling of the override, which the start's
+                # checks passed
+                overrides[allowed_sm.OPTION] = self._allowed_list
         content = opensm_conf.render(
             overrides,
             hardening=groups,
@@ -853,6 +868,7 @@ class Manager:
             ),
             key_lease_period=self.config.key_lease_period,
             port_keys=port_keys,
+            generated=generated,
         )
         # The keys are secrets.
         partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
@@ -920,12 +936,14 @@ class Manager:
         try:
             self._start_opensm()
         except ReloadError as e:
-            if not self.port_keeper.active():
+            if not (self.port_keeper.active() or self.allowed_sms.active()):
                 raise
             # A start with per-port M_Keys can fail for a reason the next
             # one may not have, such as a prober that couldn't run, or a
-            # fabric part-way through a turn-on: the applier's check starts
-            # OpenSM again at every interval, as after OpenSM stops.
+            # fabric part-way through a turn-on, and so can one with allowed
+            # SMs, whose port probe may fail while the image is pulled: the
+            # applier's check starts OpenSM again at every interval, as
+            # after OpenSM stops.
             LOG.error("Failed to start OpenSM, retrying at every check: %s", e)
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
         self._thread.start()
@@ -973,7 +991,13 @@ class Manager:
         If the current state can't be rendered, OpenSM starts with the last
         partitions file, which passed the checks when it was written, rather
         than not at all, and the next sync deals with the state.
+
+        With allowed SMs, this host's ports are read first, and a list that
+        would lock OpenSM out refuses the start with ReloadError.
         """
+        self._allowed_list = None
+        if self.allowed_sms.active():
+            self._allowed_list = self.allowed_sms.prepare()
         self._write_opensm_conf()
         # What OpenSM starts with is recorded as swept only if the driver saw
         # OpenSM's first sweep read it; a driver may not start OpenSM at all.
@@ -1427,6 +1451,8 @@ class Manager:
             # With per-port M_Key rows, the prober finds the switches.
             outcome = self.port_keeper.check()
             fabric = self._fabric(outcome.switches if outcome else None)
+            # The SMs OpenSM logged ignoring since the last check
+            sm_problems, sm_contested = self.allowed_sms.check()
         except ReloadError as e:
             # Not knowing is no evidence either way: a contested fabric stays
             # contested until a check passes.
@@ -1437,12 +1463,17 @@ class Manager:
             ok, detail = self._judge(fabric)
             if ok and outcome and outcome.problems:
                 ok, detail = False, "; ".join(outcome.problems)
+            if ok and sm_problems:
+                ok, detail = False, "; ".join(sm_problems)
             # Only a passing check ends a contest; one that fails for another
             # reason, such as a missing switch, which the other SM may sit
-            # behind, doesn't.
+            # behind, doesn't. An ignored SM on a known SM port contests it
+            # until a query of the port clears it.
             self._contested_fabric = (
-                fabric is not None and self._contested(fabric)
-            ) or (self._contested_fabric and not ok)
+                (fabric is not None and self._contested(fabric))
+                or sm_contested
+                or (self._contested_fabric and not ok)
+            )
             if self._contested_fabric:
                 # Another master may have set pkey tables since the last
                 # sweep, so it is no evidence: sweep again, once the check

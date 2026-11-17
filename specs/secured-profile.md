@@ -85,8 +85,8 @@ sub-function (an auxiliary device under `mlx5_core.sf`), which also has no
   `physfn` link, whether its device's path is an `mlx5_core.sf` auxiliary
   device, and for each port its `link_layer` and the port GUID in the low
   64 bits of GID 0 (`ports/<n>/gids/0`), which is the port GUID whatever
-  the port's state, as `ibstat` reads it. The list is written as `0x%016x` GUIDs, sorted,
-  separated by commas.
+  the port's state, as `ibstat` reads it. The list is written as `0x%016x`
+  GUIDs, sorted, separated by commas.
 - **HA:** the union of the port GUIDs that the cluster's node rows record,
   live or stopped. A node's ports leave the list only when an operator
   forgets the node's row. specs/ha.md's Retiring a node says that such a
@@ -1464,7 +1464,7 @@ and a re-cabled port.
 - [x] `-group` removals from `all`.
 - [ ] Each group joins `ALL_HARDENING_GROUPS` once its hardware tests
       pass, with release notes.
-- [ ] `allowed_sm` for single node, experimental and outside `all`, with
+- [x] `allowed_sm` for single node, experimental and outside `all`, with
       the physical-port probe, override checks, `ERR 7549` as a failed
       start, the lock-out checks, the `0F09` rules, and the commands to
       record, drop and list known SM ports. Implemented before hardware

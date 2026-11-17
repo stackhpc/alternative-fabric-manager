@@ -25,7 +25,9 @@ A driver has:
 
 The managed driver's start() also takes prepare, called with the created
 container before OpenSM starts in it, and it has read_cache(),
-write_cache() and prober() for per-port M_Keys (specs/secured-profile.md).
+write_cache() and prober() for per-port M_Keys, and physical_ports(),
+log_findings() and query_sm_port() for allowed SMs
+(specs/secured-profile.md).
 """
 
 
@@ -74,6 +76,15 @@ class SweepReport:
         # How many Bad M_Key traps OpenSM received: only counted, since its
         # log of one holds the key that was sent
         self.bad_m_key_traps = bad_m_key_traps
+
+
+class LogFindings:
+    """What OpenSM logged since the driver last looked, that a fabric check
+    judges: the port GUIDs of the SMs it ignored (ERR 0F09), as ints, in the
+    order logged"""
+
+    def __init__(self, ignored_sms=()):
+        self.ignored_sms = list(ignored_sms)
 
 
 class Fabric:

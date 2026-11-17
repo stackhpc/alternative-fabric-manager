@@ -32,12 +32,13 @@ can't read one way only, rather than guess:
 HA mode refuses removing `m_key` or `sm_key`, which it depends on.
 
 Further hardening that matches the rest of NVIDIA's Secured Cloud Profile is
-experimental: not tested enough to be on by default, and not part of `all`.
-You can try it by hand on a fabric you control (see Experimental hardening).
-One experimental group exists already, `m_key_per_port`, which is chosen by
-naming it beside `all`: `hardening = all, m_key_per_port` (see Per-port
-M_Keys). Once its hardware tests pass, each is planned to become a group in
-`all`.
+experimental, untested on hardware: not part of `all`, and not on by
+default. The experimental groups are `m_key_per_port` and `allowed_sm`, each
+chosen by naming it beside `all`, as `hardening = all, allowed_sm` (see
+Experimental hardening). Before naming one, read its "Before enabling"
+checklist: what to back up, what to check when it's turned on, what shows it
+works or failed, and how to turn it off. Once its hardware tests pass, each
+is planned to join `all`.
 The release that adds one will say so in its notes, and `-group` will
 remove it. On a fabric that others share, prefer an explicit list of groups,
 so that nothing switches on at an upgrade without their agreement.
@@ -68,6 +69,7 @@ such key at once (see Permanent keys).
 | `enforcement` | `sa_check_sgid_spoofing` | `TRUE` | `TRUE` | A client claiming another port's GID in an SA request |
 | `babbling_ports` | `babbling_port_policy` | `FALSE` | `TRUE` | A port flooding the subnet manager with traps |
 | `m_key_per_port` (experimental, not in `all`) | `m_key_per_port` | `FALSE` | `TRUE`, once turned on, with `m_key_lookup TRUE`, `m_key_protection_level 2` and `m_key` the base key | One port's M_Key opening every other port |
+| `allowed_sm` (experimental, untested on hardware; not in `all`) | `allowed_sm_guids` | unset (every SM takes part) | This host's physical ports | A tenant's subnet manager winning the election |
 
 The `enforcement` group is OpenSM's defaults already. It is written anyway,
 so that `opensm.conf` shows the options and nothing weakens them by
@@ -82,6 +84,7 @@ accident.
 | Shared with hosts outside OpenStack that need untrusted SA dumps, such as `saquery` | `m_key, sm_key, enforcement`: an explicit list, so that no group switches on without the agreement of whoever shares the fabric. `babbling_ports` is left out because it disables ports that flood traps, which may be theirs |
 | Shared with hosts whose operators can't use the M_Key yet | `enforcement`, and plan M_Key protection: without it, a bare metal tenant can reconfigure switch ports |
 | Single node, with bare metal tenants, on a fabric you control or whose owner agrees, trying per-port M_Keys | `all, m_key_per_port`: experimental, and it leaves keys on ports (see Per-port M_Keys) |
+| Single node, on a fabric where no other host should run a subnet manager, trying allowed SMs | `all, allowed_sm`: experimental, untested on hardware (see Allowed subnet managers) |
 
 ## The keys
 
@@ -382,12 +385,16 @@ is what prevents that.
 
 These options close the rest of the gaps between AFM's hardening and
 NVIDIA UFM's Secured Cloud Profile. None is enabled by default or by `all`.
-Each is designed in specs/secured-profile.md, where it is planned as a
-group of its own, once hardware tests show it is safe. Until then you can
-try one by setting its OpenSM options in `[opensm_conf]`. The manager
-writes them as they are, and checks none of what the planned groups will.
-Per-port M_Keys are the exception: they are a group already, with the
-manager's checks, but not in `all` until their hardware tests pass.
+Each is designed in specs/secured-profile.md. Some are groups already,
+experimental, untested on hardware: `m_key_per_port` and `allowed_sm`, each
+with the manager's checks, chosen by naming it beside `all`, and planned to
+join `all` once their hardware tests pass. The others you can try by
+setting their OpenSM options in `[opensm_conf]`: the manager writes them as
+they are, and checks none of what the planned groups will.
+
+Each group has a "Before enabling" checklist, drawn from the hardware tests
+the spec plans for it. Its first enabling on a fabric is that test: follow
+the checklist, and record what you saw.
 
 Try them only on a fabric you control, or with the agreement of everyone
 who shares it. Back up the database first (it holds the keys), and record
@@ -401,33 +408,117 @@ Each change takes effect when the manager restarts, which restarts OpenSM.
 
 ### Allowed subnet managers
 
-A tenant can run a subnet manager of its own. Without the SM_Key it can't
-take over by handover, and without the M_Key it can't set ports, but it may
-still win the election and send AFM's OpenSM to STANDBY, leaving the fabric
-without a working subnet manager. With `allowed_sm_guids`, OpenSM ignores
-every subnet manager whose port isn't in the list.
+**Experimental, untested on hardware.** A tenant can run a subnet manager
+of its own. Without the SM_Key it can't take over by handover, and without
+the M_Key it can't set ports, but it may still win the election and send
+AFM's OpenSM to STANDBY, leaving the fabric without a working subnet
+manager. With `allowed_sm_guids`, OpenSM ignores every subnet manager
+whose port isn't in the list (`ERR 0F09`), and drops SMInfo Sets from them
+(`ERR 2F1C`).
 
-```ini
-[opensm_conf]
-# The port GUIDs of every physical InfiniBand port that may run OpenSM: in
-# HA mode, every node's. Not virtual functions, which belong to tenants.
-allowed_sm_guids = 0x...,0x...
+The `allowed_sm` group writes the list for you: this host's physical
+InfiniBand ports, which the manager reads before every start of OpenSM, in a
+short-lived container of OpenSM's image named like the prober's
+(`opensm-prober`). It reads sysfs only, and leaves out virtual functions
+(devices with a `device/physfn` link) and mlx5 sub-functions, which belong
+to tenants, and ports whose link layer isn't InfiniBand. Choose it with
+`hardening = all, allowed_sm`, in single-node mode. The manager refuses it:
+- in HA mode ("allowed SMs aren't supported in HA mode yet"): each node's
+  list must hold every other node's ports, which the manager doesn't record
+  yet;
+- without the `m_key` or `sm_key` groups, or with `m_key_protection_level
+  0`: an ignored subnet manager is harmless only without the keys;
+- with a driver other than `managed`.
+
+`[opensm_conf] allowed_sm_guids` replaces the generated list. It must be
+`0` (no other subnet manager) or port GUIDs, each `0x` and up to 16 hex
+digits, separated by commas, and the manager writes it in its own
+spelling. An override puts the list in effect even without the group, with
+the same rules: a list typed by hand, as earlier versions of this doc
+suggested, is now checked, and HA mode refuses it.
+
+Before every start, the manager refuses to start OpenSM, logs "Not
+starting OpenSM: ...", and tries again at every `[opensm] check_interval`,
+if:
+- it can't read this host's ports, or finds no physical InfiniBand port;
+- the list leaves out one of this host's physical ports, any of which
+  OpenSM may bind to, or, with `[opensm_conf] guid` set, that port.
+
+`ERR 7549` in OpenSM's log, a list OpenSM rejected, fails the start or the
+apply: OpenSM would then ignore no subnet manager at all.
+
+**Ignored subnet managers.** At every fabric check, the manager reads the
+`ERR 0F09` lines OpenSM logged since the last one:
+- **On a known SM port**, one whose host may hold the fabric's keys, the
+  check fails and the fabric is contested, so that no job completes, until
+  a direct query of the port (`sminfo -G` and `smpquery -G portinfo`, with
+  the port's M_Key) shows its subnet manager NOT-ACTIVE or no subnet
+  manager bound there (IsSM clear). The detail reads "OpenSM ignores
+  subnet managers on 0x..., which may hold the fabric's keys (ERR 0F09)".
+  This host's own physical ports are known SM ports, recorded at every
+  start, and so are ports you record. With `m_key` or `sm_key` set in
+  `[opensm_conf]`, every ignored subnet manager is judged so, since AFM
+  can't know who holds those keys.
+- **On any other port,** the manager logs an error once for each OpenSM it
+  starts ("... which isn't a known SM port: it can't hold the fabric's
+  keys, so OpenSM stays master, but find out whose it is"), and the check
+  isn't affected.
+
+The commands, beside the running manager:
+
+```sh
+AFM="docker exec alternative-fabric-manager alternative-fabric-manager"
+$AFM --known-sm-ports            # each known SM port: "this host" or "recorded"
+$AFM --record-sm-port <guid>     # a port whose host may hold the keys
+$AFM --drop-sm-port <guid>       # one whose adapter no longer is in such a host
 ```
 
-- **A wrong list can leave the fabric without a subnet manager.** If the
-  port OpenSM binds to isn't listed, OpenSM may refuse to run. Read the
-  GUIDs with `ibstat -p` on each host, and leave out virtual functions
-  (devices with a `device/physfn` link in `/sys/class/infiniband`).
-- **A malformed list turns the feature off.** OpenSM logs `ERR 7549` and
-  disables the feature. Check OpenSM's log after the restart.
-- **In HA mode, list every node's ports.** Otherwise one leader ignores the
-  next, and drops its request to stop (`ERR 2F1C`).
-- OpenSM logs `ERR 0F09` for each subnet manager it ignores. AFM doesn't
-  act on it yet. The planned group raises an alarm, and treats an ignored
-  subnet manager on a managed node's port as a contested fabric.
-- **Untested:** whether a tenant's subnet manager can send AFM's OpenSM to
-  STANDBY without the list, and whether a change to the list applies
-  without a restart.
+Record the ports of any host that has held the fabric's keys: one that ran
+AFM before, or where `opensm.conf` or a backup was kept. Drop a port only
+once its adapter is in a host that never had them, such as a reused card
+in a tenant's host: otherwise its subnet manager contests the fabric for
+good. `--drop-sm-port` refuses this host's own ports.
+
+The group leaves nothing on ports: removing it and restarting the manager
+turns it off.
+
+- **Untested on hardware** (specs/secured-profile.md, hardware tests 1 and
+  2): whether a tenant's subnet manager can send AFM's OpenSM to STANDBY
+  without the list; whether OpenSM logs `0F09` once or at every sweep (the
+  manager handles either); whether OpenSM refuses to run on a port that
+  isn't in its list; whether `0` lets OpenSM itself run; and what a SIGHUP
+  re-reads.
+
+#### Before enabling allowed SMs
+
+- **Back up** the database, `afm.conf` and `opensm.conf`, and note this
+  host's physical port GUIDs (`ibstat -p`, leaving out virtual functions).
+- **Agree it** with whoever shares the fabric, and find out whether any
+  other host runs a subnet manager, such as a standby: once the list is on,
+  OpenSM ignores it. If one holds the fabric's keys, record its ports with
+  `--record-sm-port` first, and expect the check to fail while it runs.
+- **When turning it on,** restart the manager with `hardening = all,
+  allowed_sm`, and check that:
+  - the manager logs "OpenSM ignores every SM outside allowed_sm_guids:"
+    with exactly this host's physical ports, and `opensm.conf` has the same
+    `allowed_sm_guids` line;
+  - OpenSM's log has no `ERR 7549`, and OpenSM reaches SUBNET UP as master;
+  - `--known-sm-ports` lists this host's ports as "this host";
+  - the fabric check passes, and a port's job completes.
+- **It works if,** on a fabric nobody else uses (hardware test 1), a
+  subnet manager started on another host at a higher priority leaves AFM's
+  OpenSM master: OpenSM logs `ERR 0F09` naming that host's port, the
+  manager logs that it isn't a known SM port, and the fabric check still
+  passes. With that port recorded, the check fails with the contest detail
+  while it runs, and passes again once it has stopped.
+- **It failed if** the manager logs "Not starting OpenSM: ...", OpenSM's
+  log has `ERR 7549`, OpenSM enters STANDBY, or the fabric check reports
+  another master; or if a subnet manager the list should ignore changes a
+  port.
+- **To turn it off,** remove the group (and any `[opensm_conf]
+  allowed_sm_guids`) and restart the manager. If a start is refused, the
+  fabric has no subnet manager until it's fixed: correct the list, or turn
+  the group off.
 
 ### Class keys
 
@@ -1012,5 +1103,7 @@ Whatever `hardening` says, `[opensm_conf]` can't set `partition_config_file`,
 manager watches for. With `m_key_per_port` named, `[opensm_conf]` can't set
 `m_key`, `m_key_per_port`, `m_key_protection_level` or `m_key_lookup`
 either, and without it can't set `m_key_per_port` (see Per-port M_Keys).
+`[opensm_conf] allowed_sm_guids` is checked like the list the `allowed_sm`
+group writes (see Allowed subnet managers).
 OpenSM ignores an option it doesn't know, so check an override's spelling
 in `opensm -c` output.

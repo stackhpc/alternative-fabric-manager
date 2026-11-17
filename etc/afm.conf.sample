@@ -54,8 +54,12 @@ partitions_template =
 # or none. all, the default, hardens everything; "-sa_trust" hardens
 # everything but sa_trust; "m_key, enforcement" hardens only those. A new
 # group joins all once tested, and an upgrade then turns it on: read the
-# release notes, and remove it with -group if needed. m_key_per_port, per-port
-# M_Keys, is experimental and not in all: "all, m_key_per_port" permits them.
+# release notes, and remove it with -group if needed. The experimental
+# groups, untested on hardware, aren't in all, and are named beside it: read
+# their Before enabling checklists in docs/opensm-hardening.md first.
+# m_key_per_port, per-port M_Keys: "all, m_key_per_port" permits them.
+# allowed_sm, experimental, untested on hardware: "all, allowed_sm" makes
+# OpenSM ignore every subnet manager outside this host's physical ports.
 # [opensm_conf] overrides any single option.
 hardening = all
 # The lease, in seconds, of every key the manager sets on ports: the M_Key,
@@ -102,7 +106,8 @@ ipoib_sl = 0
 # opensm.conf options for the managed driver, as "key = value". These win
 # over the hardened options. OpenSM uses its defaults for the others.
 # partition_config_file and daemon are set by the manager. Experimental
-# hardening that isn't on by default (allowed SMs, class keys, an SA rate
-# limit) is tried here: see docs/opensm-hardening.md, Experimental hardening.
+# hardening that isn't a group yet (class keys, an SA rate limit) is tried
+# here: see docs/opensm-hardening.md, Experimental hardening.
+# allowed_sm_guids replaces the allowed_sm group's list, with its checks.
 #sm_priority = 15
 #log_flags = 0x07

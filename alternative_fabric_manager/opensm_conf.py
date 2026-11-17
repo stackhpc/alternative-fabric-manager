@@ -40,6 +40,10 @@ CONTAINER_CONFIG_DIR = "/etc/opensm"
 # on (render's port_keys): OpenSM derives each port's key from that line.
 KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed", "m_key_base")
 
+# A hardened option whose value the manager works out at each start, such as
+# allowed_sm_guids from this host's ports: render's generated gives it.
+GENERATED = object()
+
 # The hardened options, in groups that [opensm] hardening names. A group's
 # key, if it has one, is generated once and kept in the database.
 HARDENING = {
@@ -89,6 +93,10 @@ HARDENING = {
         "m_key_lookup": "TRUE",
         "m_key_protection_level": "2",
     },
+    # OpenSM ignores every SM whose port isn't listed: this host's physical
+    # ports, which the manager reads before each start
+    # (specs/secured-profile.md, Allowed SM GUIDs). Experimental.
+    "allowed_sm": {"allowed_sm_guids": GENERATED},
 }
 
 
@@ -115,9 +123,10 @@ def effective_groups(groups, port_keys=False):
     return groups
 
 
-def hardened_options(groups, keys, key_lease_period=0, port_keys=False):
+def hardened_options(groups, keys, key_lease_period=0, port_keys=False, generated=None):
     """Return the options of the hardening groups, with the fabric's keys,
-    and key_lease_period as every key lease
+    key_lease_period as every key lease, and generated's values for the
+    options the manager works out at each start
 
     m_key_per_port's options are written only when port_keys is true, the
     target being on, and then the m_key line is the per-port M_Key base,
@@ -130,6 +139,9 @@ def hardened_options(groups, keys, key_lease_period=0, port_keys=False):
         for name, value in HARDENING[group].items():
             if value is None:
                 value = keys[name]
+            elif value is GENERATED:
+                # A KeyError rather than an option left out unseen
+                value = (generated or {})[name]
             elif is_key_lease(name):
                 value = str(key_lease_period)
             options[name] = value
@@ -138,7 +150,14 @@ def hardened_options(groups, keys, key_lease_period=0, port_keys=False):
     return options
 
 
-def render(overrides, hardening=(), keys=None, key_lease_period=0, port_keys=False):
+def render(
+    overrides,
+    hardening=(),
+    keys=None,
+    key_lease_period=0,
+    port_keys=False,
+    generated=None,
+):
     """Return opensm.conf
 
     OpenSM uses its defaults for options that aren't set. hardening names
@@ -147,7 +166,8 @@ def render(overrides, hardening=(), keys=None, key_lease_period=0, port_keys=Fal
     permanent keys; overrides win over hardening, but not over the options
     the manager depends on. port_keys says whether per-port M_Keys are on,
     their target: while it's false, m_key_per_port renders as if it weren't
-    named.
+    named. generated has the values the manager worked out for this start,
+    such as allowed_sm_guids, which an override replaces like any other.
     """
     hardening = effective_groups(hardening, port_keys)
     lines = [
@@ -161,7 +181,13 @@ def render(overrides, hardening=(), keys=None, key_lease_period=0, port_keys=Fal
     if "log_flags" not in overrides:
         # The levels whose messages the manager watches for
         lines.append("log_flags 0x07")
-    hardened = hardened_options(hardening, keys or {}, key_lease_period, port_keys)
+    hardened = hardened_options(
+        hardening,
+        keys or {},
+        key_lease_period,
+        port_keys,
+        generated,
+    )
     hardened = {k: v for k, v in hardened.items() if k not in overrides}
     if hardened:
         lines += [

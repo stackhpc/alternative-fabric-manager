@@ -144,6 +144,14 @@ it, a diagnostic tool's `-y` needs the port's own key, from
 `alternative-fabric-manager --port-m-key <guid>` into a variable, rather
 than `m_key` from `--show-keys`.
 
+Another experimental group, untested on hardware, `allowed_sm`, chosen as
+`hardening = all, allowed_sm` in single-node mode, makes OpenSM ignore
+every subnet manager outside this host's physical ports, so that a tenant's
+can't win the election. An ignored one on a port whose host may hold the
+fabric's keys (`--record-sm-port`) fails the fabric check. See
+docs/opensm-hardening.md, Allowed subnet managers, and its Before enabling
+checklist.
+
 ### The partitions template
 
 `partitions.conf` is rendered from a Jinja template, in a sandbox. Set

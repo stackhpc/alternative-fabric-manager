@@ -243,6 +243,51 @@ def test_a_server_database_at_0003_gains_the_port_key_tables():
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")
 
 
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0004_gains_the_known_sm_ports():
+    # 0005 adds known_sm_ports, and runs again if it stopped midway.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0004")
+    db.upgrade(rendered)
+    command.stamp(alembic, "0004")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        session.add(db.KnownSMPort(guid="0" * 16, own=True))
+        session.commit()
+    engine = sa.create_engine(rendered)
+    # A row added without own, as by hand, isn't this host's.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO known_sm_ports (guid) VALUES ('0000000000000051')"
+        )
+    with sessionmaker() as session:
+        assert session.get(db.KnownSMPort, "0000000000000051").own is False
+        assert session.get(db.KnownSMPort, "0" * 16).own is True
+    engine.dispose()
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+def test_known_sm_ports_round_trip(config):
+    sessionmaker = db.make_sessionmaker(config.database_url)
+    with sessionmaker() as session:
+        session.add(db.KnownSMPort(guid="0002c903000e0b72", own=True))
+        session.add(db.KnownSMPort(guid="0002c90300005678"))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.KnownSMPort, "0002c903000e0b72").own is True
+        assert session.get(db.KnownSMPort, "0002c90300005678").own is False
+
+
 class _GaleraSession:
     """Just enough of a session on a Galera node for check_serving"""
 

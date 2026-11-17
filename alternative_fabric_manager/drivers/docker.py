@@ -32,12 +32,13 @@ import docker.errors
 import docker.utils
 import requests.exceptions
 
-from alternative_fabric_manager import opensm_conf
+from alternative_fabric_manager import allowed_sm, opensm_conf
 from alternative_fabric_manager import prober as probes
 from alternative_fabric_manager.config import OPENSM_CACHE_DIR, parse_volumes
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
     Fabric,
+    LogFindings,
     PartitionsRejected,
     ReloadError,
     SweepReport,
@@ -103,6 +104,18 @@ _UNREACHED = re.compile(
 # The notice dump that follows holds the key that was sent.
 _BAD_M_KEY_TRAP = re.compile(r"Received Generic Notice type:\d+ num:256\b")
 
+# OpenSM 5.17's "ERR 7549: allowed_sm_guids param is not valid. Should be
+# GUIDs in comma separated values format. Disabling the feature": a list that
+# OpenSM rejected can never pass as protection, so it fails a start or an
+# apply (specs/secured-profile.md, Overrides).
+_ALLOWED_SM_REJECTED = re.compile(r"ERR 7549: allowed_sm_guids")
+# "ERR 0F09: Ignoring SM on port 0x%lx, is not part of the allowed port GUIDs"
+_IGNORED_SM = re.compile(r"ERR 0F09: Ignoring SM on port 0x([0-9a-fA-F]{1,16})\b")
+# A line of the daemon's log with timestamps: RFC 3339, nanoseconds at most
+_LOG_TIME = re.compile(
+    r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)"
+)
+
 # OpenSM's log holds keys: a trap's notice dump, an SMP dump, an SA key
 # mismatch ("SM_Key: 0x%lx != SM_Key: 0x%lx") and debug lines about sending
 # an SMP all print one. Whatever names a key has its value masked; lines about
@@ -134,6 +147,33 @@ def _shown(line):
     """A line of OpenSM's as it may be shown"""
     masked = _mask_keys(line.strip())
     return "<a line about an M_Key, not shown>" if masked is None else masked
+
+
+def _check_allowed_sm(line):
+    if _ALLOWED_SM_REJECTED.search(line):
+        raise ReloadError(
+            "OpenSM rejected allowed_sm_guids (ERR 7549) and disabled the list, "
+            "so it would ignore no SM"
+        )
+
+
+def _log_time(stamp):
+    """A log line's timestamp, in nanoseconds since the epoch, or None"""
+    match = _LOG_TIME.fullmatch(stamp)
+    if not match:
+        return None
+    zone = "+00:00" if match.group(3) == "Z" else match.group(3)
+    try:
+        when = datetime.datetime.fromisoformat(match.group(1) + zone)
+    except ValueError:
+        return None
+    return int(when.timestamp()) * 10**9 + int((match.group(2) or "").ljust(9, "0"))
+
+
+def _note_finding(findings, line):
+    match = _IGNORED_SM.search(line)
+    if match:
+        findings.ignored_sms.append(int(match.group(1), 16))
 
 
 def _is_partitions_error(line):
@@ -362,6 +402,9 @@ class DockerReloader:
                     raise ReloadError(
                         f"OpenSM couldn't read the partitions file: {_shown(line)}"
                     )
+                if handled:
+                    # OpenSM re-reads its options at SIGHUP.
+                    _check_allowed_sm(line)
                 if started:
                     _note(report, line)
                 if HUP_MARKER in line:
@@ -393,6 +436,9 @@ class ManagedDocker(DockerReloader):
     def __init__(self, config, client=None):
         super().__init__(config.container, config.sweep_timeout, client)
         self.config = config
+        # How far log_findings() has read: (container ID, the last line's
+        # timestamp in nanoseconds)
+        self._log_mark = None
 
     def _run_kwargs(self):
         config = self.config
@@ -530,6 +576,7 @@ class ManagedDocker(DockerReloader):
             report = SweepReport()
             for line in lines:
                 _note(report, line)
+                _check_allowed_sm(line)
                 if "PARSE ERROR" in line:
                     raise _rejected(line)
                 if _is_partitions_error(line):
@@ -646,6 +693,11 @@ class ManagedDocker(DockerReloader):
             raise ReloadError(f"Docker: can't run the prober: {e}") from e
 
     def _probe_in_helper(self, environment, wait):
+        return self._run_helper(probes.SCRIPT, environment, wait)
+
+    def _run_helper(self, script, environment, wait):
+        """Run script by sh in a helper container of OpenSM's image, as
+        the prober's: (status, stdout)"""
         # Created, not run: containers.run() would pull a missing image, and
         # a start mustn't wait on a registry.
         try:
@@ -661,7 +713,7 @@ class ManagedDocker(DockerReloader):
                 name=self.prober_name,
                 image=self.config.image,
                 entrypoint=["sh", "-c"],
-                command=[probes.SCRIPT],
+                command=[script],
                 environment=environment,
                 network_mode="host",
                 privileged=True,
@@ -685,6 +737,116 @@ class ManagedDocker(DockerReloader):
                     requests.exceptions.RequestException,
                 ) as e:
                     LOG.warning("Can't remove the prober's container: %s", e)
+
+    # Allowed SMs (specs/secured-profile.md, Allowed SM GUIDs)
+
+    def physical_ports(self):
+        """The port GUIDs of this host's physical InfiniBand ports, as a set
+        of ints, read from sysfs in a helper container of OpenSM's image,
+        before OpenSM starts; raises ReloadError if it can't tell
+
+        It runs before start(), which pulls a missing image on a single
+        node, so it pulls one first too: otherwise a start retried after a
+        failed pull would never get that far.
+        """
+        if self.pulls_on_start:
+            try:
+                self.ensure_image()
+            except (
+                docker.errors.DockerException,
+                requests.exceptions.RequestException,
+            ) as e:
+                raise allowed_sm.ProbeError(
+                    f"can't pull OpenSM's image: {type(e).__name__}"
+                ) from e
+        code, output = self._run_helper(
+            allowed_sm.PORTS_SCRIPT, {}, allowed_sm.PROBE_TIMEOUT
+        )
+        if code != 0:
+            raise allowed_sm.ProbeError(f"the port probe exited with status {code}")
+        try:
+            text = output.decode("ascii")
+        except (AttributeError, UnicodeDecodeError):
+            raise allowed_sm.ProbeError("the port probe's output isn't text") from None
+        return allowed_sm.parse_ports(text)
+
+    def log_findings(self):
+        """What the running OpenSM logged since the last call, as a
+        LogFindings: the first call for a container reads its whole log
+
+        Lines are taken by the daemon's timestamps, so that each is judged
+        once. Raises ReloadError if the log can't be read.
+        """
+        try:
+            container = self.client.containers.get(self.container_name)
+            if container.status != "running":
+                raise ReloadError(
+                    f"OpenSM container {self.container_name} isn't running"
+                )
+            mark = self._log_mark
+            last = mark[1] if mark is not None and mark[0] == container.id else 0
+            kwargs = {"stdout": True, "stderr": True, "timestamps": True}
+            if last:
+                kwargs["since"] = last // 10**9
+            text = container.logs(**kwargs).decode(errors="replace")
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't read OpenSM's log: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't read OpenSM's log: {type(e).__name__}"
+            ) from e
+        findings = LogFindings()
+        newest = last
+        for line in text.splitlines():
+            stamp, _, message = line.partition(" ")
+            when = _log_time(stamp)
+            if when is not None:
+                if when <= last:
+                    continue
+                newest = max(newest, when)
+            else:
+                # Judged rather than skipped: a line judged twice repeats an
+                # alarm or a contest, one skipped could hide an SM.
+                message = line
+            _note_finding(findings, message)
+        self._log_mark = (container.id, newest)
+        return findings
+
+    def query_sm_port(self, guid, m_key):
+        """Query a known SM port directly, from OpenSM's container: SMInfo's
+        state, and PortInfo's capability mask, as an allowed_sm.PortQuery.
+        The key travels in the script's environment, never its command
+        line, and only those two values leave the container."""
+        environment = {
+            "AFM_GUID": f"0x{guid:016x}",
+            "AFM_KEY": m_key,
+            "AFM_QUERY_TIMEOUT": str(allowed_sm.QUERY_TIMEOUT),
+        }
+        try:
+            container = self.client.containers.get(self.container_name)
+            if container.status != "running":
+                raise ReloadError(
+                    f"OpenSM container {self.container_name} isn't running"
+                )
+            code, output = container.exec_run(
+                ["sh", "-c", allowed_sm.QUERY_SCRIPT],
+                environment=environment,
+                stdout=True,
+                stderr=False,
+            )
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't query the port: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't query the port: {type(e).__name__}"
+            ) from e
+        if code != 0:
+            raise ReloadError(f"the port query exited with status {code}")
+        try:
+            text = output.decode("ascii")
+        except (AttributeError, UnicodeDecodeError):
+            raise ReloadError("the port query's output isn't text") from None
+        return allowed_sm.parse_query(text)
 
     def running(self):
         try:

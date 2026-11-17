@@ -16,7 +16,7 @@ import sys
 
 import uvicorn
 
-from alternative_fabric_manager import api, db, drivers, port_keeper
+from alternative_fabric_manager import allowed_sm, api, db, drivers, port_keeper
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
 
@@ -148,6 +148,34 @@ def main(argv=None):
         metavar="GUID",
         help="Drop a removed port and its links; refused for a port seen in "
         "the last day",
+    )
+    sms = parser.add_argument_group(
+        "allowed SMs",
+        "With the allowed_sm hardening group, or [opensm_conf] "
+        "allowed_sm_guids (docs/opensm-hardening.md). OpenSM ignoring an SM on "
+        "a known SM port contests the fabric; on any other port, it's only "
+        "logged. Each runs beside the running manager, and exits",
+    )
+    sm_commands = sms.add_mutually_exclusive_group()
+    sm_commands.add_argument(
+        "--known-sm-ports",
+        action="store_true",
+        help="List the known SM ports: this host's physical ports, as the "
+        "last start found them, and those recorded with --record-sm-port",
+    )
+    sm_commands.add_argument(
+        "--record-sm-port",
+        metavar="GUID",
+        help="Record a port whose host may hold the fabric's keys, such as "
+        "another host that ran AFM's OpenSM, so that an SM there that OpenSM "
+        "ignores contests the fabric",
+    )
+    sm_commands.add_argument(
+        "--drop-sm-port",
+        metavar="GUID",
+        help="Forget a known SM port once its adapter is no longer in a host "
+        "with the fabric's keys, as when it's reused in a tenant's host; "
+        "refused for this host's own ports",
     )
     args = parser.parse_args(argv)
 
@@ -288,6 +316,17 @@ def main(argv=None):
             sys.exit(f"alternative-fabric-manager: {e}")
         return
 
+    if (
+        args.known_sm_ports
+        or args.record_sm_port is not None
+        or args.drop_sm_port is not None
+    ):
+        try:
+            _allowed_sms(config, args)
+        except (allowed_sm.AllowedSMError, port_keeper.PortKeysError) as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
+        return
+
     if args.show_enforcement_errors or args.clear_enforcement_errors:
         manager = manager_mod.Manager(
             config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
@@ -360,6 +399,26 @@ def _port_keys(config, args):
         guid = port_keeper.parse_guid(args.forget_port)
         links = keeper.forget_port(guid)
         print(f"Forgot 0x{guid:016x} and {links} links")
+
+
+def _allowed_sms(config, args):
+    """The allowed SM commands, beside the running manager"""
+    manager = manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
+    )
+    sms = manager.allowed_sms
+    if args.known_sm_ports:
+        print("\n".join(sms.known_ports()))
+    elif args.record_sm_port is not None:
+        guid = port_keeper.parse_guid(args.record_sm_port)
+        if sms.record(guid):
+            print(f"Recorded 0x{guid:016x} as a known SM port")
+        else:
+            print(f"0x{guid:016x} was a known SM port already")
+    else:
+        guid = port_keeper.parse_guid(args.drop_sm_port)
+        sms.drop(guid)
+        print(f"Dropped 0x{guid:016x} from the known SM ports")
 
 
 def _serve_ha(config, args):

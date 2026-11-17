@@ -140,7 +140,11 @@ def test_the_base_is_rendered_only_with_per_port_keys_on():
         for groups in itertools.combinations(sorted(every), size):
             for port_keys in (False, True):
                 content = opensm_conf.render(
-                    {}, hardening=set(groups), keys=keys, port_keys=port_keys
+                    {},
+                    hardening=set(groups),
+                    keys=keys,
+                    port_keys=port_keys,
+                    generated={"allowed_sm_guids": "0x0000000000000001"},
                 )
                 assert "m_key_base" not in content
                 written = port_keys and "m_key_per_port" in groups
