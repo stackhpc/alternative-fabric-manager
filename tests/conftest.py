@@ -52,7 +52,7 @@ class FakeReloader:
             raise self.error
         return self.report or SweepReport()
 
-    def fabric(self, m_key=None, sa_key=None):
+    def fabric(self, m_key=None, sa_key=None, switches=None):
         self.fabric_calls.append((m_key, sa_key))
         if isinstance(self.fabric_result, Exception):
             raise self.fabric_result

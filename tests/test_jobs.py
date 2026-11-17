@@ -789,3 +789,20 @@ def test_enforcement_errors_are_listed_without_clearing(manager, fabric):
     assert manager.enforcement_errors() == [f"{SWITCH:016x}:3"]
     assert manager.clear_enforcement_errors() == [f"{SWITCH:016x}:3"]
     assert manager.enforcement_errors() == []
+
+
+@pytest.mark.parametrize(
+    "report",
+    [SweepReport(dr_errors=True), SweepReport(unreached={GUID, 0}, bad_m_key_traps=2)],
+)
+def test_what_per_port_m_keys_watch_for_changes_nothing_without_them(
+    manager, fabric, report
+):
+    # Without the m_key_per_port group or its rows, OpenSM's directed-route
+    # send errors, unreached ports and Bad M_Key traps hold no job.
+    fabric.report = report
+    manager.put_network(NETWORK_ID, conftest.network())
+    job = manager.put_port(PORT_ID, conftest.port())
+    manager.reconcile()
+    assert _status(manager, job) == db.JobStatus.COMPLETED
+    assert all(len(call) == 2 for call in fabric.fabric_calls)

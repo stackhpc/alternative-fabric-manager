@@ -1,15 +1,12 @@
 """The prober's wire format, and its verify against a simulated fabric
 
-The simulator answers a Get only as InfiniBand would: a port at protection
-level 2 or more answers only the key it holds, a port at 0 or 1 answers any,
-and nothing crosses a link that's down. It records every Get it was sent, by
-the port its route leads to, so that the tests can assert what was never
-sent: above all, that a tenant's port isn't sent a key the rules don't
-allow it.
+The simulator, tests/fabric_sim.py, answers a Get only as InfiniBand would,
+and records every Get it was sent, so that the tests can assert what was
+never sent: above all, that a tenant's port isn't sent a key the rules
+don't allow it.
 """
 
 import dataclasses
-import datetime
 import random
 
 import pytest
@@ -18,21 +15,21 @@ from alternative_fabric_manager import port_keys, prober
 from alternative_fabric_manager.drivers import ReloadError
 from alternative_fabric_manager.port_keys import DERIVED, M_KEY, UNKNOWN, PortState
 from alternative_fabric_manager.prober import FULL, SWITCHES, Get, ProbeError
-
-M = 0x2222222222222222
-BASE = 0x1111111111111111
-NOW = datetime.datetime(2026, 11, 16, 12, 0, tzinfo=datetime.timezone.utc)
-EARLIER = datetime.datetime(2026, 11, 15, 12, 0, tzinfo=datetime.timezone.utc)
-
-OWN = 0xA0
-S1 = 0x51
-S2 = 0x52
-T1, T2, T3, T4 = 0xB1, 0xB2, 0xB3, 0xB4
-
-
-def derived(guid):
-    return port_keys.port_m_key(BASE, guid)
-
+from tests.fabric_sim import (
+    BASE,
+    EARLIER,
+    NOW,
+    OWN,
+    S1,
+    S2,
+    T1,
+    T2,
+    T3,
+    T4,
+    M,
+    derived,
+    fabric,
+)
 
 # The wire format
 
@@ -142,157 +139,6 @@ def test_parse_refuses_what_breaks_the_contract(output):
     assert "Channel" not in str(raised.value)
 
 
-# The simulator
-
-
-@dataclasses.dataclass
-class SimPort:
-    guid: int
-    switch: bool
-    key: int
-    protect: int = 2
-    node_guid: int = 0
-    num_ports: int = 1
-
-
-class Sim:
-    def __init__(self, own=OWN, own_guids=None):
-        self.ports = {}
-        self.cables = {}
-        self.down = set()
-        self.own = own
-        self.own_guids = list(own_guids or [own])
-        # Every Get: (the GUID its route leads to, key, attr, port)
-        self.sent = []
-        # The GUIDs each batch's Gets went to
-        self.batches = []
-        self.no_portinfo = set()
-        self.on_batch = None
-
-    def add(self, guid, switch=False, key=None, protect=2, node_guid=None, ports=1):
-        self.ports[guid] = SimPort(
-            guid,
-            switch,
-            derived(guid) if key is None else key,
-            protect,
-            node_guid if node_guid is not None else guid + 0x1000,
-            ports,
-        )
-
-    def cable(self, a, a_port, b, b_port, up=True):
-        self.cables[(a, a_port)] = (b, b_port)
-        self.cables[(b, b_port)] = (a, a_port)
-        if not up:
-            self.down |= {(a, a_port), (b, b_port)}
-
-    def resolve(self, route):
-        """The port a route leads to, ignoring link states, and whether the
-        Get can get there"""
-        hops = [int(hop) for hop in route.split(",")][1:]
-        current, deliverable = self.own, True
-        for i, port in enumerate(hops):
-            if i > 0 and not self.ports[current].switch:
-                return None, False
-            peer = self.cables.get((current, port))
-            if peer is None:
-                return None, False
-            if (current, port) in self.down:
-                deliverable = False
-            current = peer[0]
-        return current, deliverable
-
-    def link_state(self, guid, port):
-        cabled = (guid, port) in self.cables
-        return "Active" if cabled and (guid, port) not in self.down else "Down"
-
-    def answer(self, guid, deliverable, get):
-        if guid is None or not deliverable:
-            return None
-        port = self.ports[guid]
-        if port.protect >= 2 and get.key != port.key:
-            return None
-        if get.attr == "nodeinfo":
-            return {
-                "NodeType": "Switch" if port.switch else "Channel Adapter",
-                "NumPorts": str(port.num_ports),
-                "Guid": f"0x{port.node_guid:016x}",
-                "PortGuid": f"0x{guid:016x}",
-                "LocalPort": "1",
-            }
-        if guid in self.no_portinfo:
-            return None
-        if port.switch:
-            state = "Active" if not get.port else self.link_state(guid, get.port)
-        else:
-            state = self.link_state(guid, 1)
-        return {
-            "LocalPort": str(get.port or 1),
-            "LinkState": state,
-            "PhysLinkState": "LinkUp" if state != "Down" else "Polling",
-            "ProtectBits": str(port.protect),
-        }
-
-    def run(self, gets):
-        if self.on_batch:
-            self.on_batch(self)
-        answers = {}
-        batch = []
-        for get in gets:
-            guid, deliverable = self.resolve(get.route)
-            self.sent.append((guid, get.key, get.attr, get.port))
-            batch.append(guid)
-            answers[get.id] = self.answer(guid, deliverable, get)
-        self.batches.append(batch)
-        return list(self.own_guids), answers
-
-    def keys_sent(self, guid):
-        return [key for to, key, _attr, _port in self.sent if to == guid]
-
-    def rows(self, holds=None, switch_known=True, changes=None):
-        """Rows as a fold of OpenSM's cache would give them: every cabled
-        port, holding what holds says (what it holds in the simulator by
-        default)"""
-        holds = holds or {}
-        changes = changes or {}
-        rows = {}
-        for guid, port in self.ports.items():
-            held = M_KEY if port.key == M else DERIVED
-            fields = {
-                "switch": (port.switch or None) if switch_known else None,
-                "holds": holds.get(guid, held),
-                "reachable": True,
-                "last_seen": EARLIER,
-                **changes.get(guid, {}),
-            }
-            rows[guid] = PortState(guid, **fields)
-        return rows
-
-    def links(self):
-        return {
-            (guid, port): port_keys.Link(guid, port, *peer)
-            for (guid, port), peer in self.cables.items()
-        }
-
-
-def fabric():
-    """This host's port on S1, S2 behind S1, tenants T1 and T2 on S1, T3 on
-    S2, and T4 on S1 behind a link that's down; every port on its derived
-    key"""
-    sim = Sim()
-    sim.add(OWN)
-    sim.add(S1, switch=True, ports=8)
-    sim.add(S2, switch=True, ports=4)
-    for tenant in (T1, T2, T3, T4):
-        sim.add(tenant)
-    sim.cable(OWN, 1, S1, 1)
-    sim.cable(S1, 2, S2, 1)
-    sim.cable(S1, 3, T1, 1)
-    sim.cable(S1, 4, T2, 1)
-    sim.cable(S2, 2, T3, 1)
-    sim.cable(S1, 5, T4, 1, up=False)
-    return sim
-
-
 def check(sim, rows=None, links=None, **kwargs):
     values = {
         "m_key": M,
@@ -316,7 +162,7 @@ def test_a_whole_fabric_on_derived_keys():
     result = check(sim)
     assert result.complete and not result.own_port_lost
     assert result.own_guid == OWN
-    assert result.switches == {S1 + 0x1000, S2 + 0x1000}
+    assert result.switches == {S1, S2}
     assert result.answered == {OWN, S1, S2, T1, T2, T3}
     assert result.keyed == result.answered
     assert result.link_down == {T4}
@@ -446,7 +292,7 @@ def test_rule2_a_deadline_keeps_this_host_and_the_switches():
     rows = sim.rows()
     result = check(sim, rows=rows, deadline=50.0, clock=lambda: clock[0])
     assert not result.complete
-    assert result.switches == {S1 + 0x1000, S2 + 0x1000}
+    assert result.switches == {S1, S2}
     assert result.answered >= {OWN, S1, S2}
     # The tenants were never sent anything, and keep their rows.
     for tenant in (T1, T2, T3):
@@ -474,7 +320,7 @@ def test_rule2_a_switch_not_yet_known_isnt_routed_through():
     # probed, and it isn't counted.
     assert S2 in result.answered
     assert result.ports[S2].switch is True
-    assert S2 + 0x1000 not in result.switches
+    assert S2 not in result.switches
     assert sim.keys_sent(T3) == []
 
 
@@ -482,7 +328,7 @@ def test_rule2_a_switch_must_say_so_again():
     sim = fabric()
     sim.ports[S2].switch = False  # its NodeInfo now says it's an HCA
     result = check(sim)
-    assert S2 + 0x1000 not in result.switches
+    assert S2 not in result.switches
     assert result.ports[S2].switch is False
     assert sim.keys_sent(T3) == []
 
@@ -494,7 +340,7 @@ def test_rule2_a_switch_behind_a_switch():
     sim.cable(S2, 3, 0x53, 1)
     sim.cable(0x53, 2, 0xB5, 1)
     result = check(sim)
-    assert 0x53 + 0x1000 in result.switches
+    assert 0x53 in result.switches
     assert 0xB5 in result.keyed
     gets = [(to, port) for to, _key, attr, port in sim.sent if to == 0xB5]
     assert gets == [(0xB5, None), (0xB5, None)]
@@ -598,11 +444,13 @@ def test_rule4_an_answer_needs_both_gets():
     assert sim.keys_sent(T1) == [derived(T1)] * 2
 
 
-def test_rule4_switches_are_counted_by_node_guid():
+def test_rule4_switches_are_counted_by_the_guid_their_route_answered():
+    # Not by NodeInfo's Guid, which the node reports about itself: the
+    # fabric check and trust compare the row's own GUID.
     sim = fabric()
     sim.ports[S1].node_guid = 0x0EC0D9A0300B12560
     result = check(sim, scope=SWITCHES)
-    assert 0x0EC0D9A0300B12560 in result.switches
+    assert result.switches == {S1, S2}
     assert result.ports[S1].node_guid == 0x0EC0D9A0300B12560
 
 
@@ -789,7 +637,7 @@ def test_rule6_ports_not_probed_keep_their_rows():
     for guid in (T1, T2, T3, T4):
         assert result.ports[guid] is rows[guid]
         assert sim.keys_sent(guid) == []
-    assert result.switches == {S1 + 0x1000, S2 + 0x1000}
+    assert result.switches == {S1, S2}
 
 
 def test_rule6_a_port_without_a_row_isnt_given_one():
@@ -896,3 +744,92 @@ def test_a_result_holds_no_key():
     assert f"{M:x}" not in text and str(M) not in text
     assert result.counts()["switches"] == 2
     assert result.gets == len(sim.sent)
+
+
+# Trust: by a switch row's own GUID, which its route's answer matched
+
+CONFIRMED = {S1, S2}
+X = 0xD1
+BEHIND_X = 0xD2
+
+
+def _impostor(sim, key):
+    """An adapter on S1 port 6 that answers NodeInfo as a switch, with S1's
+    GUID as its node GUID, with a port behind it"""
+    sim.ports[S1].node_guid = S1
+    sim.ports[S2].node_guid = S2
+    sim.add(X, switch=True, key=key, node_guid=S1, ports=2)
+    sim.cable(S1, 6, X, 1)
+    sim.add(BEHIND_X)
+    sim.cable(X, 2, BEHIND_X, 1)
+    rows = sim.rows()
+    rows[X] = PortState(X, switch=True, node_guid=S1, holds=DERIVED, reachable=True)
+    return rows
+
+
+@pytest.mark.parametrize("scope", [FULL, SWITCHES, frozenset({X})])
+def test_trust_an_adapter_claiming_a_confirmed_switchs_guid_isnt_sent_m_key(scope):
+    sim = fabric()
+    rows = _impostor(sim, 0x3333333333333333)
+    result = check(sim, rows=rows, scope=scope, trusted_switches=CONFIRMED)
+    assert M not in sim.keys_sent(X)
+    assert sim.keys_sent(X) == [derived(X)] * 2
+    assert X not in result.switches
+
+
+def test_trust_an_unconfirmed_switch_isnt_routed_through_or_counted():
+    sim = fabric()
+    rows = _impostor(sim, derived(X))
+    result = check(sim, rows=rows, trusted_switches=CONFIRMED)
+    assert X in result.keyed
+    assert X not in result.switches and result.switches == CONFIRMED
+    # A Get through it would show it the key.
+    assert sim.keys_sent(BEHIND_X) == []
+
+
+def test_trust_a_switch_whose_node_guid_differs_is_trusted_by_its_port_guid():
+    sim = fabric()
+    sim.ports[S1].node_guid = 0x0EC0D9A0300B12560
+    sim.ports[S1].key = M
+    rows = sim.rows(holds={S1: DERIVED})
+    result = check(sim, rows=rows, trusted_switches=CONFIRMED)
+    # Infrastructure: both keys, so it answers the one it holds
+    assert S1 in result.keyed and result.ports[S1].holds == M_KEY
+    assert S1 in result.switches
+
+
+def test_trust_with_none_confirmed_reaches_only_this_hosts_port_and_its_peer():
+    sim = fabric()
+    result = check(sim, trusted_switches=set())
+    assert result.switches == set()
+    assert {to for to, *_ in sim.sent} == {OWN, S1}
+
+
+def test_trust_confirm_mode_follows_unconfirmed_switches_without_both_keys():
+    sim = fabric()
+    result = check(sim, trusted_switches={S1}, follow_unconfirmed=True)
+    assert result.switches == {S1, S2}
+    assert T3 in result.keyed
+    assert check(fabric(), trusted_switches={S1}).switches == {S1}
+    # Still a tenant's rule for the unconfirmed one: its derived key only
+    sim = fabric()
+    sim.ports[S2].key = M
+    rows = sim.rows(holds={S2: DERIVED})
+    result = check(sim, rows=rows, trusted_switches={S1}, follow_unconfirmed=True)
+    assert M not in sim.keys_sent(S2)
+    assert S2 not in result.switches
+
+
+def test_a_half_link_isnt_followed():
+    # T1 was re-cabled from S1 port 3 to port 6; S1 port 3's row still
+    # names it, but T1's points to port 6.
+    sim = fabric()
+    links = sim.links()
+    del sim.cables[(S1, 3)], sim.cables[(T1, 1)]
+    sim.cable(S1, 6, T1, 1)
+    links[(T1, 1)] = port_keys.Link(T1, 1, S1, 6)
+    links[(S1, 6)] = port_keys.Link(S1, 6, T1, 1)
+    result = check(sim, links=links)
+    assert T1 in result.keyed and T1 not in result.link_down
+    # S1 port 3's link state was never what T1 was judged by.
+    assert result.unrecorded == []

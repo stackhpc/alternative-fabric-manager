@@ -281,8 +281,9 @@ def test_check_each_neighbors_line_replaces_its_local_ports_link():
     _, folded, summary = _fold_check({}, links, "0x51:3 0xb2:1\n0xb2:1 0x51:3\n", {})
     assert folded[(S1, 3)] == Link(S1, 3, Y, 1, T1)
     assert folded[(Y, 1)] == Link(Y, 1, S1, 3, T1)
-    # X's own line wasn't in the file, so its row stays, as it was.
-    assert folded[(X, 1)] == Link(X, 1, S1, 3, T0)
+    # X's own line wasn't in the file, and its row pointed back to the
+    # re-cabled switch port, so it goes: a half-link is never followed.
+    assert (X, 1) not in folded
     assert (summary.links_added, summary.links_changed) == (1, 1)
 
 
@@ -520,7 +521,14 @@ def test_should_adopt_only_a_named_groups_derived_rows(
     group_named, target_on, holds, adopt
 ):
     ports = _ports(Port(X, holds=M_KEY), Port(Y, holds=holds))
-    assert port_keys.should_adopt(ports, group_named, target_on) is adopt
+    assert port_keys.should_adopt(ports, group_named, target_on, None) is adopt
+
+
+def test_should_adopt_never_with_a_fingerprint():
+    # The database has seen a turn-on: derived rows are a turn-off's
+    # leftovers, such as a node that was down, not a restore.
+    ports = _ports(Port(X, holds=DERIVED))
+    assert not port_keys.should_adopt(ports, True, False, port_keys.fingerprint(1))
 
 
 # The prober's keys
@@ -830,3 +838,28 @@ def test_only_a_fingerprint_is_stored_as_one(session, value):
     with pytest.raises(ValueError) as e:
         port_keys.save_fingerprint(session, value)
     assert "bb" not in str(e.value)
+
+
+def test_a_half_link_is_neither_followed_nor_rendered():
+    links = _links(*_both(S1, 3, X, 1, T0))
+    links[(S1, 4)] = Link(S1, 4, Y, 1, T0)  # Y's row doesn't point back
+    assert [link.key for link in port_keys.paired(links)] == [(S1, 3), (X, 1)]
+    assert "0x0000000000000051:4" not in port_keys.render_neighbors(links)
+    routes = port_keys.all_routes(links, S1, {S1})
+    assert Y not in routes and X in routes
+
+
+def test_start_fold_drops_a_recabled_ports_old_peer_too():
+    links = _links(*_both(S1, 3, X, 1, T0))
+    _, folded, _ = port_keys.fold_start(
+        {},
+        links,
+        port_keys.parse_neighbors("0xb1:1 0x51:6\n0x51:6 0xb1:1\n"),
+        port_keys.KeyEntries(),
+        M,
+        None,
+        T1,
+        T1,
+    )
+    assert (S1, 3) not in folded
+    assert folded[(X, 1)].peer_port == 6

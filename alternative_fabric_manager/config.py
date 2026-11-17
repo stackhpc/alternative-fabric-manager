@@ -416,19 +416,46 @@ class Config:
             )
 
 
+def parse_volumes(volumes):
+    """The mounts of an [opensm] volumes value, each source:destination
+    [:mode], separated by commas
+
+    A mode is itself a comma-separated list (ro,z or z,ro), so an item
+    without a colon continues the mode of the mount before it, unless it
+    is a path, which is an anonymous volume of its own.
+    """
+    mounts = []
+    for item in volumes.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if (
+            ":" not in item
+            and not item.startswith("/")
+            and mounts
+            and mounts[-1].count(":") >= 2
+        ):
+            mounts[-1] += "," + item
+        else:
+            mounts.append(item)
+    return mounts
+
+
 def cache_volume_writable(volumes):
     """Whether [opensm] volumes mounts something writable at OpenSM's cache
 
-    Each mount is source:destination[:mode]; the mode ro makes it
-    read-only, so the manager couldn't copy the cache into it.
+    Each mount is source:destination[:mode]; a mode with ro among its
+    comma-separated options makes it read-only, so the manager couldn't
+    copy the cache into it.
     """
-    for volume in volumes.split(","):
-        fields = volume.strip().split(":")
+    for volume in parse_volumes(volumes):
+        fields = volume.split(":")
         if len(fields) < 2 or not fields[0]:
             continue
         destination = fields[1].rstrip("/") or "/"
-        mode = fields[2].strip() if len(fields) > 2 else ""
-        if destination == OPENSM_CACHE_DIR and mode != "ro":
+        mode = fields[2] if len(fields) > 2 else ""
+        options = {option.strip() for option in mode.split(",")}
+        if destination == OPENSM_CACHE_DIR and "ro" not in options:
             return True
     return False
 

@@ -34,7 +34,7 @@ import requests.exceptions
 
 from alternative_fabric_manager import opensm_conf
 from alternative_fabric_manager import prober as probes
-from alternative_fabric_manager.config import OPENSM_CACHE_DIR
+from alternative_fabric_manager.config import OPENSM_CACHE_DIR, parse_volumes
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
     Fabric,
@@ -397,7 +397,7 @@ class ManagedDocker(DockerReloader):
     def _run_kwargs(self):
         config = self.config
         volumes = [f"{config.host_config_dir}:{opensm_conf.CONTAINER_CONFIG_DIR}:ro"]
-        volumes += [v.strip() for v in config.volumes.split(",") if v.strip()]
+        volumes += parse_volumes(config.volumes)
         kwargs = {
             "image": config.image,
             # After the image's own -F, so that this one is used
@@ -475,6 +475,17 @@ class ManagedDocker(DockerReloader):
         with contextlib.suppress(docker.errors.NotFound):
             self.client.containers.get(self.container_name).remove(force=True)
 
+    @property
+    def prober_name(self):
+        """The helper prober's container: a fixed name, so that one left
+        behind, whose configuration holds the plan and its keys, is found
+        and removed"""
+        return f"{self.container_name}-prober"
+
+    def _remove_prober(self):
+        with contextlib.suppress(docker.errors.NotFound):
+            self.client.containers.get(self.prober_name).remove(force=True)
+
     def start(self, prepare=None):
         """Start OpenSM, with its files already written
 
@@ -491,6 +502,7 @@ class ManagedDocker(DockerReloader):
             # A container left by an earlier manager has stopped, since it
             # was in that manager's PID namespace, but its name is taken.
             self._remove()
+            self._remove_prober()
             container = self.client.containers.create(**self._run_kwargs())
             if prepare is not None:
                 prepare(container)
@@ -644,7 +656,9 @@ class ManagedDocker(DockerReloader):
             raise ReloadError(f"OpenSM's image {self.config.image} isn't on this host")
         container = None
         try:
+            self._remove_prober()
             container = self.client.containers.create(
+                name=self.prober_name,
                 image=self.config.image,
                 entrypoint=["sh", "-c"],
                 command=[probes.SCRIPT],
@@ -688,3 +702,7 @@ class ManagedDocker(DockerReloader):
             self._remove()
         except docker.errors.DockerException as e:
             LOG.warning("Can't remove the OpenSM container: %s", e)
+        try:
+            self._remove_prober()
+        except docker.errors.DockerException as e:
+            LOG.warning("Can't remove the prober's container: %s", e)

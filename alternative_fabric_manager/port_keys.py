@@ -43,6 +43,13 @@ from alternative_fabric_manager import db
 # fingerprint of the base the ports were keyed from, as text
 TARGET = "port_keys_target"
 BASE_FINGERPRINT = "port_keys_base_fingerprint"
+# The target OpenSM was last started on, 1 for on, recorded before that
+# start: a start whose target isn't it begins a transition
+RUNNING = "port_keys_running"
+# 1 once a start with the target on met the success rule (Turning it on),
+# or adopted the target from ports that hold derived keys already (Restores):
+# until then, every start with the target on is held to it
+CONFIRMED = "port_keys_confirmed"
 
 # What a port holds: the stored m_key, its key derived from the base, or
 # neither as far as the manager knows
@@ -299,16 +306,34 @@ def render_guid2mkey(entries):
     )
 
 
+def paired(links):
+    """The links whose reverse is recorded and points back, as a list
+
+    A link recorded in one direction only, as a re-cabled port's old peer
+    can leave, is neither followed nor rendered: the port would be reached
+    through a switch port it has left, and whatever is cabled there next
+    taken for it.
+    """
+    links = list(_rows(links))
+    peers = {link.key: (link.peer_guid, link.peer_port) for link in links}
+    return [
+        link
+        for link in links
+        if peers.get((link.peer_guid, link.peer_port)) == link.key
+    ]
+
+
 def render_neighbors(links):
     """neighbors from every recorded link, sorted by its local side
 
     OpenSM finds a port only through a neighbors line, or its own topology
     (test 5: a missing line loses that port), so every link is written,
-    whatever the target. It holds GUIDs and port numbers only.
+    whatever the target, except one recorded in one direction only
+    (paired). It holds GUIDs and port numbers only.
     """
     return "".join(
         f"0x{link.guid:016x}:{link.port} 0x{link.peer_guid:016x}:{link.peer_port}\n"
-        for link in sorted(_rows(links), key=lambda link: link.key)
+        for link in sorted(paired(links), key=lambda link: link.key)
     )
 
 
@@ -400,6 +425,7 @@ def _fold(ports, links, neighbors, guid2mkey, m_key, base, times, start):
             return True
         return file_time > last_seen
 
+    listed_ends = {line.key for line in neighbors}
     for line in neighbors:
         old = links.get(line.key)
         new = dataclasses.replace(line, last_seen=neighbors_time)
@@ -409,6 +435,17 @@ def _fold(ports, links, neighbors, guid2mkey, m_key, base, times, start):
             continue
         elif (old.peer_guid, old.peer_port) != (new.peer_guid, new.peer_port):
             counts["links_changed"] += 1
+            # The old peer's row, if it still points back and the file
+            # doesn't list its end, goes with it: that switch port has
+            # nothing recorded on it now.
+            stale = (old.peer_guid, old.peer_port)
+            back = links.get(stale)
+            if (
+                back is not None
+                and stale not in listed_ends
+                and (back.peer_guid, back.peer_port) == line.key
+            ):
+                del links[stale]
         links[new.key] = new
 
     listed = {guid for line in neighbors for guid in (line.guid, line.peer_guid)}
@@ -485,17 +522,22 @@ def restore_problem(guid2mkey, m_key, base, recorded_fingerprint):
     return None
 
 
-def should_adopt(ports, group_named, target_on):
+def should_adopt(ports, group_named, target_on, recorded_fingerprint):
     """Whether a start adopts the target on: the group is named, the target
-    is off, and a folded row holds its derived key
+    is off, a folded row holds its derived key, and no fingerprint is
+    recorded
 
     A restored database that has the base but predates the turn-on has the
     target off while the ports hold the base's derived keys. Adopting the
     target, rather than re-keying the fabric back to the exposed m_key, is
-    what Restores asks for. Decided after folding the volume's files and
-    before verifying, and only once restore_problem has found none.
+    what Restores asks for. With a fingerprint, the database has seen a
+    turn-on, and derived rows are a turn-off's or a set-back's leftovers,
+    such as a node that was down: they're turned off as any others, and
+    --begin-port-keys, which checks the fabric first, turns them on.
+    Decided after folding the volume's files and before verifying, and only
+    once restore_problem has found none.
     """
-    if not group_named or target_on:
+    if not group_named or target_on or recorded_fingerprint is not None:
         return False
     return any(row.holds == DERIVED for row in _rows(ports))
 
@@ -624,7 +666,7 @@ def next_hops(links, own_guid, routes, answered):
     if own_guid not in routes:
         return [Hop(own_guid, (0,))]
     best = {}
-    for link in sorted(_rows(links), key=lambda link: link.key):
+    for link in sorted(paired(links), key=lambda link: link.key):
         source = link.guid
         if source != own_guid and source not in answered:
             continue
@@ -766,19 +808,82 @@ def save(session, ports, links):
         row.last_seen = link.last_seen
 
 
+def upsert(session, ports=(), links=()):
+    """Write these rows, adding any that are missing, and leave every other
+    row as it is, in the session's transaction
+
+    Unlike save, nothing is deleted: a command run beside the manager, such
+    as --add-link, may have added a row since the caller read them, and a
+    write of one operation's changes mustn't undo another's.
+    """
+    for port in _rows(ports):
+        guid = guid_text(port.guid)
+        row = session.get(db.FabricPort, guid)
+        if row is None:
+            row = db.FabricPort(guid=guid)
+            session.add(row)
+        row.node_guid = None if port.node_guid is None else guid_text(port.node_guid)
+        row.switch = port.switch
+        row.holds = port.holds
+        row.lapsed = port.lapsed
+        row.reachable = port.reachable
+        row.released = port.released
+        row.last_seen = port.last_seen
+    for link in _rows(links):
+        key = (guid_text(link.guid), link.port)
+        row = session.get(db.FabricLink, key)
+        if row is None:
+            row = db.FabricLink(guid=key[0], port=key[1])
+            session.add(row)
+        row.peer_guid = guid_text(link.peer_guid)
+        row.peer_port = link.peer_port
+        row.last_seen = link.last_seen
+
+
+def _load_flag(session, name):
+    row = session.get(db.State, name)
+    return bool(row is not None and row.value)
+
+
+def _save_flag(session, name, on):
+    row = session.get(db.State, name)
+    if row is None:
+        session.add(db.State(name=name, value=int(bool(on))))
+    else:
+        row.value = int(bool(on))
+
+
 def load_target(session):
     """Whether the recorded target is per-port keys on; off with no row"""
-    row = session.get(db.State, TARGET)
-    return bool(row is not None and row.value)
+    return _load_flag(session, TARGET)
 
 
 def save_target(session, on):
     """Record the target, in the session's transaction"""
-    row = session.get(db.State, TARGET)
-    if row is None:
-        session.add(db.State(name=TARGET, value=int(bool(on))))
-    else:
-        row.value = int(bool(on))
+    _save_flag(session, TARGET, on)
+
+
+def load_running(session):
+    """Whether OpenSM was last started with per-port keys on; off with no
+    row"""
+    return _load_flag(session, RUNNING)
+
+
+def save_running(session, on):
+    """Record the target OpenSM is about to be started on, in the session's
+    transaction"""
+    _save_flag(session, RUNNING, on)
+
+
+def load_confirmed(session):
+    """Whether a start with the target on has met the success rule"""
+    return _load_flag(session, CONFIRMED)
+
+
+def save_confirmed(session, on):
+    """Record whether a start with the target on has met the success rule,
+    in the session's transaction"""
+    _save_flag(session, CONFIRMED, on)
 
 
 def load_fingerprint(session):

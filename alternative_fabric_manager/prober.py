@@ -384,6 +384,7 @@ def verify(
     deadline=None,
     clock=time.monotonic,
     trusted_switches=None,
+    follow_unconfirmed=False,
 ):
     """Probe recorded ports along recorded links with the keys the rules
     allow, and say what each answer means for the rows
@@ -396,11 +397,19 @@ def verify(
     GUIDs; now stamps last_seen; deadline, on clock's scale, is checked
     between batches. The arguments are left as they were.
 
-    trusted_switches, if given, holds the node GUIDs of the switches an
-    operator confirmed: only those count as switches no tenant controls,
-    which may be sent both keys. A row says it's a switch because its
-    NodeInfo did, and an adapter that can answer as one mustn't be handed
-    m_key for it. Without it, every row recorded as a switch counts.
+    trusted_switches, if given, holds the GUIDs of the switches an operator
+    confirmed, as the fabric check compares them: each a switch row's own
+    GUID, which the answer on its route must match. Only those count as
+    switches no tenant controls, which may be sent both keys, and only
+    those are routed through and counted in result.switches, since a Get
+    that passes through a node shows it the key. A row says it's a switch
+    because its NodeInfo did, and an adapter can answer as one, with any
+    node GUID it likes, so NodeInfo's Guid never decides trust. Without
+    trusted_switches, every row recorded as a switch counts.
+
+    follow_unconfirmed routes through, and counts, every row that answers
+    as a switch, trusted or not, for --confirm-switches to find switches
+    to confirm; which keys a port is sent still follows trusted_switches.
     """
     return _Verify(
         ports,
@@ -415,6 +424,7 @@ def verify(
         deadline=deadline,
         clock=clock,
         trusted_switches=trusted_switches,
+        follow_unconfirmed=follow_unconfirmed,
     ).go()
 
 
@@ -449,10 +459,13 @@ class _Verify:
         deadline,
         clock,
         trusted_switches=None,
+        follow_unconfirmed=False,
     ):
         self.trusted = None if trusted_switches is None else set(trusted_switches)
+        self.follow_unconfirmed = follow_unconfirmed
         self.rows = dict(ports)
-        self.links = list(port_keys._rows(links))
+        # A link recorded in one direction only isn't followed.
+        self.links = port_keys.paired(links)
         self.link_keys = {link.key for link in self.links}
         self.m_key = m_key
         self.base = base
@@ -601,6 +614,17 @@ class _Verify:
 
     # Beyond it
 
+    def _trusted(self, guid):
+        """Whether a row's own GUID is a switch an operator confirmed"""
+        return self.trusted is None or guid in self.trusted
+
+    def _followed(self, guid):
+        """Whether a row is a switch that routes may go through, and that
+        the fabric check counts"""
+        if self._row(guid).switch is not True:
+            return False
+        return self.follow_unconfirmed or self._trusted(guid)
+
     def _in_scope(self, guid, needed):
         if self.scope == FULL:
             return True
@@ -613,7 +637,7 @@ class _Verify:
         that only those are probed to reach them"""
         if self.wanted is None:
             return set()
-        switches = {g for g, row in self.rows.items() if row.switch is True}
+        switches = {g for g in self.rows if self._followed(g)}
         hops = port_keys.all_routes(self.links, self.result.own_guid, switches)
         needed = set()
         for guid in self.wanted:
@@ -640,23 +664,23 @@ class _Verify:
             for hop in level:
                 if not self._in_scope(hop.guid, needed):
                     continue
-                if self._row(hop.guid).switch is True:
+                # A switch that isn't followed is probed as any other port.
+                if self._followed(hop.guid):
                     switches.append(hop)
                 else:
                     others.append(hop)
             for hop in self._linked(switches):
                 node = self._node_info.get(hop.guid)
-                # Only a recorded switch that says it's one again is routed
-                # through, and counted.
+                # Only a followed switch that says it's one again is routed
+                # through, and counted, by the GUID its route's answer
+                # matched: the identity trust is decided by.
                 if (
                     hop.guid in self.result.answered
                     and node is not None
                     and node.get("NodeType", "").strip() == "Switch"
                 ):
                     answered.add(hop.guid)
-                    node_guid = _int(node.get("Guid"), 16)
-                    if node_guid is not None:
-                        self.result.switches.add(node_guid)
+                    self.result.switches.add(hop.guid)
             if self.scope == FULL:
                 self._switch_ports([hop for hop in switches if hop.guid in answered])
             level = port_keys.next_hops(self.links, own, routes, answered)
@@ -729,12 +753,11 @@ class _Verify:
         pending = []
         for hop in hops:
             row = self._row(hop.guid)
-            infrastructure = port_keys.is_infrastructure(
-                row, self.result.own_guid
-            ) and (
-                row.guid == self.result.own_guid
-                or self.trusted is None
-                or row.node_guid in self.trusted
+            # By the row's own GUID, which the answer must match, never its
+            # NodeInfo's Guid, which an adapter answering as a switch can
+            # set to a confirmed switch's
+            infrastructure = row.guid == self.result.own_guid or (
+                row.switch is True and self._trusted(row.guid)
             )
             names = [
                 name

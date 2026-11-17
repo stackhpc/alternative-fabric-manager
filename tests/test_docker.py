@@ -1119,3 +1119,66 @@ def test_a_sweep_reports_what_it_couldnt_reach():
     assert report.dr_errors
     assert report.unreached == {0}
     assert report.bad_m_key_traps == 1
+
+
+# The helper prober's container holds the plan, keys included, in its
+# configuration: it has a fixed name, and is removed wherever it's left.
+
+
+class NamedClient(FakeManagedClient):
+    """A client that tells containers apart by name"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.named = {}
+        self.removed = []
+
+    def get(self, name):
+        if name in self.named:
+            return self.named[name]
+        return super().get(name)
+
+    def leave(self, name):
+        client = self
+
+        class Left:
+            def remove(self, force):
+                client.removed.append(name)
+                del client.named[name]
+
+        self.named[name] = Left()
+
+
+def test_the_helper_prober_has_a_fixed_name_and_replaces_one_left_behind(
+    managed_config,
+):
+    client = NamedClient()
+    client.create = lambda **kwargs: client.created.append(kwargs) or FakeHelper()
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    client.leave("opensm-prober")
+    driver.prober(helper=True)(GETS)
+    assert client.removed == ["opensm-prober"]
+    assert client.created[0]["name"] == "opensm-prober"
+
+
+def test_start_and_stop_remove_a_helper_prober_left_behind(managed_config):
+    client = NamedClient()
+    driver = docker_driver.ManagedDocker(managed_config, client=client)
+    client.leave("opensm-prober")
+    driver.start()
+    assert client.removed == ["opensm-prober"]
+    client.leave("opensm-prober")
+    driver.stop()
+    assert client.removed == ["opensm-prober"] * 2
+    # None left: nothing to remove, and no error
+    driver.stop()
+
+
+def test_a_cache_volume_modes_options_reach_docker_together(managed_config):
+    managed_config.volumes = "opensm_cache:/var/cache/opensm:z,ro,opensm_logs:/var/log"
+    driver = docker_driver.ManagedDocker(managed_config, client=FakeManagedClient())
+    volumes = driver._run_kwargs()["volumes"]
+    assert volumes[1:] == [
+        "opensm_cache:/var/cache/opensm:z,ro",
+        "opensm_logs:/var/log",
+    ]

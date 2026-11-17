@@ -16,7 +16,7 @@ import sys
 
 import uvicorn
 
-from alternative_fabric_manager import api, db, drivers
+from alternative_fabric_manager import api, db, drivers, port_keeper
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
 
@@ -34,7 +34,8 @@ def main(argv=None):
         action="store_true",
         help="Print the fabric's OpenSM keys, class key seed and per-port "
         "M_Key base, which are secrets, for diagnostic tools such as "
-        "smpquery -y <m_key>, and exit",
+        "smpquery -y <m_key>, and exit. With per-port M_Keys, a port holds "
+        "its own key: take -y's from --port-m-key instead",
     )
     parser.add_argument(
         "--confirm-switches",
@@ -92,6 +93,60 @@ def main(argv=None):
         "revisions go back and deleted IDs return: forget every deleted "
         "object and recorded revision, so that no current request is "
         "refused as late, and exit",
+    )
+    ports = parser.add_argument_group(
+        "per-port M_Keys",
+        "With the m_key_per_port hardening group (docs/opensm-hardening.md). "
+        "Each runs beside the running manager, and exits. GUIDs are hex, "
+        "with or without 0x",
+    )
+    commands = ports.add_mutually_exclusive_group()
+    commands.add_argument(
+        "--begin-port-keys",
+        action="store_true",
+        help="Turn per-port M_Keys on at the manager's next start, once the "
+        "prober finds every recorded port behind an up link holding the "
+        "stored M_Key; lists the ports that don't",
+    )
+    commands.add_argument(
+        "--port-key-states",
+        action="store_true",
+        help="List each recorded port's GUID, which key it holds (m_key, "
+        "derived or unknown), and whether it lapsed, is reachable or was "
+        "released, never a key; and the target",
+    )
+    commands.add_argument(
+        "--port-m-key",
+        metavar="GUID",
+        help="Print the M_Key the port holds now, a secret, only to feed a "
+        "diagnostic tool's -y, as in KEY=$(... --port-m-key GUID)",
+    )
+    commands.add_argument(
+        "--add-link",
+        nargs=2,
+        metavar=("GUID:PORT", "PEER_GUID:PORT"),
+        help="Record a link that OpenSM hasn't, both directions, once you "
+        "know what's attached: a switch port with its link up and no "
+        "recorded neighbour fails every fabric check",
+    )
+    commands.add_argument(
+        "--release-port",
+        metavar="GUID",
+        help="Complete a lost port's held jobs as they are, and exempt it from "
+        "the fabric check's rule on lost ports, until it answers its key "
+        "again. It changes nothing on the port",
+    )
+    commands.add_argument(
+        "--forget-port-keys",
+        action="store_true",
+        help="Drop every recorded port and link, once per-port M_Keys are off "
+        "and every port holds the stored M_Key",
+    )
+    commands.add_argument(
+        "--forget-port",
+        metavar="GUID",
+        help="Drop a removed port and its links; refused for a port seen in "
+        "the last day",
     )
     args = parser.parse_args(argv)
 
@@ -176,11 +231,24 @@ def main(argv=None):
             db.make_sessionmaker(config.database_url),
             drivers.make_driver(config),
         )
+        # The prober follows any row that answers as a switch, which an
+        # adapter can: a switch it finds that wasn't confirmed before is
+        # marked, for the operator to check before trusting it.
+        prober = manager.port_keeper.uses_prober()
+        before = manager.port_keeper.confirmed_switches()
         switches = manager.confirm_switches()
         if not switches:
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
+        new = [guid for guid in switches if guid not in before] if prober else []
         for guid in switches:
-            print(f"0x{guid:016x}")
+            mark = " (new: check that it's a switch)" if guid in new else ""
+            print(f"0x{guid:016x}{mark}")
+        if new:
+            print(
+                f"{len(new)} switches weren't confirmed before: each is trusted "
+                "with both M_Keys now, so check that it's a switch, not an "
+                "adapter that answers as one"
+            )
         return
 
     if args.forget_revisions:
@@ -189,6 +257,21 @@ def main(argv=None):
         )
         count = manager.forget_revisions()
         print(f"Forgot {count} deleted objects and every recorded revision")
+        return
+
+    if (
+        args.begin_port_keys
+        or args.port_key_states
+        or args.port_m_key is not None
+        or args.add_link is not None
+        or args.release_port is not None
+        or args.forget_port_keys
+        or args.forget_port is not None
+    ):
+        try:
+            _port_keys(config, args)
+        except port_keeper.PortKeysError as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
         return
 
     if args.show_enforcement_errors or args.clear_enforcement_errors:
@@ -234,6 +317,39 @@ def main(argv=None):
         )
     finally:
         manager.stop()
+
+
+def _port_keys(config, args):
+    """The per-port M_Key commands, beside the running manager"""
+    if config.ha:
+        raise port_keeper.PortKeysError("per-port M_Keys aren't available in HA mode")
+    # Only --begin-port-keys runs the prober, beside the running OpenSM.
+    driver = drivers.make_driver(config) if args.begin_port_keys else drivers.NoOpenSM()
+    manager = manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), driver
+    )
+    keeper = manager.port_keeper
+    if args.begin_port_keys:
+        print(keeper.begin())
+    elif args.port_key_states:
+        print("\n".join(keeper.states()))
+    elif args.port_m_key is not None:
+        print(keeper.port_m_key(port_keeper.parse_guid(args.port_m_key)))
+    elif args.add_link is not None:
+        local, peer = (port_keeper.parse_endpoint(text) for text in args.add_link)
+        added = keeper.add_link(local, peer)
+        print(f"Recorded the link, and {added} new ports")
+    elif args.release_port is not None:
+        guid = port_keeper.parse_guid(args.release_port)
+        keeper.release_port(guid)
+        print(f"Released 0x{guid:016x} until it answers its key again")
+    elif args.forget_port_keys:
+        ports, links = keeper.forget_port_keys()
+        print(f"Forgot {ports} ports and {links} links")
+    else:
+        guid = port_keeper.parse_guid(args.forget_port)
+        links = keeper.forget_port(guid)
+        print(f"Forgot 0x{guid:016x} and {links} links")
 
 
 def _serve_ha(config, args):

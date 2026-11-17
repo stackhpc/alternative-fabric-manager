@@ -33,7 +33,13 @@ import time
 import sqlalchemy as sa
 
 from alternative_fabric_manager import config as config_mod
-from alternative_fabric_manager import db, effects, opensm_conf, partitions
+from alternative_fabric_manager import (
+    db,
+    effects,
+    opensm_conf,
+    partitions,
+    port_keeper,
+)
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
     PartitionsRejected,
@@ -159,6 +165,12 @@ class Manager:
         # traced to an object, so that it isn't tried again until the
         # recorded state changes
         self._failed_generation = None
+        # How many sweeps this manager has recorded: a job's per-port M_Key
+        # evidence counts only if it was taken after the last of them
+        self._sweeps = 0
+        # Per-port M_Keys, which act only while the m_key_per_port group is
+        # named or rows exist, in single node with the managed driver
+        self.port_keeper = port_keeper.PortKeeper(self)
 
     # Requests
 
@@ -803,13 +815,29 @@ class Manager:
             return self.keys()[name]
         return None
 
-    def _fabric(self):
-        return self.driver.fabric(m_key=self._key("m_key"), sa_key=self._key("sa_key"))
+    def _fabric(self, switches=None):
+        """The fabric, with switches the prober found if it was given them:
+        with per-port keys, ibswitches -y <m_key> can't reach a re-keyed
+        port"""
+        if switches is None:
+            return self.driver.fabric(
+                m_key=self._key("m_key"), sa_key=self._key("sa_key")
+            )
+        return self.driver.fabric(
+            m_key=self._key("m_key"), sa_key=self._key("sa_key"), switches=switches
+        )
 
-    def _write_opensm_conf(self):
+    def _write_opensm_conf(self, port_keys=False):
+        """Write opensm.conf; port_keys is whether OpenSM starts with
+        per-port M_Keys on, which a start decides once it has verified the
+        ports"""
         if self.config.driver != "managed":
             return
         groups = self.config.hardening_groups
+        if port_keys:
+            # On while the group is no longer named, at a turn-off whose
+            # verify failed: OpenSM then stays on the previous target.
+            groups = groups | {port_keeper.GROUP}
         overrides = dict(self.config.opensm_conf)
         if "key_mgr_seed" in overrides:
             # The stored spelling, which _keep_seed checked the override
@@ -818,8 +846,13 @@ class Manager:
         content = opensm_conf.render(
             overrides,
             hardening=groups,
-            keys=self.keys() if groups & {"m_key", "sm_key", "sa_key"} else None,
+            keys=(
+                self.keys()
+                if groups & {"m_key", "sm_key", "sa_key", port_keeper.GROUP}
+                else None
+            ),
             key_lease_period=self.config.key_lease_period,
+            port_keys=port_keys,
         )
         # The keys are secrets.
         partitions.write_atomically(self.config.opensm_conf_file, content, 0o600)
@@ -853,6 +886,7 @@ class Manager:
         # leaves OpenSM as it was. Whether the base was stored is read first,
         # since _keep_seed stores every missing key, the base too.
         base_kept = self._base_stored()
+        self.port_keeper.refuse_start()
         self._keep_seed()
         if not self.config.ha:
             # Only in single-node mode: in HA mode, starts at takeovers would
@@ -883,7 +917,16 @@ class Manager:
                 "[opensm_conf] sets %s, which wins over [opensm] key_lease_period",
                 ", ".join(overridden),
             )
-        self._start_opensm()
+        try:
+            self._start_opensm()
+        except ReloadError as e:
+            if not self.port_keeper.active():
+                raise
+            # A start with per-port M_Keys can fail for a reason the next
+            # one may not have, such as a prober that couldn't run, or a
+            # fabric part-way through a turn-on: the applier's check starts
+            # OpenSM again at every interval, as after OpenSM stops.
+            LOG.error("Failed to start OpenSM, retrying at every check: %s", e)
         self._thread = threading.Thread(target=self._run, name="applier", daemon=True)
         self._thread.start()
         self._wakeup.set()
@@ -946,12 +989,12 @@ class Manager:
                     "current state can't be rendered: %s",
                     e,
                 )
-                self.driver.start()
+                self._driver_start()
                 return
             stamped = self._stamp(content)
             partitions.write_atomically(self.config.partitions_file, stamped)
             try:
-                report = self.driver.start()
+                report = self._driver_start()
             except PartitionsRejected as e:
                 if self._quarantine_line(e, attribution, generation):
                     continue
@@ -963,7 +1006,7 @@ class Manager:
                 partitions.write_atomically(
                     self.config.partitions_file, self._stamp(_body(body))
                 )
-                self.driver.start()
+                self._driver_start()
                 return
             # A start that the driver saw sweep is a sweep, with its pkey
             # errors; otherwise the next sync sweeps and records it.
@@ -972,6 +1015,13 @@ class Manager:
             if report is not None and not self._contested_fabric:
                 self._record(stamped, generation, attribution, report)
             return
+
+    def _driver_start(self):
+        """Start OpenSM: with per-port M_Keys, through the steps before and
+        after each start (specs/secured-profile.md, Per-port M_Keys)"""
+        if not self.port_keeper.active():
+            return self.driver.start()
+        return self.port_keeper.start(self.driver.start)
 
     def _check_opensm(self):
         """Start OpenSM again if it has stopped, with the current state, or,
@@ -1146,8 +1196,11 @@ class Manager:
             applied.check_ok = False
             applied.check_detail = "Not checked since the last sweep"
             pkey_errors = report.pkey_errors if report else set()
-            recorded = sorted(f"{g:016x}" for g in pkey_errors)
-            if report and report.unattributed:
+            # With per-port M_Key rows, ports OpenSM couldn't reach hold
+            # jobs too.
+            unreached, unattributed = self.port_keeper.sweep_errors(session, report)
+            recorded = sorted(f"{g:016x}" for g in pkey_errors | unreached)
+            if (report and report.unattributed) or unattributed:
                 recorded.append(UNATTRIBUTED)
             applied.pkey_errors = json.dumps(recorded)
             # Cleared enforcement stays recorded until an operator clears it,
@@ -1163,6 +1216,7 @@ class Manager:
                 "OpenSM couldn't set a pkey table it names no port GUID for, "
                 "so no job of this sweep completes"
             )
+        self._sweeps += 1
         self._written = content
 
     def _last_swept(self):
@@ -1370,7 +1424,9 @@ class Manager:
         """Check that OpenSM sees every expected switch, and no other subnet
         manager is master, and record the result"""
         try:
-            fabric = self._fabric()
+            # With per-port M_Key rows, the prober finds the switches.
+            outcome = self.port_keeper.check()
+            fabric = self._fabric(outcome.switches if outcome else None)
         except ReloadError as e:
             # Not knowing is no evidence either way: a contested fabric stays
             # contested until a check passes.
@@ -1379,6 +1435,8 @@ class Manager:
         else:
             self.unanswered_checks = 0
             ok, detail = self._judge(fabric)
+            if ok and outcome and outcome.problems:
+                ok, detail = False, "; ".join(outcome.problems)
             # Only a passing check ends a contest; one that fails for another
             # reason, such as a missing switch, which the other SM may sit
             # behind, doesn't.
@@ -1450,7 +1508,7 @@ class Manager:
 
     def confirm_switches(self):
         """Record the switches OpenSM sees as the fabric's expected ones"""
-        fabric = self._fabric()
+        fabric = self._fabric(self.port_keeper.switches())
         if fabric is None:
             return []
         with self._lock, self.sessionmaker() as session:
@@ -1517,7 +1575,11 @@ class Manager:
             if job.id in waiting:
                 # Not applied yet, whatever the file holds for its object
                 self._time_out(job)
-            elif ready and self._holds(job, applied, attribution, pkey_errors):
+            elif (
+                ready
+                and self._holds(job, applied, attribution, pkey_errors)
+                and self.port_keeper.job_ready(session, job)
+            ):
                 job.status = db.JobStatus.COMPLETED
                 job.finished_at = _now()
             else:
@@ -1537,6 +1599,9 @@ class Manager:
         fabric, and complete the jobs it has applied"""
         self.retry_deferred()
         self.sync()
+        # After the sweep: with per-port M_Keys, the check's Gets to the
+        # ports of open jobs are their evidence, which counts only if it was
+        # taken after the last recorded sweep.
         self.check_fabric()
         self.evaluate_jobs()
         self.forget_tombstones()

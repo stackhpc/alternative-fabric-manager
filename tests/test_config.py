@@ -436,6 +436,10 @@ def test_m_key_per_port_needs_the_managed_driver(tmp_path, driver):
         "/lib/modules:/lib/modules:ro,opensm_logs:/var/log",
         # Read-only: the manager couldn't copy the cache into it
         "opensm_cache:/var/cache/opensm:ro",
+        # A mode is a list of options: any ro among them is read-only.
+        "opensm_cache:/var/cache/opensm:ro,z",
+        "opensm_cache:/var/cache/opensm:z,ro",
+        "opensm_cache:/var/cache/opensm:z,ro,opensm_logs:/var/log",
         "opensm_cache:/var/cache",
         "/var/cache/opensm",
     ],
@@ -501,3 +505,107 @@ def test_port_verify_interval_must_be_positive(tmp_path, value):
     text = f"[api]\ntoken = x\n[opensm]\nport_verify_interval = {value}\n"
     with pytest.raises(config_mod.ConfigError, match="port_verify_interval"):
         _load(tmp_path, text)
+
+
+# The per-port M_Key commands (specs/secured-profile.md, Per-port M_Keys,
+# Commands), each run beside the running manager
+
+
+def _per_port_conf(tmp_path, hardening="all, m_key_per_port", extra=""):
+    path = tmp_path / "afm.conf"
+    path.write_text(
+        f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
+        f"[opensm]\nconfig_dir = {tmp_path}\nhardening = {hardening}\n{extra}"
+    )
+    return path
+
+
+def _cli(path, *args):
+    from alternative_fabric_manager import cli
+
+    cli.main(["--config-file", str(path), *args])
+
+
+def test_port_key_commands(tmp_path, capsys):
+    path = _per_port_conf(tmp_path)
+    _cli(path, "--add-link", "0x51:3", "b1:1")
+    assert "2 new ports" in capsys.readouterr().out
+    _cli(path, "--port-key-states")
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "target off, OpenSM last started off"
+    assert "0x00000000000000b1 - unknown -" in out
+    _cli(path, "--release-port", "0xB1")
+    capsys.readouterr()
+    _cli(path, "--port-key-states")
+    assert "0x00000000000000b1 - unknown released" in capsys.readouterr().out
+    # A row that's unknown has no key to print, and nor has a GUID with no row
+    # while others exist.
+    for guid in ("b1", "c1"):
+        with pytest.raises(SystemExit) as e:
+            _cli(path, "--port-m-key", guid)
+        assert str(e.value.code).startswith("alternative-fabric-manager: ")
+    assert capsys.readouterr().out == ""
+    with pytest.raises(SystemExit, match="is named"):
+        _cli(path, "--forget-port-keys")
+    # Never seen, so not present: it can be forgotten.
+    _cli(path, "--forget-port", "b1")
+    assert "2 links" in capsys.readouterr().out
+    path = _per_port_conf(tmp_path, hardening="all")
+    _cli(path, "--forget-port-keys")
+    assert capsys.readouterr().out == "Forgot 1 ports and 0 links\n"
+
+
+def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):
+    path = _per_port_conf(tmp_path, hardening="all")
+    _cli(path, "--show-keys")
+    m_key = capsys.readouterr().out.splitlines()[0].split()[1]
+    _cli(path, "--port-m-key", "0xb1")
+    assert capsys.readouterr().out == f"{m_key}\n"
+
+
+@pytest.mark.parametrize(
+    "args, match",
+    [
+        (["--add-link", "0x51", "0xb1:1"], "GUID>:<port>"),
+        (["--add-link", "0x51:1", "0x51:1"], "two different ports"),
+        (["--release-port", "zz"], "isn't a GUID"),
+        (["--release-port", "b1"], "no port"),
+        (["--forget-port", "b1"], "no port"),
+    ],
+)
+def test_port_key_commands_refuse_what_cant_be_done(tmp_path, args, match):
+    path = _per_port_conf(tmp_path)
+    with pytest.raises(SystemExit, match=match):
+        _cli(path, *args)
+
+
+def test_begin_port_keys_needs_the_group(tmp_path):
+    path = _per_port_conf(tmp_path, hardening="all")
+    with pytest.raises(SystemExit, match="doesn't name m_key_per_port"):
+        _cli(path, "--begin-port-keys")
+
+
+def test_port_key_commands_are_refused_in_ha_mode(tmp_path, monkeypatch):
+    path = _per_port_conf(tmp_path, hardening="all")
+    config = config_mod.Config.load(str(path))
+    # HA's own settings aren't the point here: only that ha is set
+    config.ha = True
+    monkeypatch.setattr(config_mod.Config, "load", lambda _path: config)
+    with pytest.raises(SystemExit, match="HA mode"):
+        _cli(path, "--port-key-states")
+
+
+def test_port_key_commands_are_exclusive(tmp_path):
+    path = _per_port_conf(tmp_path)
+    with pytest.raises(SystemExit):
+        _cli(path, "--port-key-states", "--forget-port-keys")
+
+
+def test_parse_volumes_keeps_a_modes_options_together():
+    assert config_mod.parse_volumes(" a:/x:ro,z , b:/y, c:/z:z,ro ,") == [
+        "a:/x:ro,z",
+        "b:/y",
+        "c:/z:z,ro",
+    ]
+    # A path alone is an anonymous volume, not a mode's option.
+    assert config_mod.parse_volumes("a:/x:ro,/scratch") == ["a:/x:ro", "/scratch"]
