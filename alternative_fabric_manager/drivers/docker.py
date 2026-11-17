@@ -565,6 +565,22 @@ class ManagedDocker(DockerReloader):
         with contextlib.suppress(docker.errors.NotFound):
             self.client.containers.get(self.container_name).remove(force=True)
 
+    def scratch_mounts(self):
+        """A tmpfs over each volume OpenSM's image declares (/var/log and
+        /var/cache/opensm), for a helper container of that image
+
+        Without a mount there, Docker gives each such path an anonymous
+        volume, which removing the container leaves behind unless asked:
+        a helper run every few seconds, as the reach probe is, filled a
+        host's Docker disk with them. A tmpfs leaves nothing, however the
+        container ends."""
+        try:
+            image = self.client.images.get(self.config.image)
+        except docker.errors.DockerException:
+            return {}
+        config = (getattr(image, "attrs", None) or {}).get("Config") or {}
+        return {path.rstrip("/") or "/": "" for path in config.get("Volumes") or {}}
+
     @property
     def prober_name(self):
         """The helper prober's container: a fixed name, so that one left
@@ -574,7 +590,7 @@ class ManagedDocker(DockerReloader):
 
     def _remove_prober(self):
         with contextlib.suppress(docker.errors.NotFound):
-            self.client.containers.get(self.prober_name).remove(force=True)
+            self.client.containers.get(self.prober_name).remove(force=True, v=True)
 
     def start(self, prepare=None):
         """Start OpenSM, with its files already written
@@ -761,6 +777,7 @@ class ManagedDocker(DockerReloader):
                 environment=environment,
                 network_mode="host",
                 privileged=True,
+                tmpfs=self.scratch_mounts(),
             )
             container.start()
             code = container.wait(timeout=wait)["StatusCode"]
@@ -775,7 +792,7 @@ class ManagedDocker(DockerReloader):
         finally:
             if container is not None:
                 try:
-                    container.remove(force=True)
+                    container.remove(force=True, v=True)
                 except (
                     docker.errors.DockerException,
                     requests.exceptions.RequestException,

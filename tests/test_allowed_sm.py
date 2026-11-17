@@ -554,7 +554,7 @@ def test_physical_ports_run_in_a_helper(managed_config):
     (kwargs,) = client.created
     assert kwargs["command"] == [allowed_sm.PORTS_SCRIPT]
     assert kwargs["image"] == managed_config.image
-    assert helper.events[-1] == "remove"
+    assert helper.events[-1] == ("remove", True)
     helper = test_docker.FakeHelper(code=4)
     driver, client = test_docker._helper_driver(managed_config, helper)
     with pytest.raises(allowed_sm.ProbeError, match="status 4"):

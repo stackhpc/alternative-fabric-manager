@@ -121,7 +121,7 @@ class FakeManagedContainer(FakeContainer):
         self.events.append("start")
         self.status = self.started
 
-    def remove(self, force):
+    def remove(self, force, v=False):
         self.removed = True
         self.events.append("remove")
 
@@ -454,6 +454,11 @@ def test_more_pkey_manager_errors_fail_closed(line):
     assert not docker_driver._is_partitions_error(line)
 
 
+class FakeImage:
+    # OpenSM's image declares these, as the real one does.
+    attrs = {"Config": {"Volumes": {"/var/cache/opensm/": {}, "/var/log/": {}}}}
+
+
 class FakeImages:
     """A host's images, and the low-level pull's stream"""
 
@@ -468,6 +473,7 @@ class FakeImages:
         self.gets.append(name)
         if not self.present:
             raise docker_driver.docker.errors.ImageNotFound("no image")
+        return FakeImage()
 
     def pull(self, repository, tag, stream, decode):
         self.pulls.append(
@@ -867,8 +873,8 @@ class FakeHelper:
         self.events.append(("logs", stdout, stderr))
         return self.output
 
-    def remove(self, force):
-        self.events.append("remove")
+    def remove(self, force, v=False):
+        self.events.append(("remove", v))
 
 
 def _helper_driver(managed_config, helper, present=True):
@@ -895,9 +901,13 @@ def test_the_helper_prober_runs_a_container_of_its_own(managed_config):
     assert kwargs["command"] == [docker_driver.probes.SCRIPT]
     assert kwargs["environment"]["AFM_PROBES"].count(f"0x{KEY:016x}") == 2
     assert kwargs["network_mode"] == "host" and kwargs["privileged"]
+    # The image's volumes are tmpfs mounts, and removing it removes any
+    # anonymous volume too: a helper run every few seconds left one set
+    # each time, and filled a host's Docker disk.
+    assert kwargs["tmpfs"] == {"/var/cache/opensm": "", "/var/log": ""}
     assert helper.events[0] == "start"
     assert helper.events[1][0] == "wait" and helper.events[1][1] > 3
-    assert helper.events[2:] == [("logs", True, False), "remove"]
+    assert helper.events[2:] == [("logs", True, False), ("remove", True)]
     # Never pulled
     assert client.images.pulls == []
 
@@ -908,7 +918,7 @@ def test_the_helper_prober_fails_and_is_removed(managed_config):
     with pytest.raises(docker_driver.probes.ProbeError, match="status 3") as raised:
         driver.prober(helper=True)(GETS)
     assert "c0ffee" not in str(raised.value)
-    assert helper.events[-1] == "remove"
+    assert helper.events[-1] == ("remove", True)
 
     helper = FakeHelper()
 
@@ -919,7 +929,7 @@ def test_the_helper_prober_fails_and_is_removed(managed_config):
     driver, _client = _helper_driver(managed_config, helper)
     with pytest.raises(ReloadError, match="ReadTimeout"):
         driver.prober(helper=True)(GETS)
-    assert helper.events[-1] == "remove"
+    assert helper.events[-1] == ("remove", True)
 
 
 def test_the_helper_prober_never_pulls_a_missing_image(managed_config):
@@ -1142,7 +1152,7 @@ class NamedClient(FakeManagedClient):
         client = self
 
         class Left:
-            def remove(self, force):
+            def remove(self, force, v=False):
                 client.removed.append(name)
                 del client.named[name]
 

@@ -29,8 +29,13 @@ class Container:
     def kill(self, **_kwargs):
         self.killed = True
 
-    def remove(self, force=False):
+    def remove(self, force=False, v=False):
         self.removed = True
+
+
+class Image:
+    # OpenSM's image declares these, as the real one does.
+    attrs = {"Config": {"Volumes": {"/var/cache/opensm/": {}, "/var/log/": {}}}}
 
 
 class Images:
@@ -40,6 +45,7 @@ class Images:
     def get(self, _name):
         if not self.present:
             raise ha_docker.docker.errors.ImageNotFound("no image")
+        return Image()
 
     def pull(self, *_args, **_kwargs):
         raise AssertionError("the reach probe mustn't pull")

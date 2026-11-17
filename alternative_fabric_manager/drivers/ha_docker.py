@@ -258,6 +258,9 @@ class HAManagedDocker(docker_driver.ManagedDocker):
                 command=command[2:],
                 network_mode="host",
                 privileged=True,
+                # run()'s remove doesn't remove the image's anonymous
+                # volumes, so they're tmpfs mounts instead.
+                tmpfs=self.scratch_mounts(),
                 remove=True,
             )
         except docker.errors.DockerException as e:
