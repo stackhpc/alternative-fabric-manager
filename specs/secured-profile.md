@@ -588,7 +588,7 @@ The design below meets them:
 3. **Merging into a cache** follows the state, not "keep what's unknown":
    a stale entry beats the derivation, so it's as harmful as a missing one.
    Re-cabled links replace their rows.
-4. **The fabric check, `--confirm-switches` and the reach probe** run a
+4. **The fabric check, `--confirm-fabric` and the reach probe** run a
    discovery that test 5 has shown works beside a running OpenSM, from a
    private directory that is removed afterwards, with stated exit-status
    rules, within the fabric check's timeout in ha.md. It returns switch
@@ -718,16 +718,16 @@ keys it may try is what keeps the old key from tenants:
   adapter that answers as a switch could say too, as it could give a
   confirmed switch's node GUID. So only a row whose own GUID, which the
   route's answer must match, is one an operator confirmed
-  (`--confirm-switches`) counts here, and only such a switch is routed
+  (`--confirm-fabric`) counts here, and only such a switch is routed
   through or counted by the fabric check: a Get that passes through a
   node shows it the key. Any other row gets a tenant port's rule. While
-  rows exist, `--confirm-switches` records the GUIDs the prober found
+  rows exist, `--confirm-fabric` records the GUIDs the prober found
   on its routes, following every row that answers as a switch, for the
   operator to check. Those are the switches' port 0 GUIDs, where
   `ibswitches` gave node GUIDs: on a switch whose two differ, the check
   reports the switch missing until it's confirmed again with rows
   present. Until some switch is confirmed, a verify reaches this host's
-  port and its peer only, and `--begin-port-keys` refuses.
+  port and its peer only, and `--confirm-fabric` doesn't record the target on.
 
 It tries the key the row records first, then the other one the rule
 allows, so a port on `m_key` during a slow transition isn't sent a wrong
@@ -791,13 +791,37 @@ naming the cause, as a lost M_Key does today.
 **Turning it on.** OpenSM must know every port's GUID before the start
 that turns per-port keys on, or it sends 0 and loses them (test 5's empty
 leg). And it must be a start someone chose, not a crash restart. So
-naming the group doesn't begin it: `--begin-port-keys` does. It's
-refused unless the group is named, the base was stored by an earlier
-start, links are recorded, and the prober, run beside the running
-OpenSM, finds every recorded port behind an up link holding `m_key`
-(and no row `unknown` behind an up link; one behind a down link is
-re-keyed through OpenSM's own choice when it returns). Then it records the target on and tells the
-operator to restart the manager. That start verifies, renders an `m_key`
+naming the group doesn't begin it: an operator's `--confirm-fabric`
+does. One command confirms everything the turn-on rests on, so that the
+switches the prober trusts and the links OpenSM is given come from one
+look at the fabric, by one person. It replaces `--confirm-switches`,
+which is gone, with no alias: no release has had it. It runs beside the
+running manager, and:
+- while the group is named or rows exist, folds the links and ports
+  that the running OpenSM's cache lists into the rows, as a check does;
+- records the switches the fabric check sees as the expected ones, as
+  `--confirm-switches` did: `ibswitches`' with no rows, the prober's
+  with them (The prober), marking those it hadn't confirmed before;
+- then, if the group is named and the target is off, records the target
+  on, and says that the next restart of the manager turns per-port keys
+  on, provided that: the base was stored by an earlier start; links are
+  recorded; no switch was confirmed for the first time by this run (the
+  operator checks the list it printed, and runs it again); and the
+  prober, run beside the running OpenSM with the switches just
+  confirmed, finds every recorded port behind an up link holding
+  `m_key`, and no row `unknown` behind an up link (one behind a down
+  link is re-keyed through OpenSM's own choice when it returns). If one
+  of these fails, the switches stay confirmed, the target stays off,
+  and the command says which failed and exits non-zero.
+
+With the group not named, or the target already on, it only confirms.
+So on a deployment that names the group, confirming the fabric is what
+arms the turn-on, and the docs say so wherever they tell an operator to
+run it. The turn-on itself still waits for a restart the operator
+chooses; a crash restart before that one turns the keys on too, since
+the target is recorded.
+
+That start verifies, renders an `m_key`
 entry for every port, and starts OpenSM with the option and the base,
 which re-keys each port it reaches; the fingerprint is recorded before
 OpenSM is started. A
@@ -841,7 +865,7 @@ is off), so it finds them. Once every recorded port holds `m_key`, the
 rows change nothing, and `--forget-port-keys` drops them.
 
 **The fabric check.** While rows exist, `ibswitches -y <m_key>` can't
-reach a re-keyed port, so the fabric check and `--confirm-switches` run
+reach a re-keyed port, so the fabric check and `--confirm-fabric` run
 the prober on the recorded switches only, under the check's timeout.
 A full verify, of every recorded port behind an up link and every
 switch port's link state, runs on a slower period
@@ -921,7 +945,7 @@ off, while the volume and the ports hold the base's derived keys. With
 the group named and no fingerprint recorded, a start whose folded rows
 show ports on the stored base's derived keys adopts the target on
 (with a fingerprint, the database has seen a turn-on, and the rows are
-a turn-off's or a set-back's leftovers, which `--begin-port-keys` must
+a turn-off's or a set-back's leftovers, which `--confirm-fabric` must
 check), decided after step 1 and
 before step 2, so that the verify runs with the target on, records the
 fingerprint, and raises an alarm saying so, rather than re-keying the
@@ -931,7 +955,7 @@ recorded as the target OpenSM last ran on, so that a verify that fails
 doesn't start OpenSM without the option either. Without the group named it's an
 ordinary turn-off.
 
-**Commands.** `--begin-port-keys` as above. `--port-key-states` lists each
+**Commands.** `--confirm-fabric` as above. `--port-key-states` lists each
 recorded port's GUID, `holds`, `lapsed` and `reachable`, never a key.
 `--port-m-key <guid>` prints that port's current key, for feeding `-y`
 under AGENTS.md's rule, never for display. `--add-link` records a link.
@@ -1357,7 +1381,7 @@ What it means for the design (Per-port M_Keys, The design):
   isn't a secret. `guid2mkey` needs an entry only for a port whose key
   isn't the one OpenSM would choose: one still on `m_key` at turn-on, or
   on its derived key at turn-off (requirement 1).
-- The fabric check, `--confirm-switches` and the reach probe use the
+- The fabric check, `--confirm-fabric` and the reach probe use the
   `smpquery -D` prober along recorded links (requirement 4); `ibdiagnet`
   is dropped.
 - The reach probe must work before the group is turned on anywhere in
