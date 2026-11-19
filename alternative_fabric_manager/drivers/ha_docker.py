@@ -80,6 +80,10 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # Called for the switches this node's port reaches by the prober,
         # with per-port M_Key rows, or None to ask ibswitches
         self.reach_switches = None
+        # The coordinator's start_gate, which gives the start request's
+        # deadline when it's written, or refuses the start; without one, as
+        # in tests, prepare's deadline
+        self.start_gate = None
 
     def _run_kwargs(self):
         kwargs = super()._run_kwargs()
@@ -181,17 +185,28 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             for inside, outside in self._container_paths().items()
         }
         hashes.update(self._cache_hashes)
-        wd.write_atomically(
-            self.state_dir,
-            wd.START,
-            {
-                "boot_id": wd.boot_id(),
-                "instance": instance,
-                "term": term,
-                "deadline": deadline,
-                "hashes": hashes,
-            },
+        gate = (
+            self.start_gate()
+            if self.start_gate is not None
+            else contextlib.nullcontext(deadline)
         )
+        with gate as deadline:
+            # A start after a stop of the same takeover, as when a turn-on
+            # fails and OpenSM is started again, removes that stop request;
+            # the gate refuses once a step-down has revoked the start.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(self.state_dir, wd.STOP))
+            wd.write_atomically(
+                self.state_dir,
+                wd.START,
+                {
+                    "boot_id": wd.boot_id(),
+                    "instance": instance,
+                    "term": term,
+                    "deadline": deadline,
+                    "hashes": hashes,
+                },
+            )
 
     def stop(self):
         """Ask the watchdog to stop OpenSM; kill its container, paused or not,

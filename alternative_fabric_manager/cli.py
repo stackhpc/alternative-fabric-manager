@@ -503,6 +503,8 @@ def _serve_ha(config, args):
         manager,
         hash_config=lambda key: config_mod.config_hash(config, key),
     )
+    # The start request's deadline, worked out as it's written
+    driver.start_gate = coordinator.start_gate
     app = api.create_app(config, manager, coordinator)
     image_stop = threading.Event()
 

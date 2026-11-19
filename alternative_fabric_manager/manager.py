@@ -220,6 +220,19 @@ class Manager:
                 self._raise_fence(session)
             yield session
 
+    def _claim_fence(self):
+        """Raise the leader fence to this term, and commit it"""
+        for attempt in range(3):
+            try:
+                with self.fenced_session() as session:
+                    session.commit()
+                return
+            except (sa.exc.IntegrityError, sa.exc.OperationalError):
+                # Two first raises racing to insert the row, or a Galera
+                # certification conflict: the next attempt sees the winner's.
+                if attempt == 2:
+                    raise
+
     def _raise_fence(self, session):
         # A new nonce every time, so that the row always changes: Galera
         # certifies a transaction against another only on rows they both
@@ -983,6 +996,13 @@ class Manager:
         # Before anything is written or started, so that a refused seed
         # leaves OpenSM as it was. Whether the base was stored is read first,
         # since _keep_seed stores every missing key, the base too.
+        if self.config.ha and self.term:
+            # The leader fence, raised and committed before any record is
+            # read: a fenced session that only reads rolls its raise back, so
+            # Galera would certify nothing against it, and a deposed
+            # leader's write could land between these reads and the first
+            # write (specs/ha.md, The secured profile).
+            self._claim_fence()
         base_kept = self._base_stored()
         seed_kept = self._seed_stored()
         self._stores_late_keys = True

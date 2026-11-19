@@ -1245,8 +1245,10 @@ HA mode):
   `-reach` container, rather than `ibswitches -y` with one key. The
   takeover's bound grows by `4 × start_timeout`, and `job_timeout` must
   exceed a takeover with a per-port start, 1.5 × `start_timeout` longer:
-  with docs/kayobe.md's settings, 327 s rather than 237 s, so set
-  `job_timeout = 360`, below Nova's `vif_plugging_timeout` of 420 s.
+  with docs/kayobe.md's settings, 327 s rather than 237 s, which its
+  `job_timeout = 360` covers, below Nova's `vif_plugging_timeout` of 420 s.
+  `job_timeout` is a cluster setting: change it on every node, as for an
+  epoch, and it moves with the epoch once every live node has it.
   A job on a recorded port completes only from the leader's checks.
 - **`class_keys`, `sa_rate`.** As in single node; every leader reads the
   same seed.

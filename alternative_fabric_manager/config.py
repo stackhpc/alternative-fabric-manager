@@ -583,6 +583,8 @@ def hashed_settings(config):
     """What the configuration hash covers, as a dict that JSON can encode:
     everything that decides the partitions and how OpenSM protects the
     fabric (specs/ha.md, Configuration epochs)"""
+    import json
+
     template = ""
     if config.partitions_template:
         with open(config.partitions_template) as f:
@@ -595,6 +597,9 @@ def hashed_settings(config):
         "ipoib": [config.ipoib_rate, config.ipoib_mtu, config.ipoib_sl],
         "hardening": sorted(config.hardening_groups),
         "key_lease_period": config.key_lease_period,
+        # The cluster settings, so that an epoch moved by agreement can move
+        # them too
+        "ha_settings": json.loads(ha_settings(config)),
         "opensm_conf": {
             name: str(value).strip()
             for name, value in sorted(config.opensm_conf.items())

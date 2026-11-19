@@ -533,10 +533,12 @@ class GaleraLease:
             session.commit()
             return epoch
 
-    def allow_config(self, hashes, seen=False):
+    def allow_config(self, hashes, seen=False, settings=None):
         """Record a new epoch that allows exactly these hashes; return its
         number, or None if seen is given, as the epoch read before, (epoch,
-        hashes) or None, and the epoch has moved since"""
+        hashes) or None, and the epoch has moved since. With settings, the
+        recorder's [ha] settings, as JSON, are stored with it: they're in
+        its hash, so the nodes the epoch allows agree with them."""
         hashes = sorted(set(hashes))
         if not 1 <= len(hashes) <= MAX_HASHES:
             raise ValueError(f"an epoch allows 1 to {MAX_HASHES} hashes")
@@ -547,6 +549,15 @@ class GaleraLease:
                 return None
             number = (epoch[0] if epoch else 0) + 1
             _store_epoch(session, number, hashes)
+            if settings is not None:
+                row = session.get(db.Secret, "ha_settings", with_for_update=True)
+                ours = json.loads(settings)
+                if row is None:
+                    session.add(db.Secret(name="ha_settings", value=settings))
+                else:
+                    row.value = json.dumps(
+                        {**json.loads(row.value), **ours}, sort_keys=True
+                    )
             session.commit()
             return number
 

@@ -906,7 +906,10 @@ With a 2 s poll, `sweep_timeout` 30 s, 5 s for a fabric check, `B` 60 s,
 `T` 30 s, `T_reach` 30 s, 5 s for Ask, `T_watchdog` 45 s, and HA mode's
 `start_timeout` of 60 s, the job timeout must exceed 60 + 30 + 2 + 30 + 5 +
 45 + 60 + 5 = 237 s. HA mode's default job timeout is therefore 300 s; the
-single-node default stays 180 s, since it has no takeover. Nova's
+single-node default stays 180 s, since it has no takeover. With per-port
+M_Keys, a takeover's start verifies the ports and waits for the turn-on,
+1.5 × `start_timeout` more, 327 s, so docs/kayobe.md sets 360 s, still
+below Nova's 420 s. Nova's
 `vif_plugging_timeout` must then exceed 300 s plus the journal's sync
 interval of 10 s and its backoff, so HA deployments set it to 420 s, and
 Ironic's wait for ports likewise; the deployment role does both. A
@@ -986,10 +989,17 @@ stores an epoch with the taker's hash.
 
 - **Only an instance whose hash is allowed is a candidate.** A candidate
   whose hash isn't allowed stays registered and heartbeats, and logs an
-  alarm, once per epoch.
+  alarm, once per epoch. While it can't be a candidate for a reason other
+  than its reach (its hash or settings, a live release without epochs,
+  or, with `allowed_sm`, no port GUIDs), it heartbeats a reach of 0, so
+  that no leader steps down for it.
 - **The epoch moves by itself once the nodes agree.** An instance whose
-  hash the epoch doesn't allow records a new epoch with only its hash once
-  every live node row, its own and the leader's included, has that hash.
+  hash the epoch doesn't allow, or whose cluster settings differ from the
+  stored ones, records a new epoch with only its hash, and stores its
+  cluster settings, once every live node row, its own and the leader's
+  included, has that hash. The hash covers the cluster settings, so the
+  nodes an epoch allows agree on them: an instance whose settings differ
+  registers and heartbeats, so that its row counts, but isn't a candidate.
   A live row is one not marked stopped whose heartbeat moved within `T`,
   as for live candidates. So a rolling change needs no command: as each
   node is reconfigured and restarted, its hash isn't allowed and it isn't
@@ -1035,8 +1045,10 @@ describes. In summary:
   changes the row: Galera certifies transactions only against rows both
   changed, and an update that left the fence as it was would let a
   deposed leader's transaction commit beside the successor's raise. A
-  takeover raises the fence before it reads the records, so a deposed
-  leader's write either commits first, and is read, or fails. Operators'
+  takeover raises the fence, and commits the raise, before it reads the
+  records: a raise in a session that only reads is rolled back, and Galera
+  certifies nothing against it. So a deposed leader's write either commits
+  first, and is read, or fails. Operators'
   commands write without it, as they do in single node, since they change
   only what their operation names.
 - **Node port GUIDs.** Every instance probes its host's physical
@@ -1057,7 +1069,11 @@ describes. In summary:
   from what its host's cache volume holds, which an older term left. The
   start request's hashes cover the rendered cache files as well as
   `opensm.conf` and `partitions.conf`, and are written once they're
-  rendered. The reach probe uses the prober along the recorded links,
+  rendered. Its deadline, `t0` + `T_self`, is worked out then, from the
+  latest renewal, since the verify before it may take longer than
+  `T_self`, and the write is refused once a step-down has begun; a start
+  after a stop within the same takeover, as when a turn-on fails, removes
+  that stop request. The reach probe uses the prober along the recorded links,
   with each port's key, rather than `ibswitches` with one key. The
   takeover loop's bound allows for the longest start with per-port M_Keys:
   a turn-on whose success rule fails, stops OpenSM, verifies the ports

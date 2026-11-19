@@ -36,6 +36,7 @@ The coordinator drives OpenSM through a runner:
   secured profile).
 """
 
+import contextlib
 import enum
 import logging
 import threading
@@ -43,6 +44,7 @@ import time
 import uuid
 
 from alternative_fabric_manager import config as config_mod
+from alternative_fabric_manager.drivers import ReloadError
 from alternative_fabric_manager.ha import lease as lease_mod
 
 LOG = logging.getLogger(__name__)
@@ -92,6 +94,13 @@ class Coordinator:
         self._old_alarmed = False
         # The instance UUID whose node row has this host's ports recorded
         self._ports_recorded = None
+        # Whether its [ha] settings match the cluster's, and whether a block
+        # (see _blocked) held at the last watch
+        self._settings_ok = True
+        self._settings_alarmed = False
+        self._blocked_now = False
+        # Whether the reach thread runs, which alone probes reach
+        self._reach_thread = False
         # Whether the takeover under way may run per-port M_Keys' steps,
         # which lengthen its bound
         self._port_keys_start = False
@@ -127,6 +136,9 @@ class Coordinator:
         # down. The lock keeps a renewal from landing after that.
         self._grant = None
         self._grant_lock = threading.Lock()
+        # Whether the runner may write a start request: from the takeover's
+        # prepare until a step-down revokes the grant
+        self._may_start = False
         self._opensm_gone = False
         self._restarting = False
         # Other nodes' heartbeats as last seen, and since when, to tell live
@@ -161,6 +173,7 @@ class Coordinator:
 
     def start(self):
         if getattr(self.runner, "reach", None) is not None:
+            self._reach_thread = True
             threading.Thread(
                 target=self._refresh_reach, name="reach", daemon=True
             ).start()
@@ -174,19 +187,21 @@ class Coordinator:
         runs, or adopt a frozen lease on this node (see Rejoining, Freeze)"""
         while not self._stop.is_set():
             try:
-                if self._hash_config is not None:
+                if self._hash_config is not None and not self.config_hash:
+                    # Once: the configuration this process runs with, not
+                    # one edited on disk since
                     self.config_hash = self._hash_config(self.lease.hash_key())
                 self.lease.register(
                     self.node, self.uuid, self.config_hash, self.adapters
                 )
                 self._database_seen = _now()
-                if not self.lease.agree_settings(config_mod.ha_settings(self.config)):
-                    LOG.error(
-                        "This instance's [ha] settings differ from the cluster's: "
-                        "not a candidate"
-                    )
-                    time.sleep(self.config.ha_period)
-                    continue
+                # Settings that differ keep it from being a candidate, not
+                # from registering: its heartbeat must count, so that the
+                # epoch, with the settings, can move once every node has
+                # them (see _blocked).
+                self._settings_ok = self.lease.agree_settings(
+                    config_mod.ha_settings(self.config)
+                )
                 state = self.lease.read()
                 if state.freeze_state in ("frozen", "ending") and (
                     state.holder_node == self.node
@@ -194,6 +209,11 @@ class Coordinator:
                     term = self.lease.adopt_frozen(self.node, self.uuid, state.term)
                     if term is not None:
                         LOG.warning("Adopting the frozen lease of term %d", term)
+                        # Whatever its hash, since a freeze keeps OpenSM
+                        # where it is; it hands over once the freeze ends.
+                        self._allowed_hashes = state.allowed_hashes
+                        if not self._config_allowed():
+                            self._alarm_config("leading while frozen")
                         self._become_leader(term, held=True)
                         self._start_opensm()
                         return
@@ -253,7 +273,12 @@ class Coordinator:
         if self.role in (Role.LEADER, Role.TAKING_OVER) and self._self_stop_due():
             return
         try:
-            beat = self.lease.heartbeat(self.node, self.uuid, self._reach())
+            reach = (
+                0
+                if self.role == Role.CANDIDATE and self._blocked_now
+                else self._reach()
+            )
+            beat = self.lease.heartbeat(self.node, self.uuid, reach)
             self._database_seen = _now()
             if beat:
                 self._displaced = False
@@ -329,7 +354,11 @@ class Coordinator:
     def _reach(self):
         """Expected switches this node reaches; 0 if its own port is down"""
         if self._reach_value is None:
-            # Not refreshed yet, or no thread, as in tests
+            if self._reach_thread:
+                # Not refreshed yet: probing here too would race the reach
+                # thread's probe for the same helper container.
+                return 0
+            # No thread, as in tests
             return self._probe_reach()
         return self._reach_value
 
@@ -393,7 +422,11 @@ class Coordinator:
         seen = self.lease.epoch()
         if seen is not None and self.config_hash in seen[1]:
             return False
-        number = self.lease.allow_config([self.config_hash], seen=seen)
+        number = self.lease.allow_config(
+            [self.config_hash],
+            seen=seen,
+            settings=config_mod.ha_settings(self.config),
+        )
         if number is None:
             return False
         LOG.warning(
@@ -455,6 +488,31 @@ class Coordinator:
     def _revoke_grant(self):
         with self._grant_lock:
             self._grant = None
+            # A step-down revokes it before it asks the watchdog to stop, so
+            # no start request is written after that stop request.
+            self._may_start = False
+
+    def _allow_start(self):
+        with self._grant_lock:
+            self._may_start = True
+
+    @contextlib.contextmanager
+    def start_gate(self):
+        """For the runner, as it writes a start request: the request's
+        deadline, worked out now, held for the write; raises ReloadError if
+        this instance may no longer start OpenSM. With per-port M_Keys the
+        request is written after the verify before the start, which may
+        take longer than T_self, and again after a turn-on that failed
+        (specs/secured-profile.md, HA mode)."""
+        with self._grant_lock:
+            if not self._may_start:
+                raise ReloadError("This instance no longer leads: not starting OpenSM")
+            if self.held:
+                yield None
+                return
+            if self.t0 is None or _now() - self.t0 >= self.config.self_stop_timeout:
+                raise ReloadError("The last renewal is too old to start OpenSM")
+            yield self.t0 + self.config.self_stop_timeout
 
     def _liveness(self):
         """Renew the watchdog's lease every period while the loops make
@@ -654,6 +712,7 @@ class Coordinator:
         # files.
         self._write_watchdog_lease(None)
         self.runner.prepare(self.uuid, self.term, None)
+        self._allow_start()
 
         def restart():
             try:
@@ -729,13 +788,19 @@ class Coordinator:
         returned = _now()
         self.frozen = state.freeze_state in ("frozen", "ending")
         self._allowed_hashes = state.allowed_hashes
-        if not self._config_allowed():
+        if not self._config_allowed() or not self._settings_ok:
             # At every watch, not only once the lease expires, so that the
             # heartbeats it judges liveness by are watched for T first
             try:
-                self._move_epoch()
+                if self._move_epoch():
+                    self._settings_ok = False
             except Exception as e:  # noqa: BLE001
                 LOG.debug("Can't move the configuration epoch: %s", e)
+        try:
+            self._blocked_now = self._blocked()
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("Can't tell whether this node may be a candidate: %s", e)
+            self._blocked_now = True
         key = (state.term, state.counter, state.released)
         if key != self._seen:
             self._seen = key
@@ -749,8 +814,7 @@ class Coordinator:
             return
         if self._expired_since is None:
             self._expired_since = returned
-        if not self._config_allowed():
-            self._alarm_config("not a candidate")
+        if self._blocked_now:
             return
         if not self._eligible(returned - self._expired_since):
             return
@@ -797,10 +861,39 @@ class Coordinator:
         try:
             expected = self.lease.expected_switches()
             others = self._live_others()
-            old_versions = self._experimental() and self._old_versions_live()
         except Exception:  # noqa: BLE001
             return False
-        if old_versions:
+        if expected and reach >= expected:
+            return True
+        if waited < self.config.reach_timeout:
+            return False
+        return reach >= max((r for _name, r in others), default=0)
+
+    def _blocked(self):
+        """Whether this node may not be a candidate whatever it reaches: its
+        configuration or [ha] settings aren't the cluster's, a release
+        without epochs is live while it names experimental groups, or,
+        with allowed_sm, its row has no port GUIDs. Each is logged once.
+        While blocked, it heartbeats a reach of 0, so that no leader steps
+        down for it (see Configuration epochs, The secured profile)."""
+        if not self._config_allowed():
+            self._alarm_config("not a candidate")
+            return True
+        if not self._settings_ok:
+            self._settings_ok = self.lease.agree_settings(
+                config_mod.ha_settings(self.config)
+            )
+            if not self._settings_ok:
+                if not self._settings_alarmed:
+                    LOG.error(
+                        "This instance's [ha] settings differ from the cluster's: "
+                        "not a candidate until every live node has them, and "
+                        "the configuration epoch moves"
+                    )
+                    self._settings_alarmed = True
+                return True
+            self._settings_alarmed = False
+        if self._experimental() and self._old_versions_live():
             # A release before epochs could lead next without the groups,
             # and undo them (see Configuration epochs).
             if not self._old_alarmed:
@@ -812,14 +905,10 @@ class Coordinator:
                     ", ".join(sorted(self._experimental())),
                 )
                 self._old_alarmed = True
-            return False
+            return True
         self._old_alarmed = False
         if self.config.allowed_sm_in_effect:
-            try:
-                ports = self.lease.node_ports().get(self.node)
-            except Exception:  # noqa: BLE001
-                return False
-            if not ports:
+            if not self.lease.node_ports().get(self.node):
                 # The leader's allowed_sm_guids would leave this node out.
                 if not self._ports_alarmed:
                     LOG.error(
@@ -828,13 +917,9 @@ class Coordinator:
                         "probe records them"
                     )
                     self._ports_alarmed = True
-                return False
+                return True
             self._ports_alarmed = False
-        if expected and reach >= expected:
-            return True
-        if waited < self.config.reach_timeout:
-            return False
-        return reach >= max((r for _name, r in others), default=0)
+        return False
 
     def _experimental(self):
         """The experimental hardening groups this configuration names"""
@@ -914,6 +999,7 @@ class Coordinator:
         before the manager starts OpenSM"""
         deadline = None if self.held else self.t0 + self.config.self_stop_timeout
         self.runner.prepare(self.uuid, self.term, deadline)
+        self._allow_start()
         self.opensm_started = True
         self._write_watchdog_lease(
             None if self.held else self._watchdog_deadline(_now())

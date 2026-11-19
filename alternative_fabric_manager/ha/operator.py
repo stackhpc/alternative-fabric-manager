@@ -160,7 +160,8 @@ def allow_config(config, lease, other=None):
             )
         hashes.append(other)
     hashes = sorted(set(hashes))
-    return lease.allow_config(hashes), hashes
+    settings = config_mod.ha_settings(config)
+    return lease.allow_config(hashes, settings=settings), hashes
 
 
 # Retiring a node (see specs/ha.md, Retiring a node)
