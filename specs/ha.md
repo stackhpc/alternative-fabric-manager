@@ -1007,7 +1007,12 @@ stores an epoch with the taker's hash.
   a successor under the new settings could take over, and leave a target
   unconfirmed, before an old leader's OpenSM is bound to have stopped. A
   change in the unsafe direction needs every node stopped cleanly, and
-  raises an alarm meanwhile. A two-hash epoch stores the settings of the
+  raises an alarm meanwhile. If the leader dies uncleanly while the nodes
+  with the new settings wait, its entry stays and nothing can take over:
+  the alarm and `--allow-config` say to run one node with the old settings
+  until it leads, which clears the entry, then roll the change again. A
+  takeover rewrites the epoch row, so that it conflicts, under Galera,
+  with an epoch recorded meanwhile. A two-hash epoch stores the settings of the
   node that recorded it; a node of the other hash whose settings differ
   stays blocked until they match.
   A live row is one not marked stopped whose heartbeat moved within `T`,

@@ -437,7 +437,9 @@ class Coordinator:
                     "settings shorten a wait (%s) while an instance with the "
                     "old ones may still run OpenSM: the epoch moves only "
                     "once the target set is empty, as after every node "
-                    "stopped cleanly",
+                    "stopped cleanly. If the leader died instead, run one "
+                    "node with the old settings until it leads, then roll "
+                    "the change again",
                     self.config_hash[:12],
                     e,
                 )

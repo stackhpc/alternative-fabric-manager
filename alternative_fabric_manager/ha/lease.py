@@ -52,7 +52,11 @@ def _epoch(session, lock=False):
 
 
 def _store_epoch(session, epoch, hashes):
-    value = json.dumps({"epoch": epoch, "hashes": sorted(hashes)})
+    # A fresh nonce, so that rewriting the same epoch still changes the row,
+    # which Galera then certifies against (see acquire)
+    value = json.dumps(
+        {"epoch": epoch, "hashes": sorted(hashes), "nonce": secrets.token_hex(8)}
+    )
     row = session.get(db.Secret, EPOCH)
     if row is None:
         session.add(db.Secret(name=EPOCH, value=value))
@@ -225,6 +229,13 @@ class GaleraLease:
                 elif config_hash not in epoch[1]:
                     session.rollback()
                     return None
+                else:
+                    # Rewritten, unchanged but for its nonce: Galera
+                    # certifies only rows both transactions change, so an
+                    # epoch recorded meanwhile on another node, perhaps with
+                    # settings this taker's waits don't follow, conflicts
+                    # with this takeover rather than passing it.
+                    _store_epoch(session, *epoch)
             deadline = lease.freeze_request_deadline
             now = _utc_now(session)
             if deadline is not None and deadline.tzinfo is None:

@@ -168,7 +168,9 @@ def allow_config(config, lease, other=None):
         raise OperatorError(
             f"This configuration's [ha] settings shorten a wait ({e}) while an "
             "instance with the old ones may still run OpenSM: stop every node "
-            "cleanly, so that the target set is empty, first"
+            "cleanly, so that the target set is empty, first. If a node died "
+            "in the target set, run one node with the old settings until it "
+            "leads, which clears it, then stop every node cleanly"
         ) from None
 
 

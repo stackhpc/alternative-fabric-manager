@@ -192,3 +192,15 @@ def test_unsafe_moves_are_named():
         "self_stop_timeout",
         "watchdog_timeout",
     ]
+
+
+def test_a_takeover_rewrites_the_epoch_row(lease):  # noqa: F811
+    lease.allow_config([A])
+    with lease.sessionmaker() as session:
+        before = session.get(db.Secret, "config_epoch").value
+    state = lease.read()
+    assert lease.acquire("a", "ua", state.term, state.counter, True, A) == 1
+    with lease.sessionmaker() as session:
+        after = session.get(db.Secret, "config_epoch").value
+    assert after != before
+    assert lease.epoch() == (1, (A,))
