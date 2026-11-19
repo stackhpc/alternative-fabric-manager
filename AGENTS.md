@@ -75,6 +75,25 @@ Every change must keep these; the reviews and tests are built around them.
 When changing HA behaviour, change specs/ha.md first, then the code, then
 the tests, and have the change reviewed (see the `review-loop` skill).
 
+## Usability
+
+Aim for zero manual operator steps in normal running. Before adding a
+command an operator must run, a confirmation, or a wait for a person, ask
+what it protects against:
+
+- **An edge case** (it needs an unlikely fault, a misconfiguration, or
+  custom firmware, or the harm is a delay that one command undoes):
+  automate the step, and log what it did. Usability wins.
+- **A real hole** (automating it could put two OpenSMs in charge, strand
+  ports with keys no SM holds, or hand a tenant a key): keep it manual,
+  say why in the spec, and make the manual step a single command whose
+  message says what to do.
+
+When unsure, write the argument in the spec, and have the reviewer judge
+it. Keep commands that automation makes unnecessary as shortcuts, not
+requirements. specs/zero-touch.md applies this to the expected switches
+and the per-port M_Key turn-on.
+
 ## Conventions
 
 - Python 3.10+, ruff (line length 88), FastAPI, SQLAlchemy 2, uv.
@@ -112,13 +131,14 @@ there manages the fabric's OpenSM, so:
   that changes what OpenSM enforces: changing `[opensm] hardening` or
   `[opensm] key_lease_period`, setting hardening options by hand in
   `[opensm_conf]` (the experimental ones in docs/opensm-hardening.md), or
-  deploying a release that adds a group to `all`. Naming
-  `m_key_per_port` and removing it are such changes, and so is
-  **`--confirm-fabric` where the group is named and the keys are off: it
-  arms the turn-on** once its preconditions hold (base stored by an
-  earlier start, links recorded, no switch new to that run, every port on
-  `m_key`), and the next restart re-keys every port. Never run it there
-  as a routine step. A deployment with
+  deploying a release that adds a group to `all`. **Naming
+  `m_key_per_port` turns per-port M_Keys on**, and removing it turns them
+  off: the manager arms the turn-on by itself once its preconditions hold
+  (base stored by an earlier start, links recorded, every port on
+  `m_key`), and restarts OpenSM, re-keying every port
+  (specs/zero-touch.md). Never name it there as a routine step, nor run
+  `--confirm-fabric` on such a deployment, which arms it at once. A
+  deployment with
   `all` (or only removals) gains each group its release notes name; one
   with an explicit list of groups gains none. With M_Key protection on,
   SMP tools (`ibswitches`, `smpquery`, `ibportstate`) need `-y $KEY`.
