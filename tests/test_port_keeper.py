@@ -1003,6 +1003,22 @@ def test_no_full_verify_fails_the_check(world, monkeypatch):
     assert "older than two" in world.applied().check_detail
 
 
+def test_a_full_verify_that_ran_out_of_time_fails_the_check(world, monkeypatch):
+    # Ports it never reached weren't checked for unrecorded neighbours, and
+    # aren't ports that didn't answer: it says which happened.
+    turned_on(world)
+    keeper = world.keeper()
+    # A tenant-free lost port, which an incomplete verify mustn't call lost
+    world.sim.ports[HV].key = STRANGER
+    assert not world.check()
+    result, began = keeper._last_full
+    keeper._last_full = (dataclasses.replace(result, complete=False), began)
+    assert not world.manager.check_fabric()
+    detail = world.applied().check_detail
+    assert "ran out of time" in detail
+    assert "didn't answer their M_Keys" not in detail
+
+
 def test_a_prober_failure_is_a_failed_query(world):
     turned_on(world)
     world.driver.probe_error = prober.ProbeError("the prober exited with status 3")

@@ -979,6 +979,16 @@ class PortKeeper:
                 f"switch port 0x{switch:016x} port {port} has its link up with no "
                 "recorded neighbour (record what's attached with --add-link)"
             )
+        if not result.complete:
+            # Some switches' ports were never looked at, so the rules above
+            # can't have covered them; and a port it never reached isn't
+            # one that didn't answer.
+            problems.append(
+                "the last full verify of the ports' M_Keys ran out of time before "
+                "reaching every port (a fabric this size may need a longer "
+                "[opensm] port_verify_interval)"
+            )
+            return problems
         lost = sorted(
             row.guid
             for row in ports.values()

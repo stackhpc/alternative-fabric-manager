@@ -112,18 +112,19 @@ _ALLOWED_SM_REJECTED = re.compile(r"ERR 7549: allowed_sm_guids")
 # "ERR 0F09: Ignoring SM on port 0x%lx, is not part of the allowed port GUIDs"
 _IGNORED_SM = re.compile(r"ERR 0F09: Ignoring SM on port 0x([0-9a-fA-F]{1,16})\b")
 # A port that answered a class key manager's KeyInfo with an error status, as
-# the VS manager (9828) and the congestion control manager (C10A) log it:
-# "Received invalid status from port GUID 0x%lx, status:0x%x, attr_id:0x%x"
+# the VS manager (9828), the N2N manager (9B28) and the congestion control
+# manager (C10A) log it: "Received invalid status from port GUID 0x%lx,
+# status:0x%x, attr_id:0x%x"
 _KEY_REJECTED = re.compile(
-    r"ERR (9828|C10A): Received invalid status from port GUID "
+    r"ERR (9828|9B28|C10A): Received invalid status from port GUID "
     r"0x([0-9a-fA-F]{1,16}), status:0x([0-9a-fA-F]{1,8}), attr_id:0x([0-9a-fA-F]{1,8})"
 )
 # A key manager that failed to set keys: "failed to update port guid 0x%016lx
 # vskeyinfo" (9803, 9822), "... n2nkeyinfo" (9B03, 9B22), "failed to update
-# port (guid 0x%016lx) by CC keyinfo" (C124), "VS keys configuration has
-# failed" (9823)
+# port (guid 0x%016lx) by CC keyinfo" (C124, C125), "VS keys configuration
+# has failed" (9823)
 _KEY_FAILED = re.compile(
-    r"ERR (9803|9822|9B03|9B22|C124): failed to update port \(?guid "
+    r"ERR (9803|9822|9B03|9B22|C124|C125): failed to update port \(?guid "
     r"0x([0-9a-fA-F]{1,16})"
 )
 _KEYS_FAILED = re.compile(r"ERR (9823): VS keys configuration has failed")

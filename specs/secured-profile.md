@@ -384,7 +384,7 @@ then the operator's reading of the attribute ID; the first run of the
 group on hardware records it.
 
 The key managers' errors that mean a key wasn't set where it is supported
-(`9803`, `9822`, `9823`, `9B03`, `9B22` and `C124`, "failed to update port
+(`9803`, `9822`, `9823`, `9B03`, `9B22`, `C124` and `C125`, "failed to update port
 ... keyinfo", and "VS keys configuration has failed") are logged as errors
 by the manager, once per code for each OpenSM it starts. They don't fail
 the fabric check: what they mean for the ports is what hardware test 3

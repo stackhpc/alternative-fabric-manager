@@ -93,6 +93,35 @@ def test_guard_problem(recorded, groups, overrides, problem):
         assert problem in found
 
 
+def test_keys_enabled_by_hand_without_a_seed_can_be_cleared_without_the_group():
+    # Naming the group would write the stored seed, not the one the keys came
+    # from: enable 1 without the group is the turn-off there.
+    clearing = {"vs_key_enable": "1"}
+    assert class_keys.guard_problem({"vs"}, set(), clearing, seeded=False) is None
+    # Only when every recorded class is cleared
+    found = class_keys.guard_problem({"vs", "cc"}, set(), clearing, seeded=False)
+    assert "without the class_keys group" in found
+    # With a seed in the last opensm.conf, the group's procedure still applies.
+    found = class_keys.guard_problem({"vs"}, set(), clearing, seeded=True)
+    assert "without the class_keys group" in found
+
+
+def test_the_record_says_whether_a_seed_was_written(ck_config, sessionmaker):
+    manager = manager_mod.Manager(ck_config, sessionmaker, FakeOpenSM())
+    keeper = manager.class_keys
+    keeper.record(set(), {"vs_key_enable": "2"})
+    assert keeper.recorded() == {"vs"} and not keeper.seeded()
+    keeper.record({"class_keys"}, {})
+    assert keeper.seeded()
+    keeper.record(set(), {"vs_key_enable": "2", "key_mgr_seed": "0x12"})
+    assert keeper.seeded()
+    # A record from before the bit, which has none, keeps the strict rule.
+    with sessionmaker() as session:
+        session.get(db.State, class_keys.RECORD).value = class_keys.CLASSES["vs"]
+        session.commit()
+    assert keeper.seeded()
+
+
 class FakeOpenSM(conftest.FakeReloader):
     def __init__(self):
         super().__init__()
@@ -225,22 +254,40 @@ CC_REJECTED = (
     "x: ERR C10A: Received invalid status from port GUID 0x2c903000e0b72, "
     "status:0xc, attr_id:0x11"
 )
+# The N2N manager's, in the same format as 9828
+N2N_REJECTED = (
+    "x: ERR 9B28: Received invalid status from port GUID 0x2c90300001234, "
+    "status:0xc, attr_id:0x11"
+)
 FAILED = (
     "x: ERR 9803: failed to update port guid 0x0002c90300001234 vskeyinfo",
     "x: ERR C124: failed to update port (guid 0x0002c90300001234) by CC keyinfo",
+    "x: ERR C125: failed to update port (guid 0x0002c90300001234) by CC keyinfo",
     "x: ERR 9823: VS keys configuration has failed",
 )
 
 
 def test_the_driver_reads_the_key_managers_lines():
     findings = LogFindings()
-    for line in (REJECTED, CC_REJECTED, *FAILED, "x: ERR C10A: Unexpected MAD"):
+    for line in (
+        REJECTED,
+        CC_REJECTED,
+        N2N_REJECTED,
+        *FAILED,
+        "x: ERR C10A: Unexpected MAD",
+    ):
         docker_driver._note_finding(findings, line)
     assert findings.key_rejections == [
         ("9828", PORT, 0xC, 0x11),
         ("C10A", OWN, 0xC, 0x11),
+        ("9B28", PORT, 0xC, 0x11),
     ]
-    assert findings.key_errors == [("9803", PORT), ("C124", PORT), ("9823", None)]
+    assert findings.key_errors == [
+        ("9803", PORT),
+        ("C124", PORT),
+        ("C125", PORT),
+        ("9823", None),
+    ]
     assert findings.ignored_sms == []
 
 

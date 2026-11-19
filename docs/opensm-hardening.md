@@ -568,13 +568,14 @@ key_mgr_seed <the stored seed>
   again without a power cycle, but that recovery hasn't been shown (see
   Permanent keys).
 - **Not every device supports every class.** For ports that don't, OpenSM
-  logs `ERR 9828` (or the congestion control manager's `ERR C10A`) at every
+  logs `ERR 9828` (or the N2N manager's `ERR 9B28`, or the congestion
+  control manager's `ERR C10A`) at every
   sweep. On the test fabric, only VS keys were supported. The manager
   doesn't fail on it, and logs it, for each OpenSM it starts, as the set of
   ports grows: "OpenSM's VS key manager reports N ports answering a KeyInfo
   with status 0xc (ERR 9828, attr_id 0x...)". The line names the attribute,
   not the class: those ports aren't protected by that class's key.
-- **Key errors** (`9803`, `9822`, `9823`, `9B03`, `9B22`, `C124`: "failed to
+- **Key errors** (`9803`, `9822`, `9823`, `9B03`, `9B22`, `C124`, `C125`: "failed to
   update port ... keyinfo") are logged once per code for each OpenSM
   ("OpenSM's ... key manager failed to set class keys"). They don't fail
   the fabric check.
@@ -595,6 +596,11 @@ may hold class keys ...":
    `guid2_n2n_key` no longer name keys. How to tell it has finished on
    every port is what hardware test 3 is to establish; the manager can't.
 3. Only then remove the group and the `<class>_key_enable` lines.
+
+Class keys enabled by hand without a seed, as before 0.4.0, came from a
+seed the manager doesn't have, so naming the group wouldn't help: there,
+step 1 is setting each `<class>_key_enable = 1` without the group, which
+the manager allows only while the last `opensm.conf` it wrote had no seed.
 
 Removing the group at once, or setting a class's enable to 0 (Ignore),
 leaves the ports keyed with keys the subnet manager no longer manages: the

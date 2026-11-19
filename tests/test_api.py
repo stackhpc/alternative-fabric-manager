@@ -705,7 +705,8 @@ def test_show_keys_stores_no_seed_for_an_override(manager, config):
     # start would then refuse the override for: it stores no seed at all,
     # and the start stores the override.
     config.opensm_conf = {"key_mgr_seed": "18"}
-    assert "key_mgr_seed" not in manager.keys()
+    keys = manager.keys()
+    assert "key_mgr_seed" not in keys
     manager.start()
     manager.stop()
     assert manager.keys()["key_mgr_seed"] == "0x0000000000000012"

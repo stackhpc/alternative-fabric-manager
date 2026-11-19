@@ -38,6 +38,12 @@ GROUP = "class_keys"
 CLASSES = {"vs": 1, "cc": 2, "n2n": 4}
 # Which classes the last opensm.conf the manager wrote enabled (2), as bits
 RECORD = "class_keys_enabled"
+# A bit in the same record: set when that opensm.conf enabled a class but
+# wrote no seed, from the group or an override, so the keys on ports came
+# from a seed no start can reproduce, and naming the group can't help clear
+# them. Set for no seed, rather than for one, so that a record without the
+# bit, as every record from before it is, keeps the strict rule.
+UNSEEDED = 8
 # Which of OpenSM's key managers a code belongs to, by its range, as the
 # binary's own lines show (9803 "vskeyinfo", 9B03 "n2nkeyinfo", C124 "by CC
 # keyinfo")
@@ -79,15 +85,26 @@ def enables(groups, overrides):
     return found
 
 
-def guard_problem(recorded, groups, overrides):
+def guard_problem(recorded, groups, overrides, seeded=True):
     """Why a start may not drop the keys from ports unmanaged, or None
 
-    recorded is the set of classes the last opensm.conf enabled. See
-    specs/secured-profile.md, Turning the keys off, and downgrades.
+    recorded is the set of classes the last opensm.conf enabled, and seeded
+    whether it wrote a seed. See specs/secured-profile.md, Turning the keys
+    off, and downgrades.
     """
     if not recorded:
         return None
     names = ", ".join(sorted(recorded))
+    values = enables(groups, overrides)
+    if (
+        GROUP not in groups
+        and not seeded
+        and all(values[name] == 1 for name in recorded)
+    ):
+        # Keys enabled by hand without a seed (as before 0.4.0): naming the
+        # group would write the stored seed, not the one they came from, so
+        # enable 1 without it is the way to clear them, from OpenSM's cache.
+        return None
     if GROUP not in groups:
         return (
             f"ports may hold class keys ({names}) that the last opensm.conf "
@@ -98,9 +115,7 @@ def guard_problem(recorded, groups, overrides):
             "class keys off)"
         )
     ignored = sorted(
-        name
-        for name, value in enables(groups, overrides).items()
-        if name in recorded and not value
+        name for name, value in values.items() if name in recorded and not value
     )
     if ignored:
         return (
@@ -146,10 +161,18 @@ class ClassKeys:
         """The classes the last opensm.conf the manager wrote enabled"""
         if not self._acts():
             return set()
+        return {name for name, bit in CLASSES.items() if self._bits() & bit}
+
+    def seeded(self):
+        """Whether the last opensm.conf the manager wrote had a seed"""
+        return not self._bits() & UNSEEDED
+
+    def _bits(self):
+        if not self._acts():
+            return 0
         with self._session() as session:
             row = session.get(db.State, RECORD)
-            bits = row.value if row is not None else 0
-        return {name for name, bit in CLASSES.items() if bits & bit}
+            return row.value if row is not None else 0
 
     def refuse_start(self, seed_kept):
         """Before a start: refuse one that would leave ports keyed with keys
@@ -159,7 +182,10 @@ class ClassKeys:
         if not self._acts():
             return
         problem = guard_problem(
-            self.recorded(), self.config.hardening_groups, self.config.opensm_conf
+            self.recorded(),
+            self.config.hardening_groups,
+            self.config.opensm_conf,
+            seeded=self.seeded(),
         )
         if problem is not None:
             raise config_mod.ConfigError(f"Not starting OpenSM: {problem}")
@@ -189,6 +215,8 @@ class ClassKeys:
             for name, value in enables(groups, overrides).items()
             if value == 2
         )
+        if bits and GROUP not in groups and "key_mgr_seed" not in overrides:
+            bits |= UNSEEDED
         for attempt in range(2):
             with self._session() as session:
                 row = session.get(db.State, RECORD)
