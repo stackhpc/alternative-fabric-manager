@@ -39,8 +39,8 @@ class SARate:
 
     def watching(self):
         """Whether OpenSM limits SA requests: the group named, or the option
-        set to something but 0, with the managed driver in single node"""
-        if self.config.ha or self.config.driver != "managed":
+        set to something but 0, with the managed driver"""
+        if self.config.driver != "managed":
             return False
         if OPTION in self.config.opensm_conf:
             return self.config.opensm_conf[OPTION].strip() not in ("0", "0x0", "")

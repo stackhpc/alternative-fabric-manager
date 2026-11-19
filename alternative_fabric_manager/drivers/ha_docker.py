@@ -217,6 +217,11 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # Fencing); self-stop and the watchdog don't depend on it.
         LOG.info("Asking %s's SM to stop isn't implemented yet", node)
 
+    def node_ports(self):
+        """This host's physical InfiniBand ports, for its node row, probed
+        in the coordinator's helper container"""
+        return self.physical_ports(name=self.reach_name)
+
     def reach(self):
         """Switches this node's port reaches, or None if its port is down"""
         value, when = self._reach

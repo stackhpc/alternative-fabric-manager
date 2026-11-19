@@ -15,8 +15,9 @@ render the group, the guard against dropping keys from ports unmanaged,
 and what OpenSM's key managers report
 
 specs/secured-profile.md, Class keys, is the source of truth. The group is
-experimental, untested on hardware: HA mode refuses it until hardware test
-3's second-host legs pass.
+experimental, untested on hardware, in either mode: hardware test 3's
+second-host legs decide whether another host derives the same keys, which
+HA mode relies on.
 
 The seed opens every port's class keys: nothing here logs it, or any key.
 """
@@ -146,10 +147,10 @@ class ClassKeys:
         return self.manager.fenced_session()
 
     def _acts(self):
-        """Whether the manager writes opensm.conf and owns the record: single
-        node, managed driver. In HA mode, which refuses the group, a write
-        outside the term's compare-and-set would be wrong."""
-        return not self.config.ha and self.config.driver == "managed"
+        """Whether the manager writes opensm.conf and owns the record: the
+        managed driver. In HA mode the leader writes it, behind the leader
+        fence (see _session)."""
+        return self.config.driver == "managed"
 
     @property
     def named(self):

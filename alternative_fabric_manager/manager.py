@@ -1618,11 +1618,29 @@ class Manager:
                     )
                 )
             }
+            # HA: the other nodes' ports, whose SMs may hold the keys
+            managed = {}
+            if self.config.ha:
+                for row in session.scalars(sa.select(db.Node)):
+                    if row.name == self.config.node:
+                        continue
+                    for text in json.loads(row.port_guids or "[]"):
+                        managed[int(text, 16)] = row.name
         others = [
             (guid, state) for guid, state in fabric.sms if guid not in fabric.own_guids
         ]
         for guid, state in others:
             LOG.warning("Another subnet manager, 0x%016x, is in state %d", guid, state)
+        # Another managed node's SM fails the check whatever its state: it may
+        # have the fabric's keys (specs/ha.md, Job completion).
+        theirs = [(guid, state) for guid, state in others if guid in managed]
+        if theirs:
+            return False, "Another managed node's subnet manager is running: " + (
+                ", ".join(
+                    f"0x{guid:016x} (node {managed[guid]}, state {state})"
+                    for guid, state in theirs
+                )
+            )
         masters = [guid for guid, state in others if state == 3]
         ours = [state for guid, state in fabric.sms if guid in fabric.own_guids]
         if 3 not in ours:

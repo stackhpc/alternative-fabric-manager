@@ -253,15 +253,12 @@ class Config:
     @property
     def allowed_sm_in_effect(self):
         """Whether the manager works out and checks OpenSM's
-        allowed_sm_guids list: the group named, or, in single node, the
-        option overridden, which gets the group's checks too
-
-        In HA mode an override is passed to OpenSM unchecked, as 0.3.0 did
-        and its docs told HA deployments to set it: refusing it would stop
-        each upgraded node of such a cluster from starting."""
+        allowed_sm_guids list: the group named, or the option overridden,
+        which gets the group's checks too (in HA mode, against the node
+        rows' ports; see specs/secured-profile.md, HA mode)"""
         if "allowed_sm" in self.hardening_groups:
             return True
-        return "allowed_sm_guids" in self.opensm_conf and not self.ha
+        return "allowed_sm_guids" in self.opensm_conf
 
     @property
     def partitions_file(self):
@@ -452,8 +449,7 @@ class Config:
         the manager can't read this host's ports
 
         See specs/secured-profile.md, Allowed SM GUIDs, Required groups and
-        Overrides. HA mode refuses it in _ha_problems, which validate checks
-        first.
+        Overrides, and HA mode.
         """
         override = self.opensm_conf.get("allowed_sm_guids")
         if override is not None and parse_allowed_sm_guids(override) is None:
@@ -462,11 +458,11 @@ class Config:
                 "and up to 16 hex digits, not 0) separated by commas: OpenSM "
                 "would otherwise disable the list"
             )
-        if self.ha and "allowed_sm_guids" in self.opensm_conf:
-            LOG.warning(
-                "[opensm_conf] allowed_sm_guids is passed to OpenSM unchecked in "
-                "HA mode: it must list every node's physical ports, or a "
-                "takeover's OpenSM may be ignored or refuse to run"
+        if self.ha and override is not None and override.strip() in ("0", "0x0"):
+            # Each leader must accept the others' SMs.
+            raise ConfigError(
+                "[opensm_conf] allowed_sm_guids can't be 0 in HA mode: it must "
+                "list every node's physical ports"
             )
         if not self.allowed_sm_in_effect:
             return
@@ -767,37 +763,9 @@ def _ha_problems(config):
         )
     if str(config.opensm_conf.get("m_key_protection_level", "1")) == "0":
         problems.append("M_Key protection level must be 1 or more")
-    # HA needs configuration epochs, so that leaders with and without the
-    # group can't alternate, and a reach probe that works on re-keyed ports
-    # (specs/secured-profile.md, Per-port M_Keys, requirement 5).
-    if "m_key_per_port" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
-            "aren't supported in HA mode yet"
-        )
-    # Untested anywhere: experimental groups are single node until their
-    # hardware tests run (specs/secured-profile.md, SA request rate).
-    if "sa_rate" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include sa_rate: the SA request rate "
-            "limit isn't supported in HA mode yet"
-        )
-    # A takeover by another host hasn't been shown to derive the same class
-    # keys (specs/secured-profile.md, The seed).
-    if "class_keys" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include class_keys: class keys aren't "
-            "supported in HA mode yet"
-        )
-    # HA needs node rows with port GUIDs, configuration epochs, the managed
-    # node SM rule and the fence ask first (specs/secured-profile.md,
-    # Allowed SM GUIDs, HA). A list typed by hand is passed on unchecked, as
-    # in 0.3.0 (see Config.allowed_sm_in_effect).
-    if "allowed_sm" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include allowed_sm: allowed SMs aren't "
-            "supported in HA mode yet"
-        )
+    # The secured profile's experimental groups run in HA mode too, behind
+    # configuration epochs and the leader fence (specs/secured-profile.md, HA
+    # mode); experimental means untested on hardware, in either mode.
     return problems
 
 

@@ -425,9 +425,9 @@ def test_m_key_per_port_with_the_m_key_group_loads(tmp_path):
     assert _load(tmp_path, text).hardening_groups == {"m_key", "m_key_per_port"}
 
 
-def test_ha_refuses_m_key_per_port():
-    # Leaders with and without the group could alternate until
-    # configuration epochs are enforced (requirement 5).
+def test_ha_allows_m_key_per_port():
+    # Configuration epochs keep leaders with and without the group from
+    # alternating (requirement 5).
     config = config_mod.Config(
         token="t",
         ha=True,
@@ -435,14 +435,7 @@ def test_ha_refuses_m_key_per_port():
         job_timeout=300,
         hardening="all, m_key_per_port",
     )
-    assert any(
-        "per-port M_Keys aren't supported in HA mode yet" in problem
-        for problem in config_mod._ha_problems(config)
-    )
-    with pytest.raises(config_mod.ConfigError, match="HA mode yet"):
-        config.validate()
-    config.hardening = "all"
-    config.validate()
+    assert not any("per-port" in problem for problem in config_mod._ha_problems(config))
 
 
 @pytest.mark.parametrize("driver", ["docker", "none"])

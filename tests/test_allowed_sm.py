@@ -141,27 +141,21 @@ def _ha_config(**kwargs):
     )
 
 
-def test_ha_refuses_allowed_sm():
+def test_ha_allows_allowed_sm():
+    # Experimental there too (specs/secured-profile.md, HA mode)
     config = _ha_config(hardening="all, allowed_sm")
-    assert any("allowed SMs" in p for p in config_mod._ha_problems(config))
-    assert not any(
-        "allowed SMs" in p for p in config_mod._ha_problems(_ha_config(hardening="all"))
-    )
+    assert not any("allowed" in p for p in config_mod._ha_problems(config))
+    assert config.allowed_sm_in_effect
 
 
-def test_ha_passes_a_hand_typed_list_on_unchecked_as_0_3_0_did(caplog):
-    # 0.3.0's docs told HA deployments to set it: refusing it would stop
-    # every upgraded node of such a cluster.
+def test_ha_checks_a_hand_typed_list_and_refuses_0():
     config = _ha_config(opensm_conf={"allowed_sm_guids": "0x1,0x2"})
-    assert not any("allowed SMs" in p for p in config_mod._ha_problems(config))
-    assert not config.allowed_sm_in_effect
-    config._validate_allowed_sm()
-    assert "passed to OpenSM unchecked" in caplog.text
-    content = opensm_conf.render(config.opensm_conf)
-    assert "allowed_sm_guids 0x1,0x2" in content
-    # A single node still gives it the group's checks.
-    single = config_mod.Config(token="x", opensm_conf={"allowed_sm_guids": "0x1"})
-    assert single.allowed_sm_in_effect
+    assert config.allowed_sm_in_effect
+    zero = _ha_config(opensm_conf={"allowed_sm_guids": "0"})
+    with pytest.raises(config_mod.ConfigError, match="can't be 0 in HA mode"):
+        zero._validate_allowed_sm()
+    single = config_mod.Config(token="x", opensm_conf={"allowed_sm_guids": "0"})
+    single._validate_allowed_sm()
 
 
 # Rendering
@@ -930,15 +924,17 @@ def test_the_commands(sm_manager):
         sms.drop(OLD_HOST)
 
 
-def test_the_commands_refuse_ha(sm_manager, sm_config):
+def test_the_commands_work_in_ha_and_keep_node_ports(sm_manager, sm_config):
     sm_config.ha = True
-    for command in (
-        sm_manager.allowed_sms.known_ports,
-        lambda: sm_manager.allowed_sms.record(OLD_HOST),
-        lambda: sm_manager.allowed_sms.drop(OLD_HOST),
-    ):
-        with pytest.raises(allowed_sm.AllowedSMError, match="HA mode"):
-            command()
+    with sm_manager.sessionmaker() as session:
+        session.add(db.Node(name="b", port_guids='["0002c90300001234"]'))
+        session.add(db.KnownSMPort(guid="0002c90300001234", own=False))
+        session.commit()
+    assert sm_manager.allowed_sms.record(OLD_HOST)
+    assert "0x0002c90300001234 node b" in sm_manager.allowed_sms.known_ports()
+    with pytest.raises(allowed_sm.AllowedSMError, match="node b's port"):
+        sm_manager.allowed_sms.drop(0x0002C90300001234)
+    sm_manager.allowed_sms.drop(OLD_HOST)
 
 
 def test_the_cli_commands(tmp_path, capsys):

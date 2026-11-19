@@ -30,7 +30,10 @@ The coordinator drives OpenSM through a runner:
 - ask(adapters): SMInfo DISABLE to a node's adapters, best effort;
 - reach(), optionally: how many expected switches this node's own port
   reaches, or None if the port's link is down, below Init, or its
-  neighbouring switch port is disabled (see Taking the lease).
+  neighbouring switch port is disabled (see Taking the lease);
+- node_ports(), optionally: the port GUIDs of this host's physical
+  InfiniBand ports, as a set of ints, which the node row records (see The
+  secured profile).
 """
 
 import enum
@@ -87,6 +90,10 @@ class Coordinator:
         # Whether the alarm for a live node of a release before epochs was
         # logged, until it's gone
         self._old_alarmed = False
+        # The instance UUID whose node row has this host's ports recorded
+        self._ports_recorded = None
+        # Whether the alarm for a node row without ports was logged
+        self._ports_alarmed = False
         self.adapters = list(adapters)
         self.node = config.node
         self.uuid = str(uuid.uuid4())
@@ -284,7 +291,37 @@ class Coordinator:
     def _refresh_reach(self):
         while not self._stop.is_set():
             self._reach_value = self._probe_reach()
+            self._record_ports()
             self._stop.wait(max(self.config.ha_period * 4, 2.0))
+
+    def _record_ports(self):
+        """Record this host's physical ports in the node row, once per
+        registered instance: at registration, then at every refresh until a
+        probe finds some (see The secured profile). A probe that fails, or
+        finds none, changes nothing."""
+        probe = getattr(self.runner, "node_ports", None)
+        uuid_ = self.uuid
+        if probe is None or self._ports_recorded == uuid_:
+            return
+        if self.role == Role.STARTING:
+            # Not registered yet under this UUID
+            return
+        try:
+            guids = probe()
+        except Exception as e:  # noqa: BLE001 - such as an image being pulled
+            LOG.info("Can't read this host's physical ports yet: %s", e)
+            return
+        if not guids:
+            return
+        try:
+            if self.lease.record_ports(self.node, uuid_, guids):
+                self._ports_recorded = uuid_
+                LOG.info(
+                    "Recorded this host's physical ports: %s",
+                    ", ".join(f"0x{guid:016x}" for guid in sorted(guids)),
+                )
+        except Exception as e:  # noqa: BLE001 - try again at the next refresh
+            LOG.warning("Can't record this host's physical ports: %s", e)
 
     def _reach(self):
         """Expected switches this node reaches; 0 if its own port is down"""
@@ -757,6 +794,22 @@ class Coordinator:
                 self._old_alarmed = True
             return False
         self._old_alarmed = False
+        if self.config.allowed_sm_in_effect:
+            try:
+                ports = self.lease.node_ports().get(self.node)
+            except Exception:  # noqa: BLE001
+                return False
+            if not ports:
+                # The leader's allowed_sm_guids would leave this node out.
+                if not self._ports_alarmed:
+                    LOG.error(
+                        "allowed_sm_guids is in effect, but this node's row has "
+                        "no port GUIDs yet: not a candidate until the port "
+                        "probe records them"
+                    )
+                    self._ports_alarmed = True
+                return False
+            self._ports_alarmed = False
         if expected and reach >= expected:
             return True
         if waited < self.config.reach_timeout:

@@ -10,18 +10,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Allowed SMs in the single-node manager: the list OpenSM gets, the checks
-that refuse a list that would lock OpenSM out, what an SM that OpenSM
-ignores means for the fabric check, and the operator's commands
+"""Allowed SMs: the list OpenSM gets, the checks that refuse a list that
+would lock OpenSM out, what an SM that OpenSM ignores means for the fabric
+check, and the operator's commands
 
-specs/secured-profile.md, Allowed SM GUIDs, is the source of truth. The
-group is experimental, untested on hardware: hardware tests 1 and 2 decide
-parts of its rules, and HA mode refuses it until its dependencies are in.
+specs/secured-profile.md, Allowed SM GUIDs, and its HA mode, are the source
+of truth. The group is experimental, untested on hardware: hardware tests 1
+and 2 decide parts of its rules.
 
 It acts only while the list is in effect (the allowed_sm group named, or
-[opensm_conf] allowed_sm_guids set), in single node with the managed
-driver, which Config.validate requires. Otherwise every hook returns at
-once.
+[opensm_conf] allowed_sm_guids set), with the managed driver, which
+Config.validate requires. Otherwise every hook returns at once. In HA mode
+the list is the node rows' ports, which each node's coordinator records,
+rather than this host's alone.
 
 The scripts here run in OpenSM's image. The port probe reads sysfs only.
 The query sends one SMInfo and one PortInfo Get to a port, with its M_Key
@@ -32,6 +33,7 @@ container, never a key.
 
 import dataclasses
 import datetime
+import json
 import logging
 import re
 
@@ -270,13 +272,16 @@ class AllowedSMs:
         return self.manager.fenced_session()
 
     def active(self):
-        """Whether OpenSM gets a list: in single node, with the managed
-        driver, which Config.validate requires"""
-        return (
-            self.config.allowed_sm_in_effect
-            and not self.config.ha
-            and self.config.driver == "managed"
-        )
+        """Whether OpenSM gets a list: with the managed driver, which
+        Config.validate requires"""
+        return self.config.allowed_sm_in_effect and self.config.driver == "managed"
+
+    def _node_ports(self, session):
+        """HA: each node row's port GUIDs, as {name: set of ints}"""
+        return {
+            row.name: {int(g, 16) for g in json.loads(row.port_guids or "[]")}
+            for row in session.scalars(sa.select(db.Node))
+        }
 
     @property
     def contested(self):
@@ -307,15 +312,20 @@ class AllowedSMs:
             )
             LOG.error("%s", message)
             raise ProbeError(message) from None
-        if own:
-            self._record_own(own)
         override = self.config.opensm_conf.get(OPTION)
-        if override is not None:
-            # Config.validate refused one it can't read.
-            listed = config_mod.parse_allowed_sm_guids(override)
+        if self.config.ha:
+            listed, problem = self._ha_list(override)
         else:
-            listed = tuple(sorted(own))
-        problem = lockout_problem(listed, own, self.config.opensm_conf.get("guid"))
+            if own:
+                self._record_own(own)
+            problem = None
+            if override is not None:
+                # Config.validate refused one it can't read.
+                listed = config_mod.parse_allowed_sm_guids(override)
+            else:
+                listed = tuple(sorted(own))
+        if problem is None:
+            problem = lockout_problem(listed, own, self.config.opensm_conf.get("guid"))
         if problem is not None:
             message = (
                 f"Not starting OpenSM: {OPTION} would lock it out: {problem}. "
@@ -333,6 +343,39 @@ class AllowedSMs:
         # until a query clears it.
         self._alarmed.clear()
         return value
+
+    def _ha_list(self, override):
+        """HA: the list, the node rows' port GUIDs or the override, and why
+        it can't be used, or None (see specs/secured-profile.md, HA mode)"""
+        with self._session() as session:
+            nodes = self._node_ports(session)
+            targets = {e.node for e in session.scalars(sa.select(db.TargetEntry))}
+        rows = set().union(*nodes.values()) if nodes else set()
+        if not nodes.get(self.config.node):
+            return (), (
+                "this node's row has no port GUIDs yet, so the other nodes' "
+                "lists may leave it out"
+            )
+        bare = sorted(
+            name for name in targets if name != self.config.node and not nodes.get(name)
+        )
+        if bare:
+            # An earlier release's leader, whose OpenSM the list would ignore
+            return (), (
+                f"node {', '.join(bare)} may run OpenSM, and its row has no port "
+                "GUIDs, so the list would leave it out"
+            )
+        if override is None:
+            return tuple(sorted(rows)), None
+        listed = config_mod.parse_allowed_sm_guids(override)
+        missing = rows - set(listed)
+        if missing:
+            return listed, (
+                f"[opensm_conf] {OPTION} leaves out node ports {_guids(missing)}: "
+                "every node's ports must be listed, or a takeover's OpenSM is "
+                "ignored"
+            )
+        return listed, None
 
     def _record_own(self, own):
         """Record this host's ports as known SM ports, and as its own; a port
@@ -362,6 +405,10 @@ class AllowedSMs:
             known = {
                 int(row.guid, 16) for row in session.scalars(sa.select(db.KnownSMPort))
             }
+            if self.config.ha:
+                # Every node row's ports, which their recording made known
+                # too, but a row is the stronger claim
+                known |= set().union(*self._node_ports(session).values())
         overridden = self._keys_overridden()
         if not overridden:
             # --drop-sm-port, beside the running manager, asserts that the
@@ -451,27 +498,38 @@ class AllowedSMs:
 
     # The operator's commands
 
-    def _refuse_ha(self):
-        if self.config.ha:
-            raise AllowedSMError("allowed SMs aren't available in HA mode")
+    def _owners(self, session):
+        """HA: which node row holds each port GUID, as {16 hex digits: name}"""
+        return {
+            f"{guid:016x}": name
+            for name, guids in self._node_ports(session).items()
+            for guid in guids
+        }
 
     def known_ports(self):
-        """--known-sm-ports: each known SM port, and whether it's this
-        host's, as the last start's probe found"""
-        self._refuse_ha()
+        """--known-sm-ports: each known SM port, and whose it is: this
+        host's, as the last start's probe found, or in HA mode the node row
+        that holds it; otherwise recorded"""
         with self._session() as session:
             rows = sorted(
                 session.scalars(sa.select(db.KnownSMPort)), key=lambda r: r.guid
             )
-            return [
-                f"0x{row.guid} {'this host' if row.own else 'recorded'}" for row in rows
-            ]
+            owners = self._owners(session) if self.config.ha else {}
+            lines = []
+            for row in rows:
+                if row.guid in owners:
+                    whose = f"node {owners[row.guid]}"
+                elif row.own and not self.config.ha:
+                    whose = "this host"
+                else:
+                    whose = "recorded"
+                lines.append(f"0x{row.guid} {whose}")
+            return lines
 
     def record(self, guid):
         """--record-sm-port: a port whose SM may hold the fabric's keys, so
         that OpenSM ignoring it contests the fabric; False if it was
         known already"""
-        self._refuse_ha()
         text = port_keys.guid_text(guid)
         with self._session() as session:
             if session.get(db.KnownSMPort, text) is not None:
@@ -483,13 +541,18 @@ class AllowedSMs:
     def drop(self, guid):
         """--drop-sm-port: forget a known SM port, whose adapter is no longer
         in a host with the fabric's keys"""
-        self._refuse_ha()
         text = port_keys.guid_text(guid)
         with self._session() as session:
             row = session.get(db.KnownSMPort, text)
             if row is None:
                 raise AllowedSMError(f"0x{text} isn't a known SM port")
-            if row.own:
+            owner = self._owners(session).get(text) if self.config.ha else None
+            if owner is not None:
+                raise AllowedSMError(
+                    f"0x{text} is node {owner}'s port, which may run OpenSM: "
+                    "--forget-node it first"
+                )
+            if row.own and not self.config.ha:
                 raise AllowedSMError(
                     f"0x{text} is this host's port, as the last start found it: "
                     "OpenSM may run there"
