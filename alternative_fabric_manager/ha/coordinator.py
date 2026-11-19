@@ -92,6 +92,9 @@ class Coordinator:
         self._old_alarmed = False
         # The instance UUID whose node row has this host's ports recorded
         self._ports_recorded = None
+        # Whether the takeover under way may run per-port M_Keys' steps,
+        # which lengthen its bound
+        self._port_keys_start = False
         # Whether the alarm for a node row without ports was logged
         self._ports_alarmed = False
         self.adapters = list(adapters)
@@ -492,8 +495,25 @@ class Coordinator:
 
     @property
     def takeover_bound(self):
-        # Each takeover step polls; the longest is OpenSM's start.
-        return self.config.start_timeout + 5 * self.config.call_timeout + 10
+        # Each takeover step polls; the longest is OpenSM's start. With
+        # per-port M_Keys, the longest start is a turn-on whose success rule
+        # fails: it verifies, starts, waits, stops, verifies again and starts
+        # once more (specs/secured-profile.md, HA mode).
+        return (
+            self.config.start_timeout * (5 if self._port_keys_start else 1)
+            + 5 * self.config.call_timeout
+            + 10
+        )
+
+    def _port_keys_active(self):
+        """Whether this takeover's start may run per-port M_Keys' steps"""
+        if "m_key_per_port" in self.config.hardening_groups:
+            return True
+        keeper = getattr(self.manager, "port_keeper", None)
+        try:
+            return bool(keeper is not None and keeper.active())
+        except Exception:  # noqa: BLE001 - assume the longer bound
+            return True
 
     def _watchdog_deadline(self, now):
         return min(
@@ -826,6 +846,9 @@ class Coordinator:
 
     def _take_over(self, term, taken_at):
         """Wait for every other target to leave the set, then start OpenSM"""
+        # Read once, on this thread: the liveness thread mustn't wait on the
+        # database for it.
+        self._port_keys_start = self._port_keys_active()
         try:
             asked = set()
             while not self._stop.is_set():

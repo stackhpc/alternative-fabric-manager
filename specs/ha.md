@@ -1059,9 +1059,13 @@ describes. In summary:
   `opensm.conf` and `partitions.conf`, and are written once they're
   rendered. The reach probe uses the prober along the recorded links,
   with each port's key, rather than `ibswitches` with one key. The
-  takeover bound allows for the longest start with per-port M_Keys: a
-  turn-on whose success rule fails, stops OpenSM, verifies the ports again
-  and starts it once more, `4 × start_timeout`.
+  takeover loop's bound allows for the longest start with per-port M_Keys:
+  a turn-on whose success rule fails, stops OpenSM, verifies the ports
+  again and starts it once more, `4 × start_timeout` longer. A takeover's
+  longest, which `job_timeout` must exceed, counts the usual start, which
+  verifies the ports and waits for the turn-on's success rule, `1.5 ×
+  start_timeout` longer: a failed turn-on is a one-off, and may outlast a
+  job.
 - **`class_keys` and `sa_rate`** need nothing beyond the leader fence:
   the seed is in Galera, so every leader derives the same keys, which
   hardware test 3's second-host run checks.

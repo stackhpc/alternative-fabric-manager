@@ -612,14 +612,21 @@ def test_confirm_fabric_with_no_fabric_to_check_sees_no_switches(tmp_path):
         _cli(path, "--confirm-fabric")
 
 
-def test_port_key_commands_are_refused_in_ha_mode(tmp_path, monkeypatch):
+def test_port_key_commands_work_in_ha_mode(tmp_path, monkeypatch, capsys):
     path = _per_port_conf(tmp_path, hardening="all")
     config = config_mod.Config.load(str(path))
     # HA's own settings aren't the point here: only that ha is set
     config.ha = True
     monkeypatch.setattr(config_mod.Config, "load", lambda _path: config)
-    with pytest.raises(SystemExit, match="HA mode"):
-        _cli(path, "--port-key-states")
+    _cli(path, "--port-key-states")
+
+
+def test_the_takeover_bound_allows_for_a_per_port_start():
+    plain = config_mod.Config(token="t", hardening="all")
+    keyed = config_mod.Config(token="t", hardening="all, m_key_per_port")
+    assert config_mod.takeover_bound(keyed) == (
+        config_mod.takeover_bound(plain) + 1.5 * plain.start_timeout
+    )
 
 
 def test_port_key_commands_are_exclusive(tmp_path):

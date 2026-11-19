@@ -408,8 +408,6 @@ def main(argv=None):
 
 def _port_keys(config, args):
     """The per-port M_Key commands, beside the running manager"""
-    if config.ha:
-        raise port_keeper.PortKeysError("per-port M_Keys aren't available in HA mode")
     manager = manager_mod.Manager(
         config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
     )
@@ -494,6 +492,10 @@ def _serve_ha(config, args):
     )
     manager = manager_mod.Manager(config, sessionmaker, driver)
     holder["manager"] = manager
+    # With per-port M_Key rows, the reach probe uses the prober
+    driver.reach_switches = lambda: manager.port_keeper.reach_switches(
+        ha_docker.REACH_TIMEOUT, driver.reach_name
+    )
     coordinator = coordinator_mod.Coordinator(
         config,
         lease_mod.GaleraLease(sessionmaker),

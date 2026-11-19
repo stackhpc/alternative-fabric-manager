@@ -1277,10 +1277,11 @@ the seed is hardware test 3's second-host leg.
   port that changed key meanwhile is sent both keys, as a verify sends
   them, and a wrong one logs a Bad M_Key trap at the port, which the
   leader's sweeps only count.
-- **The takeover bound** is `4 × start_timeout` longer while the group is
-  named or rows exist: the longest start, a turn-on whose success rule
-  fails, verifies, starts, waits, stops, verifies again and starts once
-  more.
+- **The takeover loop's bound** is `4 × start_timeout` longer while the
+  group is named or rows exist: the longest start, a turn-on whose success
+  rule fails, verifies, starts, waits, stops, verifies again and starts
+  once more. `job_timeout` must exceed a takeover with the usual per-port
+  start, `1.5 × start_timeout` longer (ha.md, The secured profile).
 - **Jobs** need evidence from the leader's checks, kept in its memory as
   in single node: another instance never completes a job on a recorded
   port, and returns its stored status, which the leader writes.

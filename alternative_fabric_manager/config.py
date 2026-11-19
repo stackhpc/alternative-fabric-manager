@@ -693,6 +693,12 @@ def takeover_bound(config):
     the new leader's OpenSM starting: as long as the fabric may go without a
     subnet manager in an unclean takeover"""
     apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    # With per-port M_Keys, a start verifies the ports first (start_timeout
+    # / 2 at most), and a turn-on waits for its success rule (start_timeout):
+    # the usual start. A turn-on that fails takes longer, once.
+    port_keys = (
+        1.5 * config.start_timeout if "m_key_per_port" in config.hardening_groups else 0
+    )
     return (
         apply_bound
         + config.lease_timeout
@@ -701,6 +707,7 @@ def takeover_bound(config):
         + 5
         + config.watchdog_timeout
         + config.start_timeout
+        + port_keys
         + 5
     )
 

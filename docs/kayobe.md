@@ -47,9 +47,10 @@ deployed, see [infiniband-networks.md](infiniband-networks.md).
 - **M_Key and SM_Key protection.** HA mode refuses to start without the
   `m_key` and `sm_key` hardening groups. Read
   [opensm-hardening.md](opensm-hardening.md) before enabling them on a
-  fabric shared with hosts outside OpenStack. HA mode refuses the
-  experimental `m_key_per_port` group (per-port M_Keys), so this
-  deployment can't use it yet.
+  fabric shared with hosts outside OpenStack. The experimental groups,
+  `m_key_per_port` (per-port M_Keys) among them, run in HA mode too,
+  untested there on hardware: see its In HA mode section before naming
+  any, after every node runs a release with configuration epochs.
 
 ## Virtualised and bare metal
 
@@ -442,7 +443,8 @@ image = {{ afm_opensm_image }}
 manager_container = {{ afm_container_name }}
 config_dir = /etc/opensm
 host_config_dir = /etc/opensm
-# Not m_key_per_port, which HA mode refuses (see opensm-hardening.md)
+# The experimental groups, such as m_key_per_port, only as
+# opensm-hardening.md's In HA mode says
 hardening = m_key, sm_key, enforcement
 # HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts)
 job_timeout = 300
