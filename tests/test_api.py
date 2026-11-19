@@ -595,20 +595,59 @@ def test_a_lost_base_isnt_kept(manager, config):
     assert not manager.base_kept()
 
 
-def test_ha_starts_dont_record_the_base(manager, config):
-    # HA refuses per-port keys, and its starts don't write outside the
-    # term's compare-and-set.
+def test_ha_starts_record_the_base_behind_the_leader_fence(manager, config):
+    # A takeover's start records it, raising the fence to its term first
+    # (specs/ha.md, The secured profile).
     from alternative_fabric_manager import manager as manager_mod
 
     config.ha = True
+    manager.term = 3
     manager.start()
     manager.stop()
     manager.start()
     manager.stop()
     assert _base(manager)
-    assert not manager.base_kept()
+    assert manager.base_kept()
     with manager.sessionmaker() as session:
-        assert session.get(db.State, manager_mod.BASE_KEPT) is None
+        assert session.get(db.State, manager_mod.LEADER_FENCE).value == 3
+
+
+def test_a_deposed_leaders_fenced_write_fails(manager, config):
+    from alternative_fabric_manager import manager as manager_mod
+
+    config.ha = True
+    manager.term = 5
+    with manager.fenced_session() as session:
+        session.commit()
+    manager.term = 4
+    with pytest.raises(manager_mod.StaleLeader):
+        with manager.fenced_session() as session:
+            session.add(db.State(name="written", value=1))
+            session.commit()
+    with manager.sessionmaker() as session:
+        assert session.get(db.State, "written") is None
+        assert session.get(db.State, manager_mod.LEADER_FENCE).value == 5
+    # An operator's command, outside any term, isn't fenced.
+    manager.term = 0
+    with manager.fenced_session() as session:
+        session.add(db.State(name="written", value=1))
+        session.commit()
+
+
+def test_every_fenced_write_changes_the_fence_row(manager, config):
+    # So that Galera certifies a deposed leader's transaction against the
+    # successor's raise
+    from alternative_fabric_manager import manager as manager_mod
+
+    config.ha = True
+    manager.term = 2
+    nonces = set()
+    for _ in range(3):
+        with manager.fenced_session() as session:
+            session.commit()
+        with manager.sessionmaker() as session:
+            nonces.add(session.get(db.State, manager_mod.LEADER_FENCE).text)
+    assert len(nonces) == 3
 
 
 def test_key_lease_period_reaches_opensm_conf(manager, config, caplog):

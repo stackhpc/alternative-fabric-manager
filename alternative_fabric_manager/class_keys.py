@@ -22,7 +22,6 @@ The seed opens every port's class keys: nothing here logs it, or any key.
 """
 
 import collections
-import contextlib
 import logging
 
 import sqlalchemy as sa
@@ -142,10 +141,9 @@ class ClassKeys:
     def config(self):
         return self.manager.config
 
-    @contextlib.contextmanager
     def _session(self):
-        with self.manager._lock, self.manager.sessionmaker() as session:
-            yield session
+        # In HA mode, the leader's sessions are behind the leader fence.
+        return self.manager.fenced_session()
 
     def _acts(self):
         """Whether the manager writes opensm.conf and owns the record: single

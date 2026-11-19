@@ -555,6 +555,70 @@ def cache_volume_writable(volumes):
     return False
 
 
+# opensm.conf options left out of the configuration hash (specs/ha.md,
+# Configuration epochs): rolling ones, which move no protection, so a change
+# to them is rolled out as an upgrade, with no epoch; and node-specific ones,
+# which differ between nodes by design. An option whose name ends in _file
+# or _dir is a path, node-specific too.
+ROLLING_OPTIONS = frozenset(
+    {
+        "sweep_interval",
+        "routing_engine",
+        "log_flags",
+        "force_log_flush",
+        "log_max_size",
+        "accum_log_file",
+        "verbosity",
+    }
+)
+NODE_OPTIONS = frozenset({"guid"})
+
+
+def _hashed_option(name):
+    return not (
+        name in ROLLING_OPTIONS
+        or name in NODE_OPTIONS
+        or name.endswith("_file")
+        or name.endswith("_dir")
+    )
+
+
+def hashed_settings(config):
+    """What the configuration hash covers, as a dict that JSON can encode:
+    everything that decides the partitions and how OpenSM protects the
+    fabric (specs/ha.md, Configuration epochs)"""
+    template = ""
+    if config.partitions_template:
+        with open(config.partitions_template) as f:
+            template = f.read()
+    return {
+        "template": template,
+        "default_partition": config.default_partition,
+        "flat_pkey": config.flat_pkey,
+        "shared_default_partition": config.shared_default_partition,
+        "ipoib": [config.ipoib_rate, config.ipoib_mtu, config.ipoib_sl],
+        "hardening": sorted(config.hardening_groups),
+        "key_lease_period": config.key_lease_period,
+        "opensm_conf": {
+            name: str(value).strip()
+            for name, value in sorted(config.opensm_conf.items())
+            if _hashed_option(name)
+        },
+    }
+
+
+def config_hash(config, key):
+    """The configuration hash: an HMAC-SHA256 of hashed_settings, keyed by a
+    secret stored in the database, so that the hash, which isn't secret,
+    can't be used to test guesses of a key set in [opensm_conf]"""
+    import hashlib
+    import hmac
+    import json
+
+    text = json.dumps(hashed_settings(config), sort_keys=True, separators=(",", ":"))
+    return hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest()
+
+
 def ha_settings(config):
     """The settings every instance of a cluster must share, as stored"""
     import json

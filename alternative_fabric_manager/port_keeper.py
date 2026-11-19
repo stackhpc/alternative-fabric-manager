@@ -235,10 +235,9 @@ class PortKeeper:
     def group_named(self):
         return GROUP in self.config.hardening_groups
 
-    @contextlib.contextmanager
     def _session(self):
-        with self.manager._lock, self.manager.sessionmaker() as session:
-            yield session
+        # In HA mode, the leader's sessions are behind the leader fence.
+        return self.manager.fenced_session()
 
     # Whether to act at all
 

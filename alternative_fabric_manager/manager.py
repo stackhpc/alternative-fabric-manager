@@ -23,12 +23,14 @@ before it lets the port become ACTIVE, so a port is never reported as in its
 partition before OpenSM has put it there.
 """
 
+import contextlib
 import datetime
 import json
 import logging
 import os
 import threading
 import time
+import uuid
 
 import sqlalchemy as sa
 
@@ -56,6 +58,10 @@ APPLIES = "applies"
 # Whether the per-port M_Key base was stored before the manager's current
 # start: a start that stored it can't begin per-port keys
 BASE_KEPT = "m_key_base_kept"
+# HA: the highest term whose leader has written the secured profile's
+# records, which every such write raises to its own term first (see
+# specs/ha.md, The secured profile)
+LEADER_FENCE = "leader_fence"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
 # _needs_sync()'s reason for restoring the last swept file
@@ -65,6 +71,11 @@ OPEN = (db.JobStatus.PENDING, db.JobStatus.RUNNING)
 
 class NotFound(LookupError):
     pass
+
+
+class StaleLeader(ReloadError):
+    """A later term's leader has written the secured profile's records: this
+    instance no longer leads, and mustn't write them"""
 
 
 def _now():
@@ -194,6 +205,46 @@ class Manager:
         self.class_keys = class_keys.ClassKeys(self)
         # The SA request rate limit's drops, logged
         self.sa_rate = sa_rate.SARate(self)
+
+    # The leader fence
+
+    @contextlib.contextmanager
+    def fenced_session(self):
+        """A session for the secured profile's records: in HA mode, while
+        this instance leads, it first raises the leader fence to its term,
+        and raises StaleLeader if a later term's leader has (see specs/ha.md,
+        The secured profile). Elsewhere, as for an operator's command, a
+        plain session."""
+        with self._lock, self.sessionmaker() as session:
+            if self.config.ha and self.term:
+                self._raise_fence(session)
+            yield session
+
+    def _raise_fence(self, session):
+        # A new nonce every time, so that the row always changes: Galera
+        # certifies a transaction against another only on rows they both
+        # changed, so a deposed leader's transaction, which reads the fence
+        # at its own term, conflicts with the successor's raise rather than
+        # slipping past it.
+        nonce = uuid.uuid4().hex
+        result = session.execute(
+            sa.update(db.State)
+            .where(db.State.name == LEADER_FENCE, db.State.value <= self.term)
+            .values(value=self.term, text=nonce)
+        )
+        if result.rowcount == 1:
+            return
+        if session.get(db.State, LEADER_FENCE) is None:
+            # The first fenced write ever; a racing first write fails its
+            # commit, and is retried as any failed write is.
+            session.add(db.State(name=LEADER_FENCE, value=self.term, text=nonce))
+            session.flush()
+            return
+        session.rollback()
+        raise StaleLeader(
+            f"A later term's leader has written the records; term {self.term} "
+            "no longer leads"
+        )
 
     # Requests
 
@@ -817,7 +868,7 @@ class Manager:
         to read. Every start overwrites it.
         """
         for attempt in range(2):
-            with self._lock, self.sessionmaker() as session:
+            with self.fenced_session() as session:
                 try:
                     row = session.get(db.State, BASE_KEPT)
                     if row is None:
@@ -938,11 +989,8 @@ class Manager:
         self.port_keeper.refuse_start()
         self.class_keys.refuse_start(seed_kept)
         self._keep_seed()
-        if not self.config.ha:
-            # Only in single-node mode: in HA mode, starts at takeovers would
-            # write it outside the term's compare-and-set, and HA refuses
-            # per-port keys anyway, so a missing row, False, is right there.
-            self._record_base_kept(base_kept)
+        # In HA mode, behind the leader fence, which this raises first.
+        self._record_base_kept(base_kept)
         self._stop.clear()
         # Counted afresh for each OpenSM this manager starts
         self.unanswered_checks = 0

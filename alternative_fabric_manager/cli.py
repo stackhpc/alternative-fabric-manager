@@ -95,6 +95,29 @@ def main(argv=None):
         "runs on its host: nothing checks this for you (see --status)",
     )
     parser.add_argument(
+        "--config-epoch",
+        action="store_true",
+        help="HA: show the configuration epoch, the hashes it allows, this "
+        "configuration's hash, and each node's, and exit",
+    )
+    parser.add_argument(
+        "--allow-config",
+        nargs="?",
+        const="",
+        metavar="HASH",
+        help="HA: record a new configuration epoch that allows this "
+        "configuration's hash, and HASH too if given, and exit. A leader whose "
+        "configuration isn't allowed hands over to a live candidate whose is",
+    )
+    parser.add_argument(
+        "--forget-node",
+        metavar="NODE",
+        help="HA: remove a retired node's row, so that its ports leave the "
+        "allowed_sm_guids list at the next takeover, and exit. Refused while "
+        "the node may run OpenSM, or its manager is live; its ports stay "
+        "known SM ports until --drop-sm-port",
+    )
+    parser.add_argument(
         "--forget-revisions",
         action="store_true",
         help="After restoring Neutron's database from a backup, whose "
@@ -215,6 +238,14 @@ def main(argv=None):
         except lease_mod.NotPrimary as e:
             sys.exit(f"alternative-fabric-manager: {e}")
         print("\n".join(operator.status(state)))
+        return
+
+    if (
+        args.config_epoch
+        or args.allow_config is not None
+        or args.forget_node is not None
+    ):
+        _epochs(config, args)
         return
 
     if args.freeze or args.unfreeze or args.force_unfreeze:
@@ -424,6 +455,29 @@ def _allowed_sms(config, args):
         print(f"Dropped 0x{guid:016x} from the known SM ports")
 
 
+def _epochs(config, args):
+    """The HA commands on configuration epochs and node rows"""
+    from alternative_fabric_manager.ha import lease as lease_mod
+    from alternative_fabric_manager.ha import operator
+
+    if not config.ha:
+        sys.exit("alternative-fabric-manager: only in HA mode")
+    lease = lease_mod.GaleraLease(
+        db.make_sessionmaker(config.database_url, config.call_timeout)
+    )
+    try:
+        if args.config_epoch:
+            print("\n".join(operator.config_epoch(config, lease)))
+        elif args.allow_config is not None:
+            epoch, hashes = operator.allow_config(config, lease, args.allow_config)
+            print(f"Recorded configuration epoch {epoch}, allowing {', '.join(hashes)}")
+        else:
+            operator.forget_node(config, lease, args.forget_node)
+            print(f"Forgot node {args.forget_node}")
+    except (operator.OperatorError, lease_mod.NotPrimary) as e:
+        sys.exit(f"alternative-fabric-manager: {e}")
+
+
 def _serve_ha(config, args):
     """One instance of an HA cluster: the coordinator decides whether this
     instance runs OpenSM (see specs/ha.md)"""
@@ -441,7 +495,11 @@ def _serve_ha(config, args):
     manager = manager_mod.Manager(config, sessionmaker, driver)
     holder["manager"] = manager
     coordinator = coordinator_mod.Coordinator(
-        config, lease_mod.GaleraLease(sessionmaker), driver, manager
+        config,
+        lease_mod.GaleraLease(sessionmaker),
+        driver,
+        manager,
+        hash_config=lambda key: config_mod.config_hash(config, key),
     )
     app = api.create_app(config, manager, coordinator)
     image_stop = threading.Event()

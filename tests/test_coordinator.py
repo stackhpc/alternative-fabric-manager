@@ -269,7 +269,8 @@ def test_shutdown_marks_the_node_stopped_and_fails_health_first(lease, clock):
     a.runner.stop = lambda: roles.append(a.role)
     a.shutdown()
     assert roles[0] == coordinator_mod.Role.STOPPING
-    assert [stopped for name, *_rest, stopped in lease.nodes() if name == "a"] == [True]
+    rows = [row for row in lease.nodes() if row[0] == "a"]
+    assert [row[4] for row in rows] == [True]
     assert lease.read().released
 
 

@@ -30,7 +30,6 @@ script's own; only the SMInfo state and the capability mask leave the
 container, never a key.
 """
 
-import contextlib
 import dataclasses
 import datetime
 import logging
@@ -267,10 +266,8 @@ class AllowedSMs:
     def driver(self):
         return self.manager.driver
 
-    @contextlib.contextmanager
     def _session(self):
-        with self.manager._lock, self.manager.sessionmaker() as session:
-            yield session
+        return self.manager.fenced_session()
 
     def active(self):
         """Whether OpenSM gets a list: in single node, with the managed

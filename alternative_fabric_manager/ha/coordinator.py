@@ -59,12 +59,31 @@ def _now():
 
 
 class Coordinator:
-    def __init__(self, config, lease, runner, manager, config_hash="", adapters=()):
+    def __init__(
+        self,
+        config,
+        lease,
+        runner,
+        manager,
+        config_hash="",
+        adapters=(),
+        hash_config=None,
+    ):
         self.config = config
         self.lease = lease
         self.runner = runner
         self.manager = manager
+        # This instance's configuration hash, worked out at registration by
+        # hash_config(key), with the HMAC key from the database, if given
+        # (see specs/ha.md, Configuration epochs). "" is always allowed, as
+        # in tests.
         self.config_hash = config_hash
+        self._hash_config = hash_config
+        # The hashes the epoch allows, as last read; None while none is
+        # stored
+        self._allowed_hashes = None
+        # The epoch last alarmed about, to alarm once per epoch
+        self._epoch_alarmed = None
         self.adapters = list(adapters)
         self.node = config.node
         self.uuid = str(uuid.uuid4())
@@ -142,6 +161,8 @@ class Coordinator:
         runs, or adopt a frozen lease on this node (see Rejoining, Freeze)"""
         while not self._stop.is_set():
             try:
+                if self._hash_config is not None:
+                    self.config_hash = self._hash_config(self.lease.hash_key())
                 self.lease.register(
                     self.node, self.uuid, self.config_hash, self.adapters
                 )
@@ -270,12 +291,20 @@ class Coordinator:
         return self._reach_value
 
     def _live_others(self):
-        """Other nodes whose heartbeat moved within T, not stopped, and not
-        in the target set: the live candidates (see Stepping down)"""
+        """Other nodes whose heartbeat moved within T, not stopped, not in
+        the target set, and whose configuration the epoch allows: the live
+        candidates (see Stepping down)"""
         now = _now()
         targets = {instance for _node, instance, _term in self.lease.targets()}
         live = []
-        for name, instance, heartbeat, reach, stopped in self.lease.nodes():
+        for (
+            name,
+            instance,
+            heartbeat,
+            reach,
+            stopped,
+            config_hash,
+        ) in self.lease.nodes():
             seen = self._heartbeats.get(name)
             if seen is None or seen[0] != heartbeat:
                 self._heartbeats[name] = (heartbeat, now)
@@ -285,9 +314,37 @@ class Coordinator:
                 and not stopped
                 and instance not in targets
                 and now - seen[1] < self.config.lease_timeout
+                and self._allows(config_hash)
             ):
                 live.append((name, reach))
         return live
+
+    # Configuration epochs
+
+    def _allows(self, config_hash):
+        """Whether the epoch, as last read, allows a hash"""
+        allowed = self._allowed_hashes
+        return allowed is None or config_hash in allowed
+
+    def _config_allowed(self):
+        """Whether the epoch, as last read, allows this instance's
+        configuration; one with no hash, as in tests, always is"""
+        return not self.config_hash or self._allows(self.config_hash)
+
+    def _alarm_config(self, why):
+        """Log, once per epoch, that this instance's configuration isn't
+        allowed"""
+        key = self._allowed_hashes
+        if key == self._epoch_alarmed:
+            return
+        self._epoch_alarmed = key
+        LOG.error(
+            "This node's configuration (%s) isn't one the configuration epoch "
+            "allows (%s): %s. See --config-epoch and --allow-config",
+            self.config_hash[:12],
+            ", ".join(h[:12] for h in key or ()),
+            why,
+        )
 
     # Leading
 
@@ -440,6 +497,18 @@ class Coordinator:
         could do better and the cooldown has passed (see Stepping down)"""
         if self.held or self.role != Role.LEADER:
             return None
+        if not self._config_allowed():
+            # A configuration no longer allowed: hand over to a live
+            # candidate whose configuration is, after the cooldown (see
+            # Configuration epochs)
+            if self._moved_age >= self.config.step_down_cooldown:
+                try:
+                    others = self._live_others()
+                except Exception:  # noqa: BLE001
+                    others = []
+                if others:
+                    return "its configuration is no longer allowed"
+            self._alarm_config("leading until a candidate whose is allowed is live")
         manager = self.manager
         stalled = manager.unanswered_checks >= 3 or manager.failed_applies >= 3
         missing = getattr(manager, "missing_checks", 0) >= 3
@@ -508,6 +577,7 @@ class Coordinator:
             return
         self.frozen = state.freeze_state in ("frozen", "ending")
         self._moved_age = state.moved_age
+        self._allowed_hashes = state.allowed_hashes
         ours = state.holder_uuid == self.uuid and state.term == self.term
         if not ours:
             return
@@ -560,6 +630,7 @@ class Coordinator:
             return
         returned = _now()
         self.frozen = state.freeze_state in ("frozen", "ending")
+        self._allowed_hashes = state.allowed_hashes
         key = (state.term, state.counter, state.released)
         if key != self._seen:
             self._seen = key
@@ -573,11 +644,19 @@ class Coordinator:
             return
         if self._expired_since is None:
             self._expired_since = returned
+        if not self._config_allowed():
+            self._alarm_config("not a candidate")
+            return
         if not self._eligible(returned - self._expired_since):
             return
         try:
             term = self.lease.acquire(
-                self.node, self.uuid, state.term, state.counter, state.released
+                self.node,
+                self.uuid,
+                state.term,
+                state.counter,
+                state.released,
+                config_hash=self.config_hash or None,
             )
         except Exception as e:  # noqa: BLE001
             # The outcome is unknown, so it counts as taken: this instance may
@@ -733,6 +812,9 @@ class Coordinator:
         # OpenSM first: the applier may take up to its bound to finish.
         self.runner.stop()
         self.manager.halt()
+        # No longer a leader: its writes to the secured profile's records
+        # mustn't raise the leader fence, nor its jobs be judged by its term.
+        self.manager.term = 0
         self.opensm_started = False
         self._opensm_gone = False
         verified = self.runner.verify_stopped()

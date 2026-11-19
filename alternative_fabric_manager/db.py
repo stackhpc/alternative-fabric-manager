@@ -192,6 +192,10 @@ class Applied(Base):
         Timestamp, nullable=True
     )
     check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+    # HA: the allowed_sm_guids list the leader's OpenSM runs with, as the
+    # manager writes it, or None without one (see specs/ha.md, The secured
+    # profile)
+    allowed_sm: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
 
 
 class ExpectedSwitch(Base):
@@ -272,6 +276,11 @@ class Node(Base):
     reach: orm.Mapped[int] = orm.mapped_column(default=0)
     # Its adapters' node GUIDs, as a JSON list of hex strings
     adapters: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # Its physical functions' port GUIDs, as a JSON list of 16 hex digits
+    # each, from the last probe that found any (see specs/ha.md, The
+    # secured profile). Nullable, so that the previous version, which
+    # doesn't write it, can share the database during a rolling upgrade.
+    port_guids: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
     # Its OpenSM verified stopped: by which instance, at which lease term
     verified_stop_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
     verified_stop_term: orm.Mapped[int] = orm.mapped_column(default=-1)
@@ -365,6 +374,10 @@ _ADDED_COLUMNS = {
     "applied": {
         "term": "INTEGER NOT NULL DEFAULT 0",
         "contested": "BOOLEAN NOT NULL DEFAULT 0",
+        "allowed_sm": "TEXT",
+    },
+    "nodes": {
+        "port_guids": "TEXT",
     },
     "networks": {
         "revision": "INTEGER",

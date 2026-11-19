@@ -10,11 +10,14 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Operators' commands: freeze, unfreeze, force an unfreeze, status"""
+"""Operators' commands: freeze, unfreeze, force an unfreeze, status,
+configuration epochs, and forgetting a node"""
 
+import re
 import socket
 import time
 
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
 
 
@@ -107,3 +110,83 @@ def status(state):
                 "--force-unfreeze.",
             ]
     return lines
+
+
+# Configuration epochs (see specs/ha.md, Configuration epochs)
+
+_HASH = re.compile(r"[0-9a-f]{64}")
+
+
+def own_hash(config, lease):
+    """The hash of the configuration this command runs with"""
+    return config_mod.config_hash(config, lease.hash_key())
+
+
+def config_epoch(config, lease):
+    """--config-epoch: the epoch, this configuration's hash, and each node's
+    hash and whether the epoch allows it"""
+    ours = own_hash(config, lease)
+    epoch = lease.epoch()
+    allowed = None if epoch is None else set(epoch[1])
+
+    def verdict(config_hash):
+        if allowed is None:
+            return "allowed (no epoch yet)"
+        return "allowed" if config_hash in allowed else "NOT allowed"
+
+    if epoch is None:
+        lines = ["No configuration epoch yet: every hash is allowed until a takeover"]
+    else:
+        lines = [f"Epoch {epoch[0]} allows: {', '.join(sorted(allowed))}"]
+    lines.append(f"This configuration: {ours} {verdict(ours)}")
+    for name, _instance, _beat, _reach, stopped, config_hash in sorted(lease.nodes()):
+        state = " (stopped)" if stopped else ""
+        lines.append(
+            f"Node {name}{state}: {config_hash or '(none recorded)'} "
+            f"{verdict(config_hash)}"
+        )
+    return lines
+
+
+def allow_config(config, lease, other=None):
+    """--allow-config: record an epoch that allows this configuration's hash,
+    and other's if given; return (epoch, hashes)"""
+    hashes = [own_hash(config, lease)]
+    if other:
+        other = other.strip().lower()
+        if not _HASH.fullmatch(other):
+            raise OperatorError(
+                f"{other!r} isn't a configuration hash: --config-epoch prints them"
+            )
+        hashes.append(other)
+    hashes = sorted(set(hashes))
+    return lease.allow_config(hashes), hashes
+
+
+# Retiring a node (see specs/ha.md, Retiring a node)
+
+
+def forget_node(config, lease, name, wait=time.sleep):
+    """--forget-node: remove a retired node's row, once it's in no target-set
+    entry and either marked stopped or its heartbeat stays still for T"""
+    rows = {row[0]: row for row in lease.nodes()}
+    if name not in rows:
+        raise OperatorError(f"No node row is named {name}")
+    if any(node == name for node, _instance, _term in lease.targets()):
+        raise OperatorError(
+            f"{name} is in the target set: it may run OpenSM. Stop its manager "
+            "cleanly first"
+        )
+    _name, _instance, heartbeat, _reach, stopped, _hash = rows[name]
+    if not stopped:
+        wait(config.lease_timeout)
+        again = {row[0]: row for row in lease.nodes()}.get(name)
+        if again is not None and again[2] != heartbeat:
+            raise OperatorError(
+                f"{name}'s manager is live: its heartbeat moved. Stop it first"
+            )
+    if not lease.forget_node(name, heartbeat if not stopped else None):
+        raise OperatorError(
+            f"{name}'s row changed meanwhile: its manager may be live, or "
+            "joined the target set"
+        )
