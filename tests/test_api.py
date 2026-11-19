@@ -620,10 +620,12 @@ def test_a_deposed_leaders_fenced_write_fails(manager, config):
     with manager.fenced_session() as session:
         session.commit()
     manager.term = 4
-    with pytest.raises(manager_mod.StaleLeader):
-        with manager.fenced_session() as session:
-            session.add(db.State(name="written", value=1))
-            session.commit()
+    with (
+        pytest.raises(manager_mod.StaleLeader),
+        manager.fenced_session() as session,
+    ):
+        session.add(db.State(name="written", value=1))
+        session.commit()
     with manager.sessionmaker() as session:
         assert session.get(db.State, "written") is None
         assert session.get(db.State, manager_mod.LEADER_FENCE).value == 5

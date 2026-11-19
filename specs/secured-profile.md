@@ -1222,21 +1222,26 @@ a deposed leader's late write fails rather than overwriting them.
   single node, against this node's probe at the start, and also refuse a
   start while this node's row has no port GUIDs, or another target's
   node row has none (an old-version leader's).
-- The running list is recorded in `applied` at each start, by the leader.
-- Candidates: a node without port GUIDs isn't one. One outside the
-  running list isn't eligible while a live candidate inside it is, and
-  even then only once the lease was released or every other target
-  verified its stop: never by an unconfirmed takeover, since the old
-  OpenSM, which ignores it, could act unseen (Changing the list, the safe
-  outcome of hardware test 1).
-- A list change, such as a new node, takes effect at the next takeover;
-  meanwhile the leader logs an alarm at each check while a live node with
-  port GUIDs is outside its running list.
+- Candidates: a node without port GUIDs isn't one, while the list is in
+  effect.
+- A list change, such as a new node, takes effect at the next takeover.
+- **A candidate outside the running list takes over as any other.**
+  Changing the list's safe outcome of hardware test 1 would have barred
+  it from an unconfirmed takeover, and from the lease while a candidate
+  inside the list was live. That protects one case: an old leader whose
+  self-stop and watchdog both failed, whose OpenSM then ignores the new
+  one and isn't seen by it. ha.md already leaves the paused-node case
+  uncovered, and the rule would leave the fabric with no SM, and nothing
+  an operator could do, whenever the old leader's host died for good
+  while only newer nodes were live. Usability wins: the rule is left out
+  until hardware test 1 shows the newcomer can't see the old OpenSM, and
+  `0F09` and the fabric check's SA records are the evidence meanwhile.
 - The fabric check: an SM in the SA's SMInfo records on another node
   row's port GUIDs fails the check, whatever its state; `0F09` is judged
   against the known SM ports, which include every node row's ports.
 - `--record-sm-port`, `--drop-sm-port` and `--known-sm-ports` work in HA
-  mode; a port in a node row can't be dropped. `--forget-node` removes a
+  mode; a port in a node row can't be dropped. The single-node `own` mark
+  isn't kept in HA mode: the node rows say whose a port is. `--forget-node` removes a
   retired node's row (ha.md, Retiring a node).
 
 **`class_keys`.** The seed is in Galera, so every leader writes the same
@@ -1250,8 +1255,10 @@ the seed is hardware test 3's second-host leg.
 **`m_key_per_port`.**
 - The leader keeps the rows as the single-node manager does, behind the
   leader fence. Operators' commands work in HA mode from any node, as in
-  single node: `--confirm-fabric` reads the running OpenSM's cache only on
-  the leader's node, and elsewhere arms nothing that needs it.
+  single node. `--confirm-fabric` reads the running OpenSM's cache, and
+  runs the prober beside it, so it arms the turn-on only on the leader's
+  node; elsewhere it confirms the switches and says the arming must run
+  there.
 - **A takeover never reads its host's cache volume.** The files there
   are from an older term, or none: the rows are newer, and folding a
   stale file could put back a link or a key state the rows have since
@@ -1266,10 +1273,14 @@ the seed is hardware test 3's second-host leg.
   port's key, in a helper container of its own (`<container>-reach`).
   The count is the switches that answered. It never writes rows: a
   candidate isn't the leader. `ibstat` still decides whether this node's
-  port is up.
-- **The takeover bound** grows by the verify before the start and the
-  turn-on's success rule, each `start_timeout` at most, while the group
-  is named or rows exist.
+  port is up. Its rows may be a check interval behind the leader's, so a
+  port that changed key meanwhile is sent both keys, as a verify sends
+  them, and a wrong one logs a Bad M_Key trap at the port, which the
+  leader's sweeps only count.
+- **The takeover bound** is `4 × start_timeout` longer while the group is
+  named or rows exist: the longest start, a turn-on whose success rule
+  fails, verifies, starts, waits, stops, verifies again and starts once
+  more.
 - **Jobs** need evidence from the leader's checks, kept in its memory as
   in single node: another instance never completes a job on a recorded
   port, and returns its stored status, which the leader writes.
@@ -1293,7 +1304,7 @@ These go into specs/ha.md before the HA code changes:
   node that is live or in the target set. The leader then re-renders.
 - **Configuration:** `opensm.conf` includes `allowed_sm_guids`, generated
   from the node rows. An override is part of the configuration hash; the
-  generated list isn't. `applied` records the running list.
+  generated list isn't.
   `key_lease_period` is in the hash, as fabric-affecting (already made in
   ha.md). A lease no longer than a takeover's longest is warned about, not
   refused, so that a test fabric can use a short one.
@@ -1302,10 +1313,9 @@ These go into specs/ha.md before the HA code changes:
   NOT-ACTIVE or IsSM clear. Naming another port, it raises the unknown-SM
   alarm. The managed-node SM rule matches SMInfo records' port GUIDs
   against the node rows' port GUIDs, not their adapters' node GUIDs.
-- **Candidates:** a node with no port GUIDs can't be a candidate. A
-  candidate inside `applied`'s running list is preferred. One outside it
-  may take over as Changing the list says, which hardware test 1 decides.
-  An alarm is raised while a live node is outside it.
+- **Candidates:** a node with no port GUIDs can't be a candidate. One
+  outside the running leader's list takes over as any other, until
+  hardware test 1 shows otherwise (see HA mode).
 - **Required keys:** HA mode allows `allowed_sm`, `class_keys`,
   `sa_rate` and `m_key_per_port` as experimental (see HA mode).
 - **Per-port M_Keys:** `fabric_ports` (with each port's key state) and

@@ -84,6 +84,9 @@ class Coordinator:
         self._allowed_hashes = None
         # The epoch last alarmed about, to alarm once per epoch
         self._epoch_alarmed = None
+        # Whether the alarm for a live node of a release before epochs was
+        # logged, until it's gone
+        self._old_alarmed = False
         self.adapters = list(adapters)
         self.node = config.node
         self.uuid = str(uuid.uuid4())
@@ -290,12 +293,11 @@ class Coordinator:
             return self._probe_reach()
         return self._reach_value
 
-    def _live_others(self):
-        """Other nodes whose heartbeat moved within T, not stopped, not in
-        the target set, and whose configuration the epoch allows: the live
-        candidates (see Stepping down)"""
+    def _live_rows(self):
+        """Node rows not marked stopped whose heartbeat moved within T, this
+        node's and the leader's included, as (name, instance, reach,
+        configuration hash)"""
         now = _now()
-        targets = {instance for _node, instance, _term in self.lease.targets()}
         live = []
         for (
             name,
@@ -309,15 +311,22 @@ class Coordinator:
             if seen is None or seen[0] != heartbeat:
                 self._heartbeats[name] = (heartbeat, now)
                 seen = self._heartbeats[name]
-            if (
-                name != self.node
-                and not stopped
-                and instance not in targets
-                and now - seen[1] < self.config.lease_timeout
-                and self._allows(config_hash)
-            ):
-                live.append((name, reach))
+            if not stopped and now - seen[1] < self.config.lease_timeout:
+                live.append((name, instance, reach, config_hash))
         return live
+
+    def _live_others(self):
+        """Other nodes whose heartbeat moved within T, not stopped, not in
+        the target set, and whose configuration the epoch allows: the live
+        candidates (see Stepping down)"""
+        targets = {instance for _node, instance, _term in self.lease.targets()}
+        return [
+            (name, reach)
+            for name, instance, reach, config_hash in self._live_rows()
+            if name != self.node
+            and instance not in targets
+            and self._allows(config_hash)
+        ]
 
     # Configuration epochs
 
@@ -330,6 +339,36 @@ class Coordinator:
         """Whether the epoch, as last read, allows this instance's
         configuration; one with no hash, as in tests, always is"""
         return not self.config_hash or self._allows(self.config_hash)
+
+    def _move_epoch(self):
+        """Record an epoch with only this configuration's hash once every
+        live node row has it, the leader's included: a rolling change then
+        needs no command (see Configuration epochs). Returns whether it
+        did."""
+        if not self.config_hash:
+            return False
+        rows = self._live_rows()
+        if not rows or any(h != self.config_hash for *_rest, h in rows):
+            return False
+        seen = self.lease.epoch()
+        if seen is not None and self.config_hash in seen[1]:
+            return False
+        number = self.lease.allow_config([self.config_hash], seen=seen)
+        if number is None:
+            return False
+        LOG.warning(
+            "Every live node runs configuration %s: recorded configuration "
+            "epoch %d, allowing only it",
+            self.config_hash[:12],
+            number,
+        )
+        self._allowed_hashes = (self.config_hash,)
+        return True
+
+    def _old_versions_live(self):
+        """Whether a live node row has no configuration hash: a release
+        before epochs, which never checks one"""
+        return any(not h for *_rest, h in self._live_rows())
 
     def _alarm_config(self, why):
         """Log, once per epoch, that this instance's configuration isn't
@@ -506,7 +545,9 @@ class Coordinator:
                     others = self._live_others()
                 except Exception:  # noqa: BLE001
                     others = []
-                if others:
+                # Only for a candidate that can take over: one whose port
+                # reaches nothing never would, and the fabric would have no SM.
+                if any(reach > 0 for _name, reach in others):
                     return "its configuration is no longer allowed"
             self._alarm_config("leading until a candidate whose is allowed is live")
         manager = self.manager
@@ -631,6 +672,13 @@ class Coordinator:
         returned = _now()
         self.frozen = state.freeze_state in ("frozen", "ending")
         self._allowed_hashes = state.allowed_hashes
+        if not self._config_allowed():
+            # At every watch, not only once the lease expires, so that the
+            # heartbeats it judges liveness by are watched for T first
+            try:
+                self._move_epoch()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("Can't move the configuration epoch: %s", e)
         key = (state.term, state.counter, state.released)
         if key != self._seen:
             self._seen = key
@@ -692,13 +740,34 @@ class Coordinator:
         try:
             expected = self.lease.expected_switches()
             others = self._live_others()
+            old_versions = self._experimental() and self._old_versions_live()
         except Exception:  # noqa: BLE001
             return False
+        if old_versions:
+            # A release before epochs could lead next without the groups,
+            # and undo them (see Configuration epochs).
+            if not self._old_alarmed:
+                LOG.error(
+                    "This node's configuration names experimental hardening "
+                    "groups (%s), but a live node runs a release without "
+                    "configuration epochs, which could lead without them: not "
+                    "a candidate until every node is upgraded",
+                    ", ".join(sorted(self._experimental())),
+                )
+                self._old_alarmed = True
+            return False
+        self._old_alarmed = False
         if expected and reach >= expected:
             return True
         if waited < self.config.reach_timeout:
             return False
         return reach >= max((r for _name, r in others), default=0)
+
+    def _experimental(self):
+        """The experimental hardening groups this configuration names"""
+        return set(self.config.hardening_groups) & set(
+            config_mod.EXPERIMENTAL_HARDENING_GROUPS
+        )
 
     # Taking over
 

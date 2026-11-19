@@ -192,10 +192,6 @@ class Applied(Base):
         Timestamp, nullable=True
     )
     check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
-    # HA: the allowed_sm_guids list the leader's OpenSM runs with, as the
-    # manager writes it, or None without one (see specs/ha.md, The secured
-    # profile)
-    allowed_sm: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
 
 
 class ExpectedSwitch(Base):
@@ -374,7 +370,6 @@ _ADDED_COLUMNS = {
     "applied": {
         "term": "INTEGER NOT NULL DEFAULT 0",
         "contested": "BOOLEAN NOT NULL DEFAULT 0",
-        "allowed_sm": "TEXT",
     },
     "nodes": {
         "port_guids": "TEXT",

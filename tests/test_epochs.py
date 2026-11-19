@@ -94,12 +94,96 @@ def test_a_candidate_whose_configuration_isnt_allowed_doesnt_take_over(
     lease, clock, caplog
 ):
     lease.allow_config([A])
+    # A live node still runs the allowed configuration, so the epoch stays.
+    a = make(lease, "a", A)
+    a._rejoin()
     b = make(lease, "b", B)
     b._rejoin()
     b._watch()
     assert b.role == coordinator_mod.Role.CANDIDATE
     assert lease.read().released
+    assert lease.epoch() == (1, (A,))
     assert "isn't one the configuration epoch allows" in caplog.text
+
+
+def test_the_epoch_moves_once_every_live_node_agrees(lease, clock):
+    a = make(lease, "a", A)
+    lead(a)
+    b = make(lease, "b", B)
+    b._rejoin()
+    c = make(lease, "c", B)
+    c._rejoin()
+    # The leader, a, still runs A: no move.
+    b._watch()
+    assert lease.epoch() == (1, (A,))
+    # a restarts with B, as the last node of a rolling change.
+    a.shutdown()
+    a2 = make(lease, "a", B)
+    a2._rejoin()
+    b._watch()
+    assert lease.epoch() == (2, (B,))
+    clock.now += 100
+    b._watch()
+    assert b.role in (coordinator_mod.Role.TAKING_OVER, coordinator_mod.Role.LEADER)
+
+
+def test_a_dead_nodes_row_stops_counting_after_t(lease, clock):
+    a = make(lease, "a", A)
+    lead(a)
+    # a dies: its heartbeat stops, without a clean stop.
+    b = make(lease, "b", B)
+    b._rejoin()
+    b._watch()
+    assert lease.epoch() == (1, (A,))
+    clock.now += TIMINGS["lease_timeout"] + 1
+    b._tick()
+    b._watch()
+    assert lease.epoch() == (2, (B,))
+
+
+def test_a_returning_node_with_the_old_configuration_isnt_allowed(lease, clock):
+    lease.allow_config([B])
+    b = make(lease, "b", B)
+    b._rejoin()
+    a = make(lease, "a", A)
+    a._rejoin()
+    a._watch()
+    assert lease.epoch() == (1, (B,))
+
+
+def test_experimental_groups_wait_for_every_node_to_have_epochs(lease, clock, caplog):
+    old = make(lease, "old", "")
+    old._rejoin()
+    new = make(lease, "new", A, hardening="all, sa_rate")
+    new._rejoin()
+    new._watch()
+    clock.now += 100
+    # The old release's heartbeat moves: it's live.
+    lease.heartbeat("old", old.uuid, 1)
+    new._watch()
+    assert new.role == coordinator_mod.Role.CANDIDATE
+    assert "a release without configuration epochs" in caplog.text
+    # Without the groups, it may lead beside the old release.
+    plain = make(lease, "plain", A)
+    plain._rejoin()
+    plain._watch()
+    assert plain.role in (
+        coordinator_mod.Role.TAKING_OVER,
+        coordinator_mod.Role.LEADER,
+    )
+
+
+def test_no_step_down_for_a_candidate_that_reaches_nothing(lease, clock):
+    a = make(lease, "a", A, step_down_cooldown=0)
+    lead(a)
+    lease.allow_config([B])
+    a._freeze_step()
+    b = make(lease, "b", B, step_down_cooldown=0)
+    b.runner.reach_value = 0
+    b._rejoin()
+    b._tick()
+    a._lead()
+    assert a.role == coordinator_mod.Role.LEADER
 
 
 def test_a_leader_whose_configuration_is_no_longer_allowed_hands_over(lease, clock):

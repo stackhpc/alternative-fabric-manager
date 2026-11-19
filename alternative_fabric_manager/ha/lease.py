@@ -533,14 +533,18 @@ class GaleraLease:
             session.commit()
             return epoch
 
-    def allow_config(self, hashes):
+    def allow_config(self, hashes, seen=False):
         """Record a new epoch that allows exactly these hashes; return its
-        number"""
+        number, or None if seen is given, as the epoch read before, (epoch,
+        hashes) or None, and the epoch has moved since"""
         hashes = sorted(set(hashes))
         if not 1 <= len(hashes) <= MAX_HASHES:
             raise ValueError(f"an epoch allows 1 to {MAX_HASHES} hashes")
         with self._session() as session:
             epoch = _epoch(session, lock=True)
+            if seen is not False and epoch != seen:
+                session.rollback()
+                return None
             number = (epoch[0] if epoch else 0) + 1
             _store_epoch(session, number, hashes)
             session.commit()
