@@ -620,6 +620,31 @@ def config_hash(config, key):
     return hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest()
 
 
+# The cluster settings whose change could break the waits of specs/ha.md,
+# Timeouts, while an instance with the old value may still run OpenSM: each
+# may only move in the direction given, +1 up and -1 down, unless no
+# instance may be running OpenSM (see Configuration epochs).
+SAFE_SETTING_MOVES = {
+    "lease_timeout": +1,
+    "watchdog_timeout": +1,
+    "self_stop_timeout": -1,
+    "ha_period": -1,
+    "call_timeout": -1,
+}
+
+
+def unsafe_setting_moves(stored, ours):
+    """The settings, as names, that moving from stored to ours (dicts, as
+    ha_settings' JSON) would change in the unsafe direction"""
+    return sorted(
+        name
+        for name, direction in SAFE_SETTING_MOVES.items()
+        if name in stored
+        and name in ours
+        and (ours[name] - stored[name]) * direction < 0
+    )
+
+
 def ha_settings(config):
     """The settings every instance of a cluster must share, as stored"""
     import json

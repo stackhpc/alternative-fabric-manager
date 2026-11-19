@@ -159,3 +159,36 @@ def test_the_hash_covers_the_ha_settings():
     one = config_mod.Config(token="t", job_timeout=300)
     two = config_mod.Config(token="t", job_timeout=360)
     assert config_mod.config_hash(one, "k") != config_mod.config_hash(two, "k")
+
+
+def _settings(**changes):
+    return config_mod.ha_settings(config_mod.Config(token="t", **changes))
+
+
+def test_an_epoch_never_shortens_a_wait_while_a_target_may_run(lease):  # noqa: F811
+    from alternative_fabric_manager.ha import lease as lease_mod
+
+    assert lease.agree_settings(_settings(lease_timeout=30.0))
+    state = lease.read()
+    lease.acquire("a", "ua", state.term, state.counter, True)
+    # A shorter lease_timeout while a's entry is in the target set: a
+    # successor could leave a's OpenSM unconfirmed too soon.
+    with pytest.raises(lease_mod.UnsafeSettings, match="lease_timeout"):
+        lease.allow_config([A], settings=_settings(lease_timeout=20.0))
+    assert lease.epoch() is None
+    # The safe direction moves.
+    assert lease.allow_config([A], settings=_settings(lease_timeout=40.0)) == 1
+    # Once every target has left, any direction does.
+    assert lease.release("a", "ua", 1)
+    assert lease.allow_config([B], settings=_settings(lease_timeout=20.0)) == 2
+
+
+def test_unsafe_moves_are_named():
+    stored = json.loads(_settings())
+    shorter = json.loads(
+        _settings(watchdog_timeout=10.0, self_stop_timeout=25.0, job_timeout=600)
+    )
+    assert config_mod.unsafe_setting_moves(stored, shorter) == [
+        "self_stop_timeout",
+        "watchdog_timeout",
+    ]

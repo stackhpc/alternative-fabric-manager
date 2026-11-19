@@ -1000,6 +1000,16 @@ stores an epoch with the taker's hash.
   included, has that hash. The hash covers the cluster settings, so the
   nodes an epoch allows agree on them: an instance whose settings differ
   registers and heartbeats, so that its row counts, but isn't a candidate.
+  The waits of Timeouts assume every instance that may run OpenSM has the
+  same settings, so an epoch moves them only in the safe direction,
+  `lease_timeout` and `T_watchdog` not shorter, `T_self`, the period and
+  the call timeout not longer, unless the target set is empty: otherwise
+  a successor under the new settings could take over, and leave a target
+  unconfirmed, before an old leader's OpenSM is bound to have stopped. A
+  change in the unsafe direction needs every node stopped cleanly, and
+  raises an alarm meanwhile. A two-hash epoch stores the settings of the
+  node that recorded it; a node of the other hash whose settings differ
+  stays blocked until they match.
   A live row is one not marked stopped whose heartbeat moved within `T`,
   as for live candidates. So a rolling change needs no command: as each
   node is reconfigured and restarted, its hash isn't allowed and it isn't

@@ -19,6 +19,7 @@ import time
 
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
+from alternative_fabric_manager.ha import lease as lease_mod
 
 
 class OperatorError(Exception):
@@ -161,7 +162,14 @@ def allow_config(config, lease, other=None):
         hashes.append(other)
     hashes = sorted(set(hashes))
     settings = config_mod.ha_settings(config)
-    return lease.allow_config(hashes, settings=settings), hashes
+    try:
+        return lease.allow_config(hashes, settings=settings), hashes
+    except lease_mod.UnsafeSettings as e:
+        raise OperatorError(
+            f"This configuration's [ha] settings shorten a wait ({e}) while an "
+            "instance with the old ones may still run OpenSM: stop every node "
+            "cleanly, so that the target set is empty, first"
+        ) from None
 
 
 # Retiring a node (see specs/ha.md, Retiring a node)

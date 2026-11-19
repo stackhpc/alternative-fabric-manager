@@ -101,6 +101,8 @@ class Coordinator:
         self._blocked_now = False
         # Whether the reach thread runs, which alone probes reach
         self._reach_thread = False
+        # Whether the alarm for settings that may not move yet was logged
+        self._unsafe_alarmed = False
         # Whether the takeover under way may run per-port M_Keys' steps,
         # which lengthen its bound
         self._port_keys_start = False
@@ -422,11 +424,26 @@ class Coordinator:
         seen = self.lease.epoch()
         if seen is not None and self.config_hash in seen[1]:
             return False
-        number = self.lease.allow_config(
-            [self.config_hash],
-            seen=seen,
-            settings=config_mod.ha_settings(self.config),
-        )
+        try:
+            number = self.lease.allow_config(
+                [self.config_hash],
+                seen=seen,
+                settings=config_mod.ha_settings(self.config),
+            )
+        except lease_mod.UnsafeSettings as e:
+            if not self._unsafe_alarmed:
+                LOG.error(
+                    "Every live node runs configuration %s, but its [ha] "
+                    "settings shorten a wait (%s) while an instance with the "
+                    "old ones may still run OpenSM: the epoch moves only "
+                    "once the target set is empty, as after every node "
+                    "stopped cleanly",
+                    self.config_hash[:12],
+                    e,
+                )
+                self._unsafe_alarmed = True
+            return False
+        self._unsafe_alarmed = False
         if number is None:
             return False
         LOG.warning(

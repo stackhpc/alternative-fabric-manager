@@ -28,6 +28,7 @@ import secrets
 
 import sqlalchemy as sa
 
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
 
 LOG = logging.getLogger(__name__)
@@ -57,6 +58,15 @@ def _store_epoch(session, epoch, hashes):
         session.add(db.Secret(name=EPOCH, value=value))
     else:
         row.value = value
+
+
+class UnsafeSettings(Exception):
+    """An epoch's cluster settings that would shorten a wait while an
+    instance with the old settings may still run OpenSM"""
+
+    def __init__(self, names):
+        super().__init__(", ".join(names))
+        self.names = names
 
 
 class NotPrimary(Exception):
@@ -538,7 +548,10 @@ class GaleraLease:
         number, or None if seen is given, as the epoch read before, (epoch,
         hashes) or None, and the epoch has moved since. With settings, the
         recorder's [ha] settings, as JSON, are stored with it: they're in
-        its hash, so the nodes the epoch allows agree with them."""
+        its hash, so the nodes the epoch allows agree with them. Raises
+        UnsafeSettings, recording nothing, if they move a timing setting in
+        the unsafe direction while the target set isn't empty, when an
+        instance with the old settings may still run OpenSM."""
         hashes = sorted(set(hashes))
         if not 1 <= len(hashes) <= MAX_HASHES:
             raise ValueError(f"an epoch allows 1 to {MAX_HASHES} hashes")
@@ -548,10 +561,23 @@ class GaleraLease:
                 session.rollback()
                 return None
             number = (epoch[0] if epoch else 0) + 1
-            _store_epoch(session, number, hashes)
+            row = None
             if settings is not None:
                 row = session.get(db.Secret, "ha_settings", with_for_update=True)
                 ours = json.loads(settings)
+                unsafe = (
+                    config_mod.unsafe_setting_moves(json.loads(row.value), ours)
+                    if row is not None
+                    else []
+                )
+                targets = session.scalar(
+                    sa.select(sa.func.count()).select_from(db.TargetEntry)
+                )
+                if unsafe and targets:
+                    session.rollback()
+                    raise UnsafeSettings(unsafe)
+            _store_epoch(session, number, hashes)
+            if settings is not None:
                 if row is None:
                     session.add(db.Secret(name="ha_settings", value=settings))
                 else:
