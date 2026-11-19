@@ -245,17 +245,21 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         if not present:
             return None
         key = self.m_key()
+        # The key goes in the environment, never the command: a command that
+        # exits non-zero raises ContainerError, whose message is the whole
+        # command, and that was logged below, M_Key and all.
         command = [
             "sh",
             "-c",
             f"timeout {REACH_TIMEOUT} ibstat; echo ===; timeout {REACH_TIMEOUT} "
-            "ibswitches " + (f"-y {key}" if key else ""),
+            "ibswitches " + ('-y "$AFM_M_KEY"' if key else ""),
         ]
         try:
             output = self.client.containers.run(
                 image=self.config.image,
                 entrypoint=command[:2],
                 command=command[2:],
+                environment={"AFM_M_KEY": key} if key else {},
                 network_mode="host",
                 privileged=True,
                 # run()'s remove doesn't remove the image's anonymous
@@ -263,6 +267,11 @@ class HAManagedDocker(docker_driver.ManagedDocker):
                 tmpfs=self.scratch_mounts(),
                 remove=True,
             )
+        except docker.errors.ContainerError as e:
+            # Its message holds the command and its output: only the status
+            # is logged.
+            LOG.warning("Can't probe this node's reach: exit status %s", e.exit_status)
+            return None
         except docker.errors.DockerException as e:
             LOG.warning("Can't probe this node's reach: %s", e)
             return None

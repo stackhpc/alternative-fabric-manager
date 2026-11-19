@@ -152,7 +152,10 @@ hardened option. Unlike other overrides, it's checked:
   `0` is refused, because each leader must accept the others' SMs (see HA).
   The override is a cluster setting, so it is part of the configuration
   hash. Only the generated list is left out of the hash. Until HA mode
-  allows the group (see HA), it refuses the override too.
+  allows the group (see HA), it passes the override to OpenSM unchecked,
+  with a warning, as 0.3.0 did: 0.3.0's hardening doc told HA deployments
+  to set it, and refusing it would stop each upgraded node of such a
+  cluster from starting.
 
 ### Refusing a list that would lock AFM out
 
@@ -427,9 +430,11 @@ is keyed:
   from the stored seed is refused, as ha.md refuses keys other than the
   stored ones. An equal override is written as the stored value, never in
   the operator's spelling.
-- `keys()` stores the seed too, as `--show-keys` and rendering call it, so
-  the class_keys step must record whether a start stored it, for the rule
-  above.
+- Only a start stores the seed and the per-port M_Key base. Commands run
+  beside the manager, such as `--show-keys`, read them and never store a
+  missing one: the next start would otherwise find it stored, and take it
+  as held by a backup since an earlier start. The class_keys step records
+  whether a start stored the seed, for the rule above.
 
 OpenSM also caches class keys per port (`guid2vskey`, `guid2cckey`,
 `guid2_n2n_key`, beside `guid2mkey`) in `/var/cache/opensm`. If those
@@ -831,7 +836,13 @@ keys it may try is what keeps the old key from tenants:
   route's answer must match, is one an operator confirmed
   (`--confirm-fabric`) counts here, and only such a switch is routed
   through or counted by the fabric check: a Get that passes through a
-  node shows it the key. Any other row gets a tenant port's rule. While
+  node shows it the key. Any other row gets a tenant port's rule. An
+  adapter that gets OpenSM to record a link under a confirmed switch's
+  GUID can still answer on that route, so with the target on and
+  anything able to hold a derived key, a switch recorded `derived` is
+  sent only its derived key, never `m_key`, which the real switch no
+  longer needs; only this host's own port, which nothing else can answer
+  as, keeps both keys whatever its row says. While
   rows exist, `--confirm-fabric` records the GUIDs the prober found
   on its routes, following every row that answers as a switch, for the
   operator to check. Those are the switches' port 0 GUIDs, where

@@ -122,7 +122,7 @@ class FakeManagedContainer(FakeContainer):
         self.status = self.started
 
     def remove(self, force, v=False):
-        self.removed = True
+        self.removed = "with volumes" if v else True
         self.events.append("remove")
 
     def get_archive(self, path):
@@ -197,7 +197,9 @@ def test_managed_start(managed_config):
     driver = docker_driver.ManagedDocker(managed_config, client=client)
     driver.start()
 
-    assert old.removed
+    # With its anonymous volumes, or a start retried at every check leaves
+    # one behind each time.
+    assert old.removed == "with volumes"
     (kwargs,) = client.created
     assert "detach" not in kwargs
     assert client.events == ["create", "start"]

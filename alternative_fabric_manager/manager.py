@@ -111,6 +111,11 @@ def _increment(session, name):
     raise RuntimeError(f"Can't increment {name}")
 
 
+# Keys a start stores, a start before any port is keyed with them, so that
+# a backup taken between holds them
+LATE_KEYS = ("key_mgr_seed", "m_key_base")
+
+
 def _stored_key(session, name, initial=None):
     """One of the fabric's shared keys, stored as initial, or generated, if
     it's missing"""
@@ -144,6 +149,12 @@ class Manager:
         # One SQLite connection is shared by every thread, so all database
         # access is serialised.
         self._lock = threading.Lock()
+        # Whether keys() may generate the keys that a start must store before
+        # anything uses them (LATE_KEYS): only a start, never a command run
+        # beside the manager, or a command could store one that no backup
+        # holds, and the next start would take it as stored by an earlier
+        # one (specs/secured-profile.md, The seed, and A new base key).
+        self._stores_late_keys = False
         self._wakeup = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -737,7 +748,9 @@ class Manager:
 
         A missing seed is stored as the operator's override, if there is one:
         ports may already be keyed with it, set by hand before the manager
-        kept a seed (see specs/secured-profile.md, The seed).
+        kept a seed (see specs/secured-profile.md, The seed). The seed and
+        the per-port M_Key base are generated only by a start; elsewhere a
+        missing one is left out.
         """
         initial = {
             "key_mgr_seed": _canonical_seed(self.config.opensm_conf.get("key_mgr_seed"))
@@ -745,10 +758,14 @@ class Manager:
         for attempt in range(2):
             with self._lock, self.sessionmaker() as session:
                 try:
-                    keys = {
-                        name: _stored_key(session, name, initial.get(name))
-                        for name in opensm_conf.KEYS
-                    }
+                    keys = {}
+                    for name in opensm_conf.KEYS:
+                        if name in LATE_KEYS and not self._stores_late_keys:
+                            secret = session.get(db.Secret, name)
+                            if secret is not None:
+                                keys[name] = secret.value
+                            continue
+                        keys[name] = _stored_key(session, name, initial.get(name))
                     session.commit()
                 except sa.exc.IntegrityError:
                     # Another instance stored a key first, which surfaces at
@@ -917,6 +934,7 @@ class Manager:
         # since _keep_seed stores every missing key, the base too.
         base_kept = self._base_stored()
         seed_kept = self._seed_stored()
+        self._stores_late_keys = True
         self.port_keeper.refuse_start()
         self.class_keys.refuse_start(seed_kept)
         self._keep_seed()

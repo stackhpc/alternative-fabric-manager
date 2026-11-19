@@ -290,6 +290,12 @@ class PortKeeper:
         """The M_Key OpenSM uses with per-port keys off, and the base, as
         integers"""
         keys = self.manager.keys()
+        if "m_key_base" not in keys:
+            # Only a start stores it (Manager.keys)
+            raise PortKeysError(
+                "The per-port M_Key base isn't stored yet: start the manager "
+                "once, and back up its database, first"
+            )
         m_key = self.manager._key("m_key") or keys["m_key"]
         return port_keys.parse_key(m_key), port_keys.parse_key(keys["m_key_base"])
 

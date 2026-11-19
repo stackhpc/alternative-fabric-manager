@@ -252,12 +252,16 @@ class Config:
 
     @property
     def allowed_sm_in_effect(self):
-        """Whether OpenSM gets an allowed_sm_guids list: the group named, or
-        the option overridden, which gets the group's checks too"""
-        return (
-            "allowed_sm" in self.hardening_groups
-            or "allowed_sm_guids" in self.opensm_conf
-        )
+        """Whether the manager works out and checks OpenSM's
+        allowed_sm_guids list: the group named, or, in single node, the
+        option overridden, which gets the group's checks too
+
+        In HA mode an override is passed to OpenSM unchecked, as 0.3.0 did
+        and its docs told HA deployments to set it: refusing it would stop
+        each upgraded node of such a cluster from starting."""
+        if "allowed_sm" in self.hardening_groups:
+            return True
+        return "allowed_sm_guids" in self.opensm_conf and not self.ha
 
     @property
     def partitions_file(self):
@@ -457,6 +461,12 @@ class Config:
                 "[opensm_conf] allowed_sm_guids must be 0, or port GUIDs (0x "
                 "and up to 16 hex digits, not 0) separated by commas: OpenSM "
                 "would otherwise disable the list"
+            )
+        if self.ha and "allowed_sm_guids" in self.opensm_conf:
+            LOG.warning(
+                "[opensm_conf] allowed_sm_guids is passed to OpenSM unchecked in "
+                "HA mode: it must list every node's physical ports, or a "
+                "takeover's OpenSM may be ignored or refuse to run"
             )
         if not self.allowed_sm_in_effect:
             return
@@ -717,12 +727,12 @@ def _ha_problems(config):
         )
     # HA needs node rows with port GUIDs, configuration epochs, the managed
     # node SM rule and the fence ask first (specs/secured-profile.md,
-    # Allowed SM GUIDs, HA). A list typed by hand gets the group's rules, so
-    # it's refused too.
-    if config.allowed_sm_in_effect:
+    # Allowed SM GUIDs, HA). A list typed by hand is passed on unchecked, as
+    # in 0.3.0 (see Config.allowed_sm_in_effect).
+    if "allowed_sm" in config.hardening_groups:
         problems.append(
-            "[opensm] hardening can't include allowed_sm, nor [opensm_conf] "
-            "set allowed_sm_guids: allowed SMs aren't supported in HA mode yet"
+            "[opensm] hardening can't include allowed_sm: allowed SMs aren't "
+            "supported in HA mode yet"
         )
     return problems
 

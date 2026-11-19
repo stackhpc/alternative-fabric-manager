@@ -569,7 +569,7 @@ def is_infrastructure(port, own_guid):
     return port.guid == own_guid or port.switch is True
 
 
-def keys_to_try(holds, target_on, infrastructure, nothing_derived):
+def keys_to_try(holds, target_on, infrastructure, nothing_derived, own_port=False):
     """Which keys the prober may send a port, in order: "derived" and
     "m_key"
 
@@ -587,11 +587,20 @@ def keys_to_try(holds, target_on, infrastructure, nothing_derived):
     tries its derived key first. So with the target on, a tenant's port
     recorded derived or unknown is never sent m_key once anything can hold
     a derived key.
+
+    A switch is trusted by the GUID on its route, which an adapter that got
+    OpenSM to record a link under a confirmed switch's GUID can claim. So
+    with the target on and anything able to hold a derived key, a switch
+    recorded derived isn't sent m_key either: the real one never needs it
+    then. Only this host's own port (own_port), which nothing else can
+    answer as, keeps both keys whatever its row says.
     """
     if holds not in HOLDS:
         raise ValueError(f"holds must be one of {', '.join(HOLDS)}")
     if infrastructure:
         allowed = {DERIVED, M_KEY}
+        if not own_port and target_on and not nothing_derived and holds == DERIVED:
+            allowed = {DERIVED}
     else:
         allowed = set()
         if target_on or holds == DERIVED:

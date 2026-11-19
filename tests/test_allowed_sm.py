@@ -144,11 +144,24 @@ def _ha_config(**kwargs):
 def test_ha_refuses_allowed_sm():
     config = _ha_config(hardening="all, allowed_sm")
     assert any("allowed SMs" in p for p in config_mod._ha_problems(config))
-    config = _ha_config(opensm_conf={"allowed_sm_guids": "0x1"})
-    assert any("allowed SMs" in p for p in config_mod._ha_problems(config))
     assert not any(
         "allowed SMs" in p for p in config_mod._ha_problems(_ha_config(hardening="all"))
     )
+
+
+def test_ha_passes_a_hand_typed_list_on_unchecked_as_0_3_0_did(caplog):
+    # 0.3.0's docs told HA deployments to set it: refusing it would stop
+    # every upgraded node of such a cluster.
+    config = _ha_config(opensm_conf={"allowed_sm_guids": "0x1,0x2"})
+    assert not any("allowed SMs" in p for p in config_mod._ha_problems(config))
+    assert not config.allowed_sm_in_effect
+    config._validate_allowed_sm()
+    assert "passed to OpenSM unchecked" in caplog.text
+    content = opensm_conf.render(config.opensm_conf)
+    assert "allowed_sm_guids 0x1,0x2" in content
+    # A single node still gives it the group's checks.
+    single = config_mod.Config(token="x", opensm_conf={"allowed_sm_guids": "0x1"})
+    assert single.allowed_sm_in_effect
 
 
 # Rendering
@@ -637,6 +650,10 @@ def sm_manager(sm_config, sm_driver, monkeypatch):
     with manager.sessionmaker() as session:
         session.add(db.ExpectedSwitch(guid=f"{SWITCH:016x}"))
         session.commit()
+    # The keys a start stores, as an earlier start would have
+    manager._stores_late_keys = True
+    manager.keys()
+    manager._stores_late_keys = False
     # Another master in the SA's records is judged as before: these tests
     # are about SMs OpenSM ignores, which the SA doesn't list.
     sm_driver.fabric_result = Fabric({SWITCH}, [(OWN_A, 3)], {OWN_A, OWN_B})

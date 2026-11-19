@@ -154,7 +154,10 @@ def test_reach_counts_switches_from_a_port_that_is_up(driver):
     driver.m_key = lambda: "0x1"
     driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
     assert driver.reach() == 1
-    assert "-y 0x1" in " ".join(driver.client.runs[-1]["command"])
+    run = driver.client.runs[-1]
+    # The key in the environment, never on the command
+    assert '-y "$AFM_M_KEY"' in " ".join(run["command"])
+    assert run["environment"] == {"AFM_M_KEY": "0x1"}
 
 
 def test_reach_is_none_when_the_port_is_down(driver):
@@ -272,3 +275,32 @@ def test_start_fails_rather_than_pull_a_missing_image(driver):
     assert driver.client.created == []
     # Not eligible again on the reach cached before the image went
     assert driver.reach() is None
+
+
+def test_reach_leaves_no_anonymous_volumes(driver):
+    # run()'s remove leaves the image's anonymous volumes, one set per
+    # probe, every few seconds: they filled a host's Docker disk.
+    driver.reach()
+    run = driver.client.runs[-1]
+    assert run["tmpfs"] == {"/var/cache/opensm": "", "/var/log": ""}
+
+
+def test_a_failed_reach_probe_never_logs_the_m_key(driver, caplog):
+    # A command that exits non-zero raises ContainerError, whose message is
+    # the whole command: with the key on it, every failed probe logged it.
+    key = "0x5ec12e7000c0ffee"
+    driver.m_key = lambda: key
+
+    def run(**kwargs):
+        driver.client.runs.append(kwargs)
+        raise ha_docker.docker.errors.ContainerError(
+            "probe", 1, kwargs["command"], kwargs["image"], b"ibwarn: timeout"
+        )
+
+    driver.client.run = run
+    assert driver.reach() is None
+    (kwargs,) = driver.client.runs
+    assert key not in " ".join(kwargs["command"])
+    assert kwargs["environment"] == {"AFM_M_KEY": key}
+    assert "exit status 1" in caplog.text
+    assert "c0ffee" not in caplog.text

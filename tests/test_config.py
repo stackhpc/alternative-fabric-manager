@@ -155,21 +155,43 @@ def test_show_keys(tmp_path, capsys):
     )
     cli.main(["--config-file", str(path), "--show-keys"])
     first = capsys.readouterr().out
+    # Only a start stores the seed and the base (test_show_keys_stores_no_
+    # late_key), so a fresh database has neither yet.
     assert [line.split()[0] for line in first.splitlines()] == [
+        "m_key",
+        "sm_key",
+        "sa_key",
+    ]
+    cli.main(["--config-file", str(path), "--show-keys"])
+    assert capsys.readouterr().out == first
+    _start_once(path)
+    cli.main(["--config-file", str(path), "--show-keys"])
+    assert [line.split()[0] for line in capsys.readouterr().out.splitlines()] == [
         "m_key",
         "sm_key",
         "sa_key",
         "key_mgr_seed",
         "m_key_base",
     ]
-    cli.main(["--config-file", str(path), "--show-keys"])
-    assert capsys.readouterr().out == first
 
 
-def test_show_keys_doesnt_record_a_start(tmp_path):
-    # --show-keys may store the per-port M_Key base, but it isn't a start:
-    # only a start records whether the base was stored before it, and the
-    # first start after --show-keys stored it finds it stored.
+def _start_once(path):
+    """Start and stop a manager with the configuration at path, as a
+    deployment's first start would"""
+    from alternative_fabric_manager import db, drivers
+    from alternative_fabric_manager import manager as manager_mod
+
+    config = config_mod.Config.load(str(path))
+    sessionmaker = db.make_sessionmaker(config.database_url)
+    manager = manager_mod.Manager(config, sessionmaker, drivers.NoOpenSM())
+    manager.start()
+    manager.stop()
+
+
+def test_show_keys_stores_no_late_key(tmp_path):
+    # A command beside the manager mustn't store the seed or the per-port
+    # M_Key base: the next start would find it stored, and take it as held
+    # by a backup since an earlier start, which it may not be.
     from alternative_fabric_manager import cli, db, drivers
     from alternative_fabric_manager import manager as manager_mod
 
@@ -183,9 +205,13 @@ def test_show_keys_doesnt_record_a_start(tmp_path):
     config = config_mod.Config.load(str(path))
     sessionmaker = db.make_sessionmaker(config.database_url)
     with sessionmaker() as session:
-        assert session.get(db.Secret, "m_key_base") is not None
+        assert session.get(db.Secret, "m_key_base") is None
+        assert session.get(db.Secret, "key_mgr_seed") is None
         assert session.get(db.State, manager_mod.BASE_KEPT) is None
     manager = manager_mod.Manager(config, sessionmaker, drivers.NoOpenSM())
+    manager.start()
+    manager.stop()
+    # The first start stored it, so it isn't kept yet; the next start is.
     assert not manager.base_kept()
     manager.start()
     manager.stop()
@@ -193,18 +219,15 @@ def test_show_keys_doesnt_record_a_start(tmp_path):
 
 
 def _seed_override_conf(tmp_path):
-    # A seed that isn't the one the manager stores: a random seed is stored
-    # first, then the configuration overrides it.
-    from alternative_fabric_manager import cli
-
+    # A seed that isn't the one the manager stores: a start stores a random
+    # seed first, then the configuration overrides it.
     path = tmp_path / "afm.conf"
     text = (
         f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
         f"[opensm]\ndriver = none\nconfig_dir = {tmp_path}\n"
     )
     path.write_text(text)
-    with contextlib.redirect_stdout(io.StringIO()):
-        cli.main(["--config-file", str(path), "--show-keys"])
+    _start_once(path)
     path.write_text(text + "[opensm_conf]\nkey_mgr_seed = 0x1\n")
     return path
 
@@ -512,11 +535,22 @@ def test_port_verify_interval_must_be_positive(tmp_path, value):
 
 
 def _per_port_conf(tmp_path, hardening="all, m_key_per_port", extra=""):
+    from alternative_fabric_manager import db, drivers
+    from alternative_fabric_manager import manager as manager_mod
+
     path = tmp_path / "afm.conf"
     path.write_text(
         f"[api]\ntoken = x\n[database]\ndatabase = {tmp_path}/afm.sqlite\n"
         f"[opensm]\nconfig_dir = {tmp_path}\nhardening = {hardening}\n{extra}"
     )
+    # The keys a start stores, as the manager's first start of this release
+    # would have before an operator runs these commands
+    config = config_mod.Config.load(str(path))
+    manager = manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
+    )
+    manager._stores_late_keys = True
+    manager.keys()
     return path
 
 

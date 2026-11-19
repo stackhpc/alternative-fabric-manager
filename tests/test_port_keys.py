@@ -567,7 +567,11 @@ KEYS_TO_TRY = [
         )
         for target in (True, False)
         for nothing in (True, False)
+        if (holds, target, nothing) != (DERIVED, True, False)
     ],
+    # A switch recorded derived once anything can be: never m_key, which an
+    # adapter claiming the switch's GUID on its route could read
+    (DERIVED, True, True, False, (DERIVED,)),
     (M_KEY, True, False, False, (M_KEY, DERIVED)),
     (DERIVED, True, False, False, (DERIVED,)),
     (UNKNOWN, True, False, False, (DERIVED,)),
@@ -591,6 +595,14 @@ def test_the_table_covers_every_combination():
 @pytest.mark.parametrize("holds, target_on, infra, nothing, keys", KEYS_TO_TRY)
 def test_keys_to_try_follows_the_probers_rule(holds, target_on, infra, nothing, keys):
     assert port_keys.keys_to_try(holds, target_on, infra, nothing) == keys
+
+
+def test_this_hosts_own_port_keeps_both_keys():
+    # Nothing else can answer as it, so it's sent both whatever its row says.
+    assert port_keys.keys_to_try(DERIVED, True, True, False, own_port=True) == (
+        DERIVED,
+        M_KEY,
+    )
 
 
 @pytest.mark.parametrize("holds", [DERIVED, UNKNOWN])

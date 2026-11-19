@@ -566,9 +566,13 @@ def test_the_base_is_kept_from_the_next_start(manager, config):
     assert manager.base_kept()
 
 
-def test_the_base_kept_before_the_first_start(manager, config):
-    # --show-keys stored it: the first start finds it stored.
-    manager.keys()
+def test_keys_before_the_first_start_dont_store_the_base(manager, config):
+    # As --show-keys calls it: only a start stores the base and the seed, so
+    # the first start still stores it, and isn't one that kept it.
+    keys = manager.keys()
+    assert "m_key_base" not in keys and "key_mgr_seed" not in keys
+    manager.start()
+    manager.stop()
     assert not manager.base_kept()
     manager.start()
     manager.stop()
@@ -696,12 +700,15 @@ def test_a_seed_override_on_a_fresh_database_is_stored(manager, config, reloader
         assert "key_mgr_seed 0x0000000000000001" in f.read().splitlines()
 
 
-def test_show_keys_stores_the_override_too(manager, config):
+def test_show_keys_stores_no_seed_for_an_override(manager, config):
     # --show-keys before the first start mustn't store a random seed that the
-    # start would then refuse the override for.
+    # start would then refuse the override for: it stores no seed at all,
+    # and the start stores the override.
     config.opensm_conf = {"key_mgr_seed": "18"}
+    assert "key_mgr_seed" not in manager.keys()
+    manager.start()
+    manager.stop()
     assert manager.keys()["key_mgr_seed"] == "0x0000000000000012"
-    manager._keep_seed()
 
 
 def test_a_key_stored_meanwhile_is_read_back(manager, monkeypatch):

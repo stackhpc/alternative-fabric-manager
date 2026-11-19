@@ -271,6 +271,9 @@ def main(argv=None):
                 f"alternative-fabric-manager: can't confirm the fabric: {e} "
                 "(no switch was confirmed)"
             )
+        except port_keeper.PortKeysError as e:
+            # Such as the base not yet stored by a start
+            sys.exit(f"alternative-fabric-manager: can't confirm the fabric: {e}")
         if not confirmation.switches:
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in confirmation.switches:

@@ -562,8 +562,11 @@ class ManagedDocker(DockerReloader):
             stop.wait(interval)
 
     def _remove(self):
+        # With its anonymous volumes: one for each volume of the image that
+        # [opensm] volumes doesn't name, which a start retried at every
+        # check would otherwise leave behind each time.
         with contextlib.suppress(docker.errors.NotFound):
-            self.client.containers.get(self.container_name).remove(force=True)
+            self.client.containers.get(self.container_name).remove(force=True, v=True)
 
     def scratch_mounts(self):
         """A tmpfs over each volume OpenSM's image declares (/var/log and
@@ -573,11 +576,9 @@ class ManagedDocker(DockerReloader):
         volume, which removing the container leaves behind unless asked:
         a helper run every few seconds, as the reach probe is, filled a
         host's Docker disk with them. A tmpfs leaves nothing, however the
-        container ends."""
-        try:
-            image = self.client.images.get(self.config.image)
-        except docker.errors.DockerException:
-            return {}
+        container ends. Raises DockerException if the image can't be read,
+        rather than run the helper with nothing over its volumes."""
+        image = self.client.images.get(self.config.image)
         config = (getattr(image, "attrs", None) or {}).get("Config") or {}
         return {path.rstrip("/") or "/": "" for path in config.get("Volumes") or {}}
 

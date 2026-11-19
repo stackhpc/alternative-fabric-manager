@@ -579,7 +579,11 @@ class _Verify:
             # one first. m_key is the same for every candidate, so it's
             # sent once.
             for name in port_keys.keys_to_try(
-                self._row(guid).holds, self.target_on, True, self.nothing_derived
+                self._row(guid).holds,
+                self.target_on,
+                True,
+                self.nothing_derived,
+                own_port=True,
             ):
                 key = self._key(name, guid)
                 if key is None or key in tried:

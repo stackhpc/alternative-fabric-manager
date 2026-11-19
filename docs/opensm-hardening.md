@@ -437,7 +437,10 @@ to tenants, and ports whose link layer isn't InfiniBand. Choose it with
 digits, separated by commas, and the manager writes it in its own
 spelling. An override puts the list in effect even without the group, with
 the same rules: a list typed by hand, as earlier versions of this doc
-suggested, is now checked, and HA mode refuses it.
+suggested, is now checked in single-node mode. In HA mode it's passed to
+OpenSM unchecked, with a warning, as before 0.4.0: it must list every
+node's physical ports, or a takeover's OpenSM may be ignored or refuse to
+run.
 
 Before every start, the manager refuses to start OpenSM, logs "Not
 starting OpenSM: ...", and tries again at every `[opensm] check_interval`,
@@ -815,8 +818,8 @@ start must be one someone chose. So:
 1. **Agree it** with whoever shares the fabric.
 2. **Name the group and restart the manager.** That only permits per-port
    M_Keys: OpenSM runs as before, with the shared `m_key`. The first start
-   of a release with this group stores `m_key_base`, whatever the groups,
-   and so does `--show-keys`, which stores any missing key; a start that
+   of a release with this group stores `m_key_base`, whatever the groups
+   (`--show-keys` and the other commands never store it); a start that
    stored it can't arm the turn-on. The manager starts recording the
    fabric's ports and links from OpenSM's cache at every fabric check, and
    from then on the fabric check, job completion and the sweeps follow the

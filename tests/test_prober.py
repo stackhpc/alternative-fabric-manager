@@ -518,13 +518,26 @@ def test_rule5_a_row_not_known_to_be_a_switch_isnt_infrastructure():
 
 
 def test_rule5_switches_get_both_keys():
+    # A switch whose row isn't derived, or with the target off: both keys
+    for holds, target_on in ((UNKNOWN, True), (DERIVED, False)):
+        sim = fabric()
+        sim.ports[S1].key = M
+        result = check(sim, rows=sim.rows(holds={S1: holds}), target_on=target_on)
+        assert sim.keys_sent(S1)[:4] == [derived(S1)] * 2 + [M, M]
+        assert result.ports[S1].holds == M_KEY
+        # Its ports' link states are asked with the key it answered.
+        assert all(key == M for to, key, _attr, port in sim.sent if to == S1 and port)
+
+
+def test_rule5_a_derived_switch_isnt_sent_m_key_once_keys_are_on():
+    # An adapter claiming a confirmed switch's GUID on its route could
+    # answer: with the target on and anything derived, a switch recorded
+    # derived gets only its derived key, which the real one holds.
     sim = fabric()
     sim.ports[S1].key = M
     result = check(sim, rows=sim.rows(holds={S1: DERIVED}))
-    assert sim.keys_sent(S1)[:4] == [derived(S1)] * 2 + [M, M]
-    assert result.ports[S1].holds == M_KEY
-    # Its ports' link states are asked with the key it answered.
-    assert all(key == M for to, key, _attr, port in sim.sent if to == S1 and port)
+    assert set(sim.keys_sent(S1)) == {derived(S1)}
+    assert S1 not in result.keyed
 
 
 def test_rule5_no_derived_key_without_a_base():
@@ -563,7 +576,7 @@ def test_rule5_property_every_key_sent_is_allowed():
             row = rows[guid]
             infrastructure = port_keys.is_infrastructure(row, OWN)
             allowed = port_keys.keys_to_try(
-                row.holds, target_on, infrastructure, nothing
+                row.holds, target_on, infrastructure, nothing, own_port=guid == OWN
             )
             values = [M if name == M_KEY else derived(guid) for name in allowed]
             sent = sim.keys_sent(guid)
@@ -791,7 +804,8 @@ def test_trust_a_switch_whose_node_guid_differs_is_trusted_by_its_port_guid():
     sim = fabric()
     sim.ports[S1].node_guid = 0x0EC0D9A0300B12560
     sim.ports[S1].key = M
-    rows = sim.rows(holds={S1: DERIVED})
+    # Unknown, which a tenant's port would be sent only its derived key for
+    rows = sim.rows(holds={S1: UNKNOWN})
     result = check(sim, rows=rows, trusted_switches=CONFIRMED)
     # Infrastructure: both keys, so it answers the one it holds
     assert S1 in result.keyed and result.ports[S1].holds == M_KEY
