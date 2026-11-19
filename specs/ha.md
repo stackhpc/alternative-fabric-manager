@@ -73,11 +73,13 @@ would stop itself. The deployment role checks this.
 | `networks` | Network ID, type, pkey (unique, NULL for flat networks), name, the highest revision it was set at (see Late requests) |
 | `ports` | Port ID, network (foreign key), GUID (unique), host, the highest revision it was set at |
 | `tombstones` | Deleted objects' kind, ID, the highest revision they were set at and were deleted at, and the deletion time, for 7 days (see Late requests) |
-| `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration) |
+| `state` | The `generation` counter; the schema version; the configuration epoch, the configuration hashes it allows, and the cluster settings (see Configuration); the leader fence, the highest term whose leader has written the secured profile's records (see The secured profile) |
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), when leadership last moved, and the **freeze**: whether it is frozen, the frozen leader's node, instance UUID and term, who froze it, when, and when it expires (see Freeze) |
-| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs, and whether its OpenSM is verified stopped (see Fencing, Rejoining) |
-| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
+| `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs, its physical functions' port GUIDs (see The secured profile), and whether its OpenSM is verified stopped (see Fencing, Rejoining) |
+| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, the last fabric check's result and time, and the `allowed_sm_guids` list the leader's OpenSM runs with, if any |
+| `known_sm_ports` | Port GUIDs whose SMs may hold the fabric's keys: every port GUID a node row has recorded, kept when the node is forgotten, and those an operator recorded |
+| `fabric_ports`, `fabric_links` | Per-port M_Keys' records: each port's key state, never a key, and the links OpenSM's cache listed (see specs/secured-profile.md, Per-port M_Keys) |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
 | `deferred` | A request whose pkey or GUID another object still holds, or a port on a network that waits or is quarantined, its values, revision and job |
@@ -244,7 +246,9 @@ instance adds itself to the target set before it can know, so a successor
 waits for it as for any target.
 
 A candidate's configuration hash must be one the current configuration
-epoch allows, and its OpenSM must be verified stopped.
+epoch allows, and its OpenSM must be verified stopped. While `allowed_sm`
+is in effect it also needs port GUIDs in its node row, and one outside
+the running list waits (see The secured profile).
 
 The lease's exclusion sits behind a small coordination driver interface:
 acquire it, renew it, release it, and watch it for expiry. Every driver
@@ -480,10 +484,10 @@ The **fabric checks** run after every sweep and every `check_interval`:
 - **No other subnet manager that matters:** the leader looks at the SMs
   its own SA knows, by their SMInfo records, and OpenSM's log since the last
   check, and sorts them by port GUID and by where they sit:
-  - another managed node's SM, one whose port GUID is one of a managed
-    node's adapters', fails the check, and the leader asks it to stop, as in
-    Fencing, step 1, and raises an alarm, since it may have the fabric's
-    keys;
+  - another managed node's SM, one whose port GUID is in another node
+    row's port GUIDs, fails the check, whatever its state, and the leader
+    asks it to stop, as in Fencing, step 1, and raises an alarm, since it
+    may have the fabric's keys;
   - an unknown SM, such as one a bare metal tenant runs, fails the check
     only if it is master or the leader's OpenSM went to STANDBY. Without the
     SM_Key and M_Key, which HA mode requires (see Fencing, Required keys),
@@ -603,11 +607,17 @@ Its row stays, and nothing acts on it. A frozen leader's node needs an
 unfreeze first (see Freeze). A node that dies uncleanly instead stops
 counting as live once its heartbeat has been unchanged for `T`, and its
 target entry, if it has one, leaves at the next takeover, as in
-Fencing. There is no command to forget a node's row: nothing reads its
-adapters' GUIDs or configuration hash yet. One comes with the checks that
-will read them, managed nodes' SMs in the fabric checks and configuration
-epochs, since a retired node's adapters, reused elsewhere, would then
-count as a managed node's.
+Fencing.
+
+A retired node's row still counts: its port GUIDs are in the
+`allowed_sm_guids` list, and an SM on them is another managed node's (see
+Job completion). `--forget-node <name>` removes the row. It is refused for
+a node in the target set, and for one whose heartbeat moved within `T`
+unless its row is marked stopped: the command reads the heartbeat, waits
+`T`, and reads it again. The node's port GUIDs stay among the known SM
+ports, since its files still hold the keys; `--drop-sm-port` drops one
+once its adapter is no longer in a host with the keys. The running list
+keeps the node until the next takeover renders a new one.
 
 ### Seeing the host's processes
 
@@ -628,6 +638,10 @@ level 1 or more, and OpenSM has a generated SM_Key: the `m_key` and
 win a handover, and step 1 has no key to authenticate with. The keys are
 then in Galera and its backups, as well as in OpenSM's files and log, so
 the backups need the same protection.
+
+The secured profile's other groups, `allowed_sm`, `class_keys`, `sa_rate`
+and `m_key_per_port`, are allowed in HA mode as experimental: untested on
+hardware there, and outside `all` (see The secured profile).
 
 ## The watchdog
 
@@ -812,7 +826,7 @@ when:
 - OpenSM exits;
 - its configuration is no longer allowed, and a live candidate with an
   allowed configuration exists; otherwise it keeps leading and raises an
-  alarm;
+  alarm (see Configuration epochs);
 - a loop overruns its bound: it stops OpenSM, verifies, and releases the
   lease if it can;
 - its fabric checks fail to answer, or OpenSM fails to answer them, for
@@ -943,28 +957,97 @@ networks.
 
 ### Configuration epochs
 
-The configuration's hash covers everything that decides the partitions and
-how OpenSM protects the fabric: the template, `default_partition`,
+The **configuration hash** covers everything that decides the partitions
+and how OpenSM protects the fabric: the template, `default_partition`,
 `flat_pkey`, `shared_default_partition`, the IPoIB settings, the hardening
-groups, `key_lease_period`, the keys, and the `opensm.conf` overrides, except
-node-specific ones,
-such as the port GUID OpenSM binds to, and paths. The cluster settings, the
-lease and job timeouts among them, are stored in Galera, not in each
-instance's configuration. The hash is stored with an epoch, which allows one
-hash, or two during a rolling change. Only an instance whose hash is
-allowed may become leader; a leader whose hash is no longer allowed steps
-down, once a candidate whose hash is allowed is live. A change is applied by
-moving the leadership:
+groups as resolved (so a release that adds a group to `all` changes it),
+`key_lease_period`, and the `opensm.conf` overrides. It leaves out:
 
-- **Rolling changes** are an allowlist in code: `sweep_interval`, routing
-  and logging. The operator records a new epoch that allows both hashes,
-  updates the candidates, then has the leader release the lease, as for an
-  upgrade, and updates it, then records an epoch with only the new hash.
-- **Everything else** is fabric-affecting, the keys included. The operator
-  updates the candidates, then records an epoch with only the new hash, so
-  that the leader steps down and an updated candidate takes over. Changing a
-  key needs a key rotation procedure, which is future work: until then the
-  manager refuses to start with keys other than the stored ones.
+- **node-specific options**, such as `guid`, the port OpenSM binds to, and
+  paths, which differ between nodes by design;
+- **rolling options**, an allowlist in code: `sweep_interval`, the routing
+  options (`routing_engine` and the like) and the logging options. A change
+  to them moves no protection, so it needs no epoch: roll it out as an
+  upgrade;
+- **generated values**: the keys, which every instance reads from Galera,
+  and the generated `allowed_sm_guids` list. A key or list set in
+  `[opensm_conf]` is an override, and is covered.
+
+The hash is an HMAC-SHA256 of the canonical JSON of those settings, keyed
+by a random secret stored in Galera beside the keys, so that a hash, which
+`--config-epoch` prints, doesn't let anyone test guesses of an overridden
+key. Each instance records its hash in its node row at registration.
+
+The **epoch** is stored in Galera: a number and the hashes it allows, one,
+or two during a change. `--config-epoch` prints it, with each node's hash
+and whether it's allowed. `--allow-config [<hash>]` records a new epoch
+that allows the hash of the configuration it runs with, and the given one
+if any. While no epoch is stored, as after an upgrade from a release
+without them, every hash is allowed, and the takeover's compare-and-set
+stores an epoch with the taker's hash.
+
+- **Only an instance whose hash is allowed is a candidate.** A candidate
+  whose hash isn't allowed stays registered and heartbeats, and logs an
+  alarm, once per epoch.
+- **A leader whose hash is no longer allowed steps down**, once a live
+  candidate whose hash is allowed exists, as a discretionary trigger (see
+  Stepping down). Otherwise it keeps leading, and raises an alarm.
+
+A fabric-affecting change is applied by moving the leadership: update the
+candidates' configuration, run `--allow-config` on one of them, which
+records an epoch with only the new hash, and the leader steps down for an
+updated candidate. To change one node at a time with the old leader kept
+meanwhile, record an epoch with both hashes first (`--allow-config <old
+hash>`), then one with the new hash only. Changing a key needs a key
+rotation procedure, which is future work: until then the manager refuses
+to start with keys other than the stored ones.
+
+A release that changes what the hash covers changes every node's hash.
+Its release notes say so: before upgrading, record an epoch with both the
+old hash and the new one, which an upgraded candidate prints with
+`--config-epoch`.
+
+### The secured profile
+
+The groups specs/secured-profile.md adds, beyond `m_key` and `sm_key`, are
+allowed in HA mode as experimental, as that spec's HA mode section
+describes. In summary:
+
+- **The leader fence.** The records those groups keep in Galera (per-port
+  M_Keys' rows and state, the class keys' turn-off record, whether a start
+  found the per-port M_Key base stored) are written only by the leader,
+  each transaction first doing a compare-and-set on the leader fence: it
+  raises the fence to its own term, and fails if the fence is above it.
+  A takeover raises the fence before OpenSM starts, so a deposed leader's
+  late writes fail. Operators' commands write without it, as they do in
+  single node, since they change only what their operation names.
+- **Node port GUIDs.** Every instance probes its host's physical
+  InfiniBand ports, as `allowed_sm`'s probe does, at registration and then
+  at every reach refresh until a probe succeeds, and records them in its
+  node row, and among the known SM ports, in one transaction. A probe
+  that fails or finds no port changes nothing.
+- **`allowed_sm`.** The list is the union of the node rows' port GUIDs; an
+  override must contain all of them, and can't be `0`. While the list is
+  in effect, a node without port GUIDs isn't a candidate, and a leader
+  refuses to start OpenSM while another target's node row has none. The
+  running list is recorded in `applied`. A candidate outside it may take
+  the lease only when the lease was released, or every other target has
+  verified its stop, never by an unconfirmed takeover, and isn't eligible
+  while a live candidate inside it is. A list change takes effect at the
+  next takeover; the leader raises an alarm while a live node with port
+  GUIDs is outside its running list.
+- **`m_key_per_port`.** The leader keeps the rows as the single-node
+  manager does. A takeover renders OpenSM's cache from the rows, never
+  from what its host's cache volume holds, which an older term left. The
+  start request's hashes cover the rendered cache files as well as
+  `opensm.conf` and `partitions.conf`, and are written once they're
+  rendered. The reach probe uses the prober along the recorded links,
+  with each port's key, rather than `ibswitches` with one key. The
+  takeover bound allows for the verify before the start and the turn-on's
+  success rule.
+- **`class_keys` and `sa_rate`** need nothing beyond the leader fence:
+  the seed is in Galera, so every leader derives the same keys, which
+  hardware test 3's second-host run checks.
 
 ## Galera specifics
 
@@ -1130,10 +1213,13 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       version, cluster settings agreed by every instance,
       `wsrep_sync_wait = 7`, UTC timestamps, the generation bump first in
       every request, and 64-bit counters.
-- [ ] Configuration epochs: each instance records its configuration's
-      hash, but nothing yet reads it, so a leader whose configuration isn't
-      allowed doesn't step down (see Configuration epochs); with a CLI to
-      record an epoch.
+- [x] Configuration epochs: the hash in each node row, the epoch in
+      Galera, candidates and step-downs by it, `--config-epoch` and
+      `--allow-config`.
+- [x] The secured profile's groups in HA mode, experimental: the leader
+      fence, node port GUIDs, `--forget-node`, and each group as The
+      secured profile says. Their hardware runs in HA mode are still to
+      come.
 - [ ] Retry deadlocks and constraint races in the request path, as Galera's
       certification conflicts and two instances racing for a pkey or GUID
       raise them: today they are answered 500, which networking-mlnx
@@ -1170,9 +1256,9 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 - [x] A CLI to confirm the expected switches, `--confirm-fabric`, which
       also drops one that died.
 - [ ] A CLI to force a step-down.
-- [ ] With the managed-SM fabric check and configuration epochs, a
-      command to forget a retired node's row, and the nodes in `--status`
-      (see Retiring a node).
+- [x] The managed-SM fabric check, by node rows' port GUIDs, and
+      `--forget-node` (see Retiring a node).
+- [ ] The nodes in `--status`.
 - [x] Tests: the failover suite, three instances against a three-node
       Galera cluster in containers with a fake OpenSM under the real
       watchdog, with faults injected and a monitor that no two OpenSMs ever

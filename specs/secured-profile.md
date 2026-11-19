@@ -151,11 +151,12 @@ hardened option. Unlike other overrides, it's checked:
   which are the known SM ports of nodes that haven't been forgotten, and
   `0` is refused, because each leader must accept the others' SMs (see HA).
   The override is a cluster setting, so it is part of the configuration
-  hash. Only the generated list is left out of the hash. Until HA mode
-  allows the group (see HA), it passes the override to OpenSM unchecked,
-  with a warning, as 0.3.0 did: 0.3.0's hardening doc told HA deployments
-  to set it, and refusing it would stop each upgraded node of such a
-  cluster from starting.
+  hash. Only the generated list is left out of the hash. Releases before
+  HA mode allowed the group passed the override to OpenSM unchecked, as
+  0.3.0 did, whose hardening doc told HA deployments to set it. Now it's
+  checked: an upgraded cluster whose hand-typed list leaves out a node's
+  port refuses to start OpenSM there, with an alarm naming the port, and
+  the release notes say so.
 
 ### Refusing a list that would lock AFM out
 
@@ -268,16 +269,13 @@ every leader's list contains every other node's ports, so:
 - a resumed old leader's OpenSM sees the new one, and the new one sees it,
   as the election and the fabric check expect.
 
-`allowed_sm` in HA mode depends on parts of specs/ha.md that aren't
-implemented yet. HA mode refuses the group until all of these are in:
-
-- node rows record adapters (cli.py builds the Coordinator without them
-  today);
-- configuration epochs are enforced, so leaders with different lists can't
-  alternate during a rolling upgrade;
-- the fabric check treats a managed node's SM as ha.md says;
-- the fence ask is implemented, and hardware test 1 shows it is honoured
-  with both hosts listed.
+`allowed_sm` in HA mode depended on parts of specs/ha.md: node rows
+with port GUIDs, configuration epochs, so that leaders with different
+lists can't alternate, and the fabric check's rule for a managed node's
+SM. Those are in, and HA mode allows the group as experimental (see HA
+mode). The fence ask is still a stub that logs: with the group it stays
+one, so the group loses nothing there until the ask is implemented and
+hardware test 1 shows it's honoured with both hosts listed.
 
 A rolling upgrade to a version that records port GUIDs leaves older rows
 without them. The leader renders the list from the rows that have port
@@ -447,7 +445,8 @@ also uses the SM's own port GUID or other local state, which is what an HA
 takeover by another host would expose. The second-host run decides HA.
 CC and N2N keys are still unverified, because the test fabric doesn't
 support them. Until the rest of test 3 passes, the group is experimental:
-HA mode refuses it, and a single node can choose it beside `all`, so that
+a single node, or an HA cluster (see HA mode), can choose it beside `all`,
+so that
 test 3's remaining legs run the group itself, with the rules of this
 section and the turn-off guard (see Turning the keys off, and downgrades).
 That is a change from the first version of this spec, which refused it in
@@ -582,10 +581,9 @@ test 4 records, and the warning an operator needs when the limit bites a
 legitimate client. It doesn't fail the check: a limited client is the
 limit working, and a tenant could otherwise stop every job by flooding.
 If the manager's own `saquery`, which sends the SA_Key, is limited, its
-fabric check fails as a failed query, which shows it. HA mode refuses
-the group, as it does the other experimental groups, until test 4 has
-run; it leaves nothing on ports, so it could be allowed there without
-further design.
+fabric check fails as a failed query, which shows it. It leaves nothing
+on ports, so HA mode allows it, experimental, as it does the other
+experimental groups (see HA mode).
 
 ## Per-port M_Keys
 
@@ -711,8 +709,8 @@ The design below meets them:
    node GUIDs, as `_judge` compares sets. Every instance re-renders its
    files from the database on a period, so a candidate's probe uses
    current keys; with no rows, the probe uses `m_key` as today.
-5. **HA:** refused until configuration epochs are enforced (as
-   `allowed_sm` is), so that leaders with and without the group can't
+5. **HA:** only with configuration epochs enforced (as for
+   `allowed_sm`), so that leaders with and without the group can't
    alternate. The fence ask and `allowed_sm`'s `0F09` direct query need
    the target port's derived key and a route, so node rows need port
    GUIDs. A helper that writes the cache volume counts in the takeover's
@@ -731,17 +729,16 @@ The design below meets them:
 
 ### The design
 
-This first version is for single node with the managed driver. HA mode
-refuses the group (requirement 5), and so does any other driver, since
-the manager must write OpenSM's cache volume and run the prober in
-OpenSM's image.
+This design is for the managed driver, in single node and, as
+experimental, in HA mode (see HA mode for what changes there). Any other
+driver is refused, since the manager must write OpenSM's cache volume and
+run the prober in OpenSM's image.
 
 **The group.** `m_key_per_port` writes `m_key_per_port TRUE`,
 `m_key_lookup TRUE` and `m_key_protection_level 2`, written so that they
 show though OpenSM forces them. It needs the `m_key` group, and is in
 `HARDENING_GROUPS` only, so it's chosen as `all, m_key_per_port`.
-`Config.validate` refuses it without `m_key`, in HA mode, with another
-driver, without a volume at `/var/cache/opensm` in `[opensm] volumes`
+`Config.validate` refuses it without `m_key`, with another driver, without a volume at `/var/cache/opensm` in `[opensm] volumes`
 (the copy would hit the read-only root), and with `m_key`,
 `m_key_per_port`, `m_key_protection_level` or `m_key_lookup` in
 `[opensm_conf]`; and refuses `m_key_per_port` in `[opensm_conf]` without
@@ -1196,6 +1193,90 @@ groups (a misspelt removal would leave the group on), a group both named
 and removed, removals beside groups without `all`, and `none` with
 anything else. HA mode refuses removing `m_key` or `sm_key`.
 
+## HA mode
+
+The groups above are allowed in HA mode as experimental, built before any
+hardware run in HA mode, at the user's request, so that those runs use
+the implementation. specs/ha.md's Configuration epochs and The secured
+profile are the HA design; this section says what each group does there.
+
+**Configuration epochs** come first. Every group's options, and an
+override of any option, are in the configuration hash, so leaders with
+and without a group, or with different lists, can't alternate: a node
+whose hash isn't allowed isn't a candidate, and a leader whose hash isn't
+allowed hands over to one whose is.
+
+**The leader fence.** Per-port M_Keys' rows and state, the class keys'
+turn-off record, and whether a start found the per-port M_Key base stored,
+are written by the leader only, each transaction behind the leader fence
+(ha.md, The secured profile). A takeover's start raises the fence before
+it reads any of them, so it judges the records the last leader left, and
+a deposed leader's late write fails rather than overwriting them.
+
+**`allowed_sm`.**
+- Each node's ports are probed as in single node, from the coordinator's
+  reach thread, at registration and then until a probe succeeds, and
+  recorded in its node row and among the known SM ports.
+- The list is the union of the node rows' port GUIDs; an override must
+  contain each of them and can't be `0`. The lock-out checks run as in
+  single node, against this node's probe at the start, and also refuse a
+  start while this node's row has no port GUIDs, or another target's
+  node row has none (an old-version leader's).
+- The running list is recorded in `applied` at each start, by the leader.
+- Candidates: a node without port GUIDs isn't one. One outside the
+  running list isn't eligible while a live candidate inside it is, and
+  even then only once the lease was released or every other target
+  verified its stop: never by an unconfirmed takeover, since the old
+  OpenSM, which ignores it, could act unseen (Changing the list, the safe
+  outcome of hardware test 1).
+- A list change, such as a new node, takes effect at the next takeover;
+  meanwhile the leader logs an alarm at each check while a live node with
+  port GUIDs is outside its running list.
+- The fabric check: an SM in the SA's SMInfo records on another node
+  row's port GUIDs fails the check, whatever its state; `0F09` is judged
+  against the known SM ports, which include every node row's ports.
+- `--record-sm-port`, `--drop-sm-port` and `--known-sm-ports` work in HA
+  mode; a port in a node row can't be dropped. `--forget-node` removes a
+  retired node's row (ha.md, Retiring a node).
+
+**`class_keys`.** The seed is in Galera, so every leader writes the same
+`key_mgr_seed`. The rule that a start which stored the seed doesn't render
+the group holds per takeover. The turn-off guard's record is written
+behind the leader fence. Whether another host derives the same keys from
+the seed is hardware test 3's second-host leg.
+
+**`sa_rate`.** As in single node: it leaves nothing on ports.
+
+**`m_key_per_port`.**
+- The leader keeps the rows as the single-node manager does, behind the
+  leader fence. Operators' commands work in HA mode from any node, as in
+  single node: `--confirm-fabric` reads the running OpenSM's cache only on
+  the leader's node, and elsewhere arms nothing that needs it.
+- **A takeover never reads its host's cache volume.** The files there
+  are from an older term, or none: the rows are newer, and folding a
+  stale file could put back a link or a key state the rows have since
+  replaced. So a takeover's start treats the volume as lost, which the
+  rows rebuild (Restores' lost volume), and renders the cache from them.
+- **The watchdog's start request is written after the cache is
+  rendered**, and its hashes cover `neighbors` and `guid2mkey` in
+  OpenSM's cache directory as well as `opensm.conf`, which the start
+  rewrites, and `partitions.conf`.
+- **The reach probe uses the prober** while rows exist: from this node's
+  port, along the recorded links through confirmed switches, with each
+  port's key, in a helper container of its own (`<container>-reach`).
+  The count is the switches that answered. It never writes rows: a
+  candidate isn't the leader. `ibstat` still decides whether this node's
+  port is up.
+- **The takeover bound** grows by the verify before the start and the
+  turn-on's success rule, each `start_timeout` at most, while the group
+  is named or rows exist.
+- **Jobs** need evidence from the leader's checks, kept in its memory as
+  in single node: another instance never completes a job on a recorded
+  port, and returns its stored status, which the leader writes.
+
+What a hardware run in HA mode must show, before any of these joins
+`all`, is in docs/opensm-hardening.md's checklists.
+
 ## Changes to specs/ha.md
 
 These go into specs/ha.md before the HA code changes:
@@ -1225,9 +1306,8 @@ These go into specs/ha.md before the HA code changes:
   candidate inside `applied`'s running list is preferred. One outside it
   may take over as Changing the list says, which hardware test 1 decides.
   An alarm is raised while a live node is outside it.
-- **Required keys:** HA mode refuses `allowed_sm` until its dependencies
-  (see HA) are in, and `class_keys` until hardware test 3 passes, with
-  its second-host legs.
+- **Required keys:** HA mode allows `allowed_sm`, `class_keys`,
+  `sa_rate` and `m_key_per_port` as experimental (see HA mode).
 - **Per-port M_Keys:** `fabric_ports` (with each port's key state) and
   `fabric_links`, written only by the leader under its term's
   compare-and-set; `m_key_base` among the shared keys; in Job
@@ -1548,8 +1628,10 @@ and a re-cabled port.
 - [ ] Hardware tests 1 and 2, with the implemented group. Their outcomes
       may change the `0F09` rules (Why, The fabric check) before it joins
       `all`.
-- [ ] specs/ha.md changes. Then node rows' port GUIDs, known SM ports, and
-      `allowed_sm` in HA mode, once its dependencies are in.
+- [x] specs/ha.md changes, node rows' port GUIDs, known SM ports,
+      configuration epochs, and the four groups in HA mode, experimental
+      (HA mode).
+- [ ] Hardware runs of the groups in HA mode, on two hosts.
 - [x] `class_keys` for single node, experimental and outside `all`: the
       seed rules, the logged rejections and key errors, and the turn-off
       guard, with its downgrade procedure in docs/opensm-hardening.md.
