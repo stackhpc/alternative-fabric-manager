@@ -608,9 +608,8 @@ stale is never granted on a partial check:
   taint the pkey. A **host** is tainted while the map holds a (GUID,
   host) for it that the latest body doesn't: a port that left it, by
   deletion, migration or rebinding. Taint isn't pruned while the fabric
-  is incomplete,
-  since telling that a stale holder has been cleared needs evidence the
-  partial check doesn't have;
+  is incomplete, since telling that a stale holder has been cleared needs
+  evidence the partial check doesn't have;
 - the map is reset only at a passing check after a fresh sweep (below)
   with no unattributed error, and only if no expected switch was removed
   since the map was last reset: to the memberships of the latest body,
@@ -640,14 +639,17 @@ after the sweep, no older than `2 × check_interval`, and:
    above, with no pkey error in the sweep, and the sweep had no
    unattributed error;
 3. no pkey it grants a membership in is tainted;
-4. for a bare metal port (`binding:vnic_type` `baremetal`), its host
-   isn't tainted, and no revocation job is open for another port bound to
-   it: a node with ports on two leaves, one of them missing, may still
-   hold the last tenant's pkeys on the port behind it, and the new
-   tenant's own port being placed says nothing about that one. A
-   hypervisor's ports are exempt: a stale virtual function there is
-   another instance's, which the new instance doesn't get, and taint that
-   isn't pruned while the switch is missing would soon hold every busy
+4. for any port but a virtual function's (`binding:vnic_type` `direct`),
+   its host isn't tainted, and no revocation job is open for another port
+   bound to it: a bare metal node with ports on two leaves, one of them
+   missing, may still hold the last tenant's pkeys on the port behind it,
+   and the new tenant's own port being placed says nothing about that
+   one. A port with no recorded `vnic_type`, as one recorded before this,
+   or with a type this doesn't know, such as `direct-physical`, a whole
+   function passed to an instance, gets the same rule. Virtual functions
+   are exempt: a stale virtual function on a hypervisor is another
+   instance's, which the new instance doesn't get, and taint that isn't
+   pruned while the switch is missing would soon hold every busy
    hypervisor's grants.
 
 | Request | On a partial check |
@@ -1451,8 +1453,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       sweep, vports through OpenSM's virtualization dump; the possibly
       held memberships with their hosts, extended before each write, and
       tainted pkeys and hosts; each port's `binding:vnic_type`, recorded
-      from the port networking-mlnx sends; `--confirm-fabric --reset-held`; the
-      fresh sweep after a partial period; and a failover test with a leaf
+      from the port networking-mlnx sends; `--confirm-fabric
+      --reset-held`; the fresh sweep after a partial period; and a failover test with a leaf
       paused in the fake fabric. Revocations stay for a whole fabric until
       the open question on the SA below is answered on a fabric with more
       than one switch.
