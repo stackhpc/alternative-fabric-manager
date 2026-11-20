@@ -559,11 +559,14 @@ matters where the check runs `ibswitches`.
 **A partial check** is one that fails only because expected switches are
 missing: OpenSM is master, the check is contested by no SM, it queried the
 fabric in full, and it finds no enforcement error, no unanswered key, no
-failing apply, and nothing else that fails a check. In prober mode, a
-port never sent a key because every route to it passes through an
-expected switch that is missing, or a switch whose link is down, is no
-unanswered key; one behind any other switch that didn't answer is. A
-check that couldn't
+failing apply, and nothing else that fails a check. In prober mode,
+while some expected switch is missing, a port never sent a key because
+each switch that didn't answer on its route (the shortest the recorded
+links give, which the prober follows) is an expected switch that is
+missing or one whose link is down is no unanswered key; one behind any
+other switch that didn't answer is. With no expected switch missing,
+every such port counts as unanswered, as before, so this can make a
+check partial at most, never passing. A check that couldn't
 query the fabric, or any part of what follows, isn't partial: it fails as
 today. A partial check is still a failed check everywhere else: for the
 alarm, for Stepping down (a live candidate that reaches more switches
@@ -606,11 +609,15 @@ that also runs instances, as in a hyperconverged or all-in-one
 deployment, is a hypervisor too. A physical port seen for another host
 than the one it is learnt for, as a stale dump after a migration may show
 it, is unlearnt, logged, and kept as learnt for no host; it is learnt
-again only once two passing checks in a row see it for the same host. A
-learnt physical port is dropped once three passing checks' scans in a
-row haven't found it: a scan made while its link flapped mustn't drop
+again only once two passing checks in a row, each with a dump it could
+read, of the same OpenSM, see it for the same host. A learnt physical
+port is dropped once three passing checks' scans in a row, of the same
+OpenSM, haven't found it. Both counts are the leader's, in memory, and
+start again at each start of OpenSM, which only delays relearning and
+pruning. Three, since a scan made while its link flapped mustn't drop
 it, and three such scans span at least three `confirm_checks` intervals
-where the check runs `ibswitches`. A virtual function's GUID that **neither dump read lists
+where the check runs `ibswitches`. Learning and pruning are leader
+writes, behind the leader fence. A virtual function's GUID that **neither dump read lists
 at all** is placed if H has at least one learnt physical port, and the
 same learnt set is placed the same way by both scans, in the same
 sweep-start window, and every adapter port that the last passing scan
@@ -629,7 +636,10 @@ in prober mode `fabric_links`, and where the check runs `ibswitches`, an
 `ibnetdiscover` scan at a passing check at most once every
 `confirm_checks` checks, which adds to the links kept rather than
 replacing them, so that an adapter whose link was down at one scan keeps
-its last link until a scan finds it elsewhere. An adapter cabled, or moved between hosts,
+its last link until a scan finds it elsewhere. They never shrink: an
+adapter removed from the fabric stays behind its old switch, and, while
+that switch is missing, holds the grants placed through hosts' physical
+ports unless it is attributed. That fails closed, and is a known cost. An adapter cabled, or moved between hosts,
 since that scan is a hardware change at the fabric, which this doesn't
 cover. Otherwise, a VF placed this way is on a physical port the scan
 placed, behind a switch the check found, so OpenSM programs its vport
