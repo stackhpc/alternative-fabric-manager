@@ -429,7 +429,10 @@ def test_a_takeover_renders_the_cache_from_the_rows_not_the_volume(world):
     # older term, which may name links the rows have since replaced.
     running_with_rows(world)
     world.config.ha = True
-    links = {key for key in port_keys.load(world.sessionmaker())[1]}
+    # Closed at once: an open transaction holds a server database's
+    # metadata lock, which the next test's DROP DATABASE waits on.
+    with world.sessionmaker() as session:
+        links = set(port_keys.load(session)[1])
     stale = "".join(f"0x{Z:016x}:1 0x{S1:016x}:7\n0x{S1:016x}:7 0x{Z:016x}:1\n")
     world.driver.volume["neighbors"] = (stale, _now() + datetime.timedelta(hours=1))
     reads = world.driver.reads
