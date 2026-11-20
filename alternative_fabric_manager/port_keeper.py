@@ -245,6 +245,9 @@ class CheckOutcome:
     # the expected switches (specs/zero-touch.md)
     verify: object = None
     complete: bool = True
+    # Every verify of the check, from which a partial check places the ports
+    # they reached (specs/ha.md, Where a port is)
+    results: list = dataclasses.field(default_factory=list)
 
 
 class PortKeeper:
@@ -1029,8 +1032,15 @@ class PortKeeper:
 
         began = time.monotonic()
         results = []
-        # A full verify is due after an interval.
-        full = self._last_full is None or began - self._last_full[1] >= interval
+        # A full verify is due after an interval, and at every check while
+        # expected switches are missing, so that the scan a partial check
+        # places ports from reaches every adapter port, not only the
+        # switches and the open jobs' ports (specs/ha.md, Where a port is).
+        full = (
+            self._last_full is None
+            or began - self._last_full[1] >= interval
+            or getattr(self.manager, "_missing_fabric", False)
+        )
         if full:
             try:
                 result = verify(prober.FULL, ports, links)
@@ -1083,6 +1093,7 @@ class PortKeeper:
             nodes={guid: result.ports[guid].node_guid for guid in result.switches},
             verify=result,
             complete=all(each.complete for each in results),
+            results=results,
         )
         outcome.problems = self._problems(ports, neutron, results)
         if not full and not outcome.complete:

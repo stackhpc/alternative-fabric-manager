@@ -1,0 +1,44 @@
+# VIRTUALIZATION_SMDB, 1.4, 2026 Nov 20 15:08:52:762948
+
+START_INDEX_TABLE
+Name, Offset, Size, Line, Rows
+PORTS     ,         324,         274,          11,           6
+VNODES    ,         622,         595,          21,           9
+VPORTS    ,        1242,        1033,          34,           9
+END_INDEX_TABLE
+
+START_PORTS
+PortGUID, LID, IndexCap, IndexTop
+0xb88303ffff6b9208,     2,     1,     1
+0x040973ffffc75124,     3,    16,     0
+0x040973ffffc7514c,     4,    16,     0
+0x040973ffffc75168,     1,    16,     8
+0xb88303ffff96b9e0,     6,    16,     0
+0xb88303ffff6b03e8,     7,     1,     1
+END_PORTS
+
+START_VNODES
+VNodeGUID, NumPorts, VNodeDesc
+0xb88303ffff6b9208,   1, "localhost mlx5_0"
+0xb88303ffff6b920a,   1, "MT4119 ConnectX5   Mellanox Technologies"
+0x040973ffffc75124,   1, "MT4119 ConnectX5   Mellanox Technologies"
+0x040973ffffc7514c,   1, "MT4119 ConnectX5   Mellanox Technologies"
+0xfa163e000062a357,   1, "MT4120 ConnectX5   Mellanox Technologies"
+0x040973ffffc75168,   1, "MT4119 ConnectX5   Mellanox Technologies"
+0xb88303ffff96b9e0,   1, "MT4119 ConnectX5   Mellanox Technologies"
+0xb88303ffff6b03e8,   1, "localhost mlx5_0"
+0xb88303ffff6b03ea,   1, "MT4119 ConnectX5   Mellanox Technologies"
+END_VNODES
+
+START_VPORTS
+PortGUID, Index, VPortGUID, VNodeGUID, VPortNum, State, IsLidRequired, VPortLidIndex, VPortLid, ActiveLid
+0xb88303ffff6b9208,     0, 0xb88303ffff6b9208, 0xb88303ffff6b9208,   1, ACTIVE, 1,     0,     2,     2
+0xb88303ffff6b9208,     1, 0xb88303ffff6b920a, 0xb88303ffff6b920a,   1, ACTIVE, 1,     0,     9,     9
+0x040973ffffc75124,     0, 0x040973ffffc75124, 0x040973ffffc75124,   1, ACTIVE, 1,     0,     3,     3
+0x040973ffffc7514c,     0, 0x040973ffffc7514c, 0x040973ffffc7514c,   1, ACTIVE, 1,     0,     4,     4
+0x040973ffffc75168,     0, 0x040973ffffc75168, 0x040973ffffc75168,   1, ACTIVE, 1,     0,     1,     1
+0x040973ffffc75168,     7, 0xfa163e000062a357, 0xfa163e000062a357,   1, ACTIVE, 1,     0,   185,   185
+0xb88303ffff96b9e0,     0, 0xb88303ffff96b9e0, 0xb88303ffff96b9e0,   1, ACTIVE, 1,     0,     6,     6
+0xb88303ffff6b03e8,     0, 0xb88303ffff6b03e8, 0xb88303ffff6b03e8,   1, ACTIVE, 1,     0,     7,     7
+0xb88303ffff6b03e8,     1, 0xb88303ffff6b03ea, 0xb88303ffff6b03ea,   1, ACTIVE, 1,     0,    10,    10
+END_VPORTS
