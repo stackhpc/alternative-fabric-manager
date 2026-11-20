@@ -559,7 +559,11 @@ matters where the check runs `ibswitches`.
 **A partial check** is one that fails only because expected switches are
 missing: OpenSM is master, the check is contested by no SM, it queried the
 fabric in full, and it finds no enforcement error, no unanswered key, no
-failing apply, and nothing else that fails a check. A check that couldn't
+failing apply, and nothing else that fails a check. In prober mode, a
+port never sent a key because every route to it passes through an
+expected switch that is missing, or a switch whose link is down, is no
+unanswered key; one behind any other switch that didn't answer is. A
+check that couldn't
 query the fabric, or any part of what follows, isn't partial: it fails as
 today. A partial check is still a failed check everywhere else: for the
 alarm, for Stepping down (a live candidate that reaches more switches
@@ -599,23 +603,33 @@ host H and with no open job, on a physical port that isn't a recorded
 port's GUID, as a bare metal node's is, records (H, that physical port)
 in `host_ports`. A node row's port can be learnt: a control-plane host
 that also runs instances, as in a hyperconverged or all-in-one
-deployment, is a hypervisor too. Learning a physical port for H removes it from any
-other host's; a passing check's scan that doesn't find a learnt physical
-port drops it. A virtual function's GUID that **neither dump read lists
+deployment, is a hypervisor too. A physical port seen for another host
+than the one it is learnt for, as a stale dump after a migration may show
+it, is unlearnt, logged, and kept as learnt for no host; it is learnt
+again only once two passing checks in a row see it for the same host. A
+learnt physical port is dropped once three passing checks' scans in a
+row haven't found it: a scan made while its link flapped mustn't drop
+it, and three such scans span at least three `confirm_checks` intervals
+where the check runs `ibswitches`. A virtual function's GUID that **neither dump read lists
 at all** is placed if H has at least one learnt physical port, and the
 same learnt set is placed the same way by both scans, in the same
 sweep-start window, and every adapter port that the last passing scan
-found cabled to a switch now missing is attributed: a learnt physical
-port, a recorded port's GUID, or a node row's port. One that isn't may be
-another physical port of H, which the VF could land on, behind a hung
+found cabled to a switch now missing is attributed: a physical port
+learnt for a host, a recorded port's GUID, or a node row's port while
+none of that node's ports is learnt (or kept as learnt for no host). Once
+one is, the node is a hypervisor whose other ports a VF may land on, so
+they count only once learnt themselves. One that isn't may be another
+physical port of H, which the VF could land on, behind a hung
 leaf, so it holds every grant placed this way. A GUID a dump read lists
 but doesn't place (listed twice, not ACTIVE, or on a physical port that
 isn't placed), as when a VF is attached to a running guest or migrated
 live, waits as any vport does; a host with no learnt physical port waits.
-The manager keeps the last passing scan's adapter-to-switch links: in
-prober mode `fabric_links`, and where the check runs `ibswitches`, an
+The manager keeps the adapter-to-switch links that passing scans found:
+in prober mode `fabric_links`, and where the check runs `ibswitches`, an
 `ibnetdiscover` scan at a passing check at most once every
-`confirm_checks` checks. An adapter cabled, or moved between hosts,
+`confirm_checks` checks, which adds to the links kept rather than
+replacing them, so that an adapter whose link was down at one scan keeps
+its last link until a scan finds it elsewhere. An adapter cabled, or moved between hosts,
 since that scan is a hardware change at the fabric, which this doesn't
 cover. Otherwise, a VF placed this way is on a physical port the scan
 placed, behind a switch the check found, so OpenSM programs its vport
