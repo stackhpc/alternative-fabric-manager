@@ -724,12 +724,161 @@ def test_a_node_rows_port_is_learnt(manager, fabric):
     assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
 
 
+def _passing_scan(manager):
+    """A passing check that runs the whole fabric's ibnetdiscover scan"""
+    manager._checks_since_scan = manager.config.confirm_checks
+    assert manager.check_fabric()
+
+
 def test_a_learnt_port_the_passing_scan_doesnt_find_is_dropped(manager, fabric):
     _learn_hv1(manager, fabric)
     del fabric.ports[OWN]
-    manager._checks_since_scan = manager.config.confirm_checks
-    manager.check_fabric()
+    # A scan made while its link flapped doesn't drop it, nor two.
+    _passing_scan(manager)
+    _passing_scan(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+    # Found again, the count starts again.
+    fabric.ports[OWN] = (LEAF_A, 1)
+    _passing_scan(manager)
+    del fabric.ports[OWN]
+    _passing_scan(manager)
+    _passing_scan(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+    _passing_scan(manager)
     assert _host_ports(manager) == {}
+
+
+def test_an_adapters_link_outlasts_a_scan_that_missed_it(manager, fabric):
+    _learn_hv1(manager, fabric)
+    fabric.ports[0xC0FFEE] = (LEAF_B, 7)
+    _passing_scan(manager)
+    # Its link flaps at the next passing scan, which doesn't find it.
+    del fabric.ports[0xC0FFEE]
+    _passing_scan(manager)
+    fabric.ports[0xC0FFEE] = (LEAF_B, 7)
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    _settle(manager)
+    # Still known to be behind the missing leaf, and nobody's: it holds.
+    assert _status(manager, job) == PENDING
+
+
+def test_a_hyperconverged_nodes_other_port_isnt_attributed(manager, fabric):
+    other_port = 0x040973FFFFC75169
+    # The node is also hv1, with two ports: OWN, learnt, and another,
+    # behind leaf B, which a VF may land on.
+    with manager.sessionmaker.begin() as session:
+        session.add(
+            db.Node(
+                name="hv1", port_guids=json.dumps([f"{OWN:016x}", f"{other_port:016x}"])
+            )
+        )
+    fabric.ports[other_port] = (LEAF_B, 9)
+    _learn_hv1(manager, fabric)
+    _passing_scan(manager)
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    _settle(manager)
+    assert _status(manager, job) == PENDING
+    # A node none of whose ports is learnt runs no VF: its ports are
+    # attributed.
+    with manager.sessionmaker.begin() as session:
+        session.add(db.Node(name="ctl", port_guids=json.dumps([f"{0xC0FFEE:016x}"])))
+    with manager.sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        unattributed = manager._unattributed(session, applied, {LEAF_B}, False)
+    assert unattributed == {f"{other_port:016x}"}
+
+
+def test_a_conflicting_learn_unlearns_until_two_checks_agree(manager, fabric):
+    _learn_hv1(manager, fabric)
+    # A stale dump after a migration: hv2's VF shows on OWN, learnt for hv1.
+    manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID, host="hv2"))
+    _settle(manager)
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+    with manager.sessionmaker() as session:
+        assert manager._host_ports(session) == {}
+    # One more passing check that sees it for hv2 moves it.
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+
+
+def test_a_conflict_waits_for_two_agreeing_checks(manager, fabric):
+    _learn_hv1(manager, fabric)
+    manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID, host="hv2"))
+    _settle(manager)
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.check_fabric()
+    # The next check sees no VF on it: still learnt for no host.
+    fabric.vports = []
+    manager.check_fabric()
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+
+
+def test_a_passing_check_writes_applied_locked(manager, fabric, monkeypatch):
+    from alternative_fabric_manager import manager as manager_mod
+
+    locked = []
+    original = manager_mod.Manager._locked_applied
+
+    def spy(session):
+        locked.append(True)
+        return original(session)
+
+    monkeypatch.setattr(manager_mod.Manager, "_locked_applied", staticmethod(spy))
+    assert manager.check_fabric()
+    assert locked
+
+
+def test_a_new_leader_inherits_a_fresh_sweep_due(config, fabric, manager):
+    from alternative_fabric_manager import manager as manager_mod
+
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    _lose_leaf(manager, fabric)
+    job = manager.delete_network(NETWORK_ID)
+    manager.reconcile()
+    # A takeover: a new manager, with the leaf back
+    fabric.switches = {LEAF_A, LEAF_B}
+    new = manager_mod.Manager(config, manager.sessionmaker, fabric)
+    fabric.start = lambda: SweepReport()
+    new.start()
+    try:
+        new.check_fabric()
+        new.evaluate_jobs()
+        # Its start's sweep isn't the fresh sweep.
+        assert _status(new, job) == PENDING
+        new.reconcile()
+        assert _status(new, job) == COMPLETED
+    finally:
+        new.halt()
+
+
+def test_resweeps_are_by_job_and_forgotten_as_jobs_end(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    del fabric.ports[GUID]
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(PORT_ID, _port(PORT_ID, conftest.CLIENT_ID))
+    fabric.ports[GUID] = (LEAF_A, 2)
+    _settle(manager, 4)
+    assert _status(manager, job) == COMPLETED
+    manager._placement_moved()
+    assert manager._resweeps == set()
+    # A later update of the port, unplaced at its sweep and then placed at
+    # the same place as before: its job gets a re-sweep of its own.
+    del fabric.ports[GUID]
+    manager.check_fabric()
+    again = manager.put_port(
+        PORT_ID, _port(PORT_ID, conftest.CLIENT_ID, host="compute-0")
+    )
+    fabric.ports[GUID] = (LEAF_A, 2)
+    _settle(manager, 4)
+    assert _status(manager, again) == COMPLETED
 
 
 def test_an_unattributed_adapter_behind_the_missing_leaf_holds_vf_grants(

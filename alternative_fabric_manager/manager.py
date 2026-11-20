@@ -78,6 +78,9 @@ PROBER = "prober"
 CONFIG_HASH_KEY = "config_hash_key"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
+# How many passing scans in a row must miss a learnt physical port before
+# it's forgotten (specs/ha.md, Where a port is)
+PRUNE_AFTER = 3
 # _needs_sync()'s reason for restoring the last swept file
 RESTORE = "the last swept partitions must be restored"
 OPEN = (db.JobStatus.PENDING, db.JobStatus.RUNNING)
@@ -250,6 +253,12 @@ class Manager:
         # adapters' links at most once every confirm_checks checks
         self._checks_since_scan = 0
         self._scanned_once = False
+        # How many passing scans in a row haven't found each learnt
+        # physical port, and the host each was seen for at the last passing
+        # check, kept in memory: a takeover counts afresh, which only
+        # delays pruning and relearning
+        self._unfound = {}
+        self._sightings = {}
         # Why the last _judge failed only on missing switches, if it did
         self._only_missing = False
         # A generation whose render or apply failed in a way that can't be
@@ -1629,15 +1638,22 @@ class Manager:
             errors = set(json.loads(applied.pkey_errors or "[]")) - {UNATTRIBUTED}
             pkeys = held.reset(errors)
             applied.held = held.dumps()
+            # held_term stays the last leader's: this command leads no term,
+            # and the reset needs no compare-and-set of its own. It ran on
+            # applied locked, against the body the last sweep recorded, so a
+            # leader's later extension sees it and adds to it, and a later
+            # term's leader judges the map by that leader's term as before.
             session.commit()
         return sorted(pkeys), sorted(hosts - held.tainted_hosts())
 
     @staticmethod
     def _host_ports(session):
-        """Each host's learnt physical ports, {host: {GUID}}"""
+        """Each host's learnt physical ports, {host: {GUID}}, without those
+        kept as learnt for no host after a conflicting learn"""
         found = {}
         for row in session.scalars(sa.select(db.HostPort)):
-            found.setdefault(row.host, set()).add(row.guid)
+            if row.host:
+                found.setdefault(row.host, set()).add(row.guid)
         return found
 
     @staticmethod
@@ -1720,16 +1736,21 @@ class Manager:
                 recorded.get("guids", {}) if recorded.get("term") == self.term else {}
             )
             host_ports = self._host_ports(session)
-            for _job, effect, vnic_type in self._open_grants(
-                session, applied.generation
-            ):
+            grants = self._open_grants(session, applied.generation)
+            # Forget the jobs that have ended, so that the set stays as
+            # small as the open jobs
+            open_ids = {job.id for job, _effect, _vnic in grants}
+            self._resweeps = {seen for seen in self._resweeps if seen[0] in open_ids}
+            for job, effect, vnic_type in grants:
                 where = self._grant_place(effect, vnic_type, scan_, host_ports)
                 if where is None:
                     continue
                 guid = effect["guids"][0]
                 if swept.get(guid) == where:
                     continue
-                seen = (guid, json.dumps(where, sort_keys=True))
+                # By job and place: a later job at the same place gets its
+                # own sweep.
+                seen = (job.id, json.dumps(where, sort_keys=True))
                 if seen in self._resweeps:
                     continue
                 self._resweeps.add(seen)
@@ -2108,7 +2129,10 @@ class Manager:
         dump = self._dump() if ok else None
         adapters = self._passing_scan(outcome, fabric) if ok else None
         with self._lock, self.sessionmaker() as session:
-            applied = self._applied(session)
+            # Locked, since a passing check may reset the possibly held map:
+            # a --confirm-fabric beside it that blocks the reset waits for
+            # this transaction rather than being lost under it.
+            applied = self._locked_applied(session)
             if self.term and (applied.term or 0) > self.term:
                 session.rollback()
                 return ok
@@ -2273,10 +2297,16 @@ class Manager:
                 for guid, where in json.loads(applied.adapter_links).items()
                 if where[1] in missing
             }
-        attributed = set(session.scalars(sa.select(db.HostPort.guid)))
+        rows = {row.guid: row.host for row in session.scalars(sa.select(db.HostPort))}
+        attributed = {guid for guid, host in rows.items() if host}
         attributed |= set(session.scalars(sa.select(db.Port.guid)))
         for text in session.scalars(sa.select(db.Node.port_guids)):
-            attributed |= {g.lower() for g in json.loads(text or "[]")}
+            node = {g.lower() for g in json.loads(text or "[]")}
+            # A node none of whose ports is learnt runs no instance's VF.
+            # Once one is, it is a hypervisor, and a VF may land on any of
+            # its ports: the others count only once learnt themselves.
+            if not node & set(rows):
+                attributed |= node
         return adapters - attributed
 
     def _placed_since_sweep(self, session, applied, scanned, end, missing, prober):
@@ -2360,18 +2390,32 @@ class Manager:
 
     def _keep_host_ports(self, session, applied, adapters, prober):
         """At a passing check whose scan found the whole fabric's adapters:
-        keep their links, where the check runs ibswitches, and drop the
-        learnt physical ports it didn't find"""
+        add their links to those kept, where the check runs ibswitches, so
+        that an adapter whose link was down at this scan keeps its last
+        link until a scan finds it elsewhere; and drop a learnt physical
+        port once PRUNE_AFTER scans in a row haven't found it, so that one
+        scan made while its link flapped doesn't (specs/ha.md, Where a port
+        is)"""
         if not prober:
-            applied.adapter_links = json.dumps(adapters, sort_keys=True)
+            kept = json.loads(applied.adapter_links or "{}")
+            kept.update(adapters)
+            applied.adapter_links = json.dumps(kept, sort_keys=True)
         for row in list(session.scalars(sa.select(db.HostPort))):
-            if row.guid not in adapters:
-                LOG.info(
-                    "Physical port 0x%s of host %s isn't on the fabric: forgot it",
-                    row.guid,
-                    row.host,
-                )
-                session.delete(row)
+            if row.guid in adapters:
+                self._unfound.pop(row.guid, None)
+                continue
+            self._unfound[row.guid] = self._unfound.get(row.guid, 0) + 1
+            if self._unfound[row.guid] < PRUNE_AFTER:
+                continue
+            del self._unfound[row.guid]
+            LOG.info(
+                "Physical port 0x%s of host %s wasn't found by %d passing scans "
+                "in a row: forgot it",
+                row.guid,
+                row.host or "(none)",
+                PRUNE_AFTER,
+            )
+            session.delete(row)
 
     def _learn_host_ports(self, session, dump):
         """At a passing check: record each host's physical ports from the
@@ -2397,6 +2441,8 @@ class Manager:
         counts = {}
         for entry in entries:
             counts[entry[0]] = counts.get(entry[0], 0) + 1
+        # Each physical port's hosts, as this dump shows them
+        seen = {}
         for vport, physical, index, state in entries:
             if None in (vport, physical) or not index or state != scan.ACTIVE:
                 continue
@@ -2408,19 +2454,44 @@ class Manager:
             guid = scan.guid_text(physical)
             if guid in recorded:
                 continue
+            seen.setdefault(guid, set()).add(port.host)
+        previous, self._sightings = self._sightings, {}
+        for guid, hosts in sorted(seen.items()):
             row = session.get(db.HostPort, guid)
-            if row is not None and row.host == port.host:
+            if len(hosts) != 1:
+                host = ""
+            else:
+                (host,) = hosts
+                self._sightings[guid] = host
+            if row is not None and row.host == host:
                 continue
+            if host and (row is None or not row.host):
+                if row is not None and previous.get(guid) != host:
+                    # Unlearnt by a conflict: learnt again only once two
+                    # passing checks in a row see it for one host.
+                    continue
+                if row is None:
+                    row = db.HostPort(guid=guid)
+                    session.add(row)
+                LOG.info("Learnt physical port 0x%s for host %s", guid, host)
+                row.host = host
+                row.learnt = _now()
+                continue
+            # Seen for another host than it's learnt for, or for two hosts
+            # at once, as a stale dump after a migration may show it:
+            # learnt for no host, which fails closed, until two passing
+            # checks in a row agree.
             if row is None:
                 row = db.HostPort(guid=guid)
                 session.add(row)
-            LOG.info(
-                "Learnt physical port 0x%s for host %s, from its virtual function 0x%s",
+            LOG.warning(
+                "Physical port 0x%s is seen for %s, but learnt for %s: unlearnt "
+                "it until two passing checks in a row see it for one host",
                 guid,
-                port.host,
-                scan.guid_text(vport),
+                ", ".join(sorted(hosts)),
+                row.host or "no host",
             )
-            row.host = port.host
+            row.host = ""
             row.learnt = _now()
 
     @staticmethod
@@ -2919,5 +2990,13 @@ def fabric_status(session):
         lines.append(
             f"host {host}: physical ports "
             + ", ".join(f"0x{guid}" for guid in sorted(guids))
+        )
+    unlearnt = sorted(
+        session.scalars(sa.select(db.HostPort.guid).where(db.HostPort.host == ""))
+    )
+    if unlearnt:
+        lines.append(
+            "physical ports seen for conflicting hosts, learnt for none until "
+            "two passing checks agree: " + ", ".join(f"0x{guid}" for guid in unlearnt)
         )
     return lines
