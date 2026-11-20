@@ -835,7 +835,12 @@ when:
 - its fabric checks find expected switches missing, and a live candidate
   reports reaching more of them;
 - it can't write, signal or sweep, as opposed to a rejected body, for three
-  `check_interval`s in a row, and a live candidate exists.
+  `check_interval`s in a row, and a live candidate exists;
+- the per-port M_Key target differs from what its OpenSM runs with, at a
+  passing check with no open job, at most once an hour: it releases the
+  lease so that a takeover's start, possibly its own, applies the target
+  (specs/zero-touch.md). Unlike the other triggers, it needs no other
+  candidate.
 
 Failures that every node would have the same way never make a leader step
 down: quarantine, pkey errors, template errors that can't be attributed, a
@@ -1053,7 +1058,8 @@ describes. In summary:
 
 - **The leader fence.** The records those groups keep in Galera (per-port
   M_Keys' rows and state, the class keys' turn-off record, whether a start
-  found the per-port M_Key base stored) are written only by the leader,
+  found the per-port M_Key base stored), and the expected switches the
+  leader records itself (specs/zero-touch.md), are written only by the leader,
   each transaction first doing a compare-and-set on the leader fence: it
   raises the fence to its own term, and fails if the fence is above it.
   Each raise also writes a fresh nonce to the row, so that it always
@@ -1205,7 +1211,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | The leader shut down cleanly | It fails `/healthz`, stops and verifies its OpenSM, and releases the lease | A candidate takes over at once, without waiting |
 | A takeover's winner dies before starting OpenSM | Its targets, and itself, stay in the target set. The next candidate waits for them all | Jobs wait longer |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
-| An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator removes the switch with the CLI; alarm |
+| An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until the prober shows every link to it down, with per-port M_Key rows, or an operator runs `--confirm-fabric`; alarm (specs/zero-touch.md) |
 | A node lacks OpenSM's image, and can't pull it | Its reach is 0, so it isn't eligible; it stays in HAProxy's rotation, and logs an error every minute | Nothing, while another candidate has the image; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
 | Any one Galera node lost, even a candidate's | Every node's commits block until the survivors evict it, after `evs.suspect_timeout`, 5 s by default, and a view change; the leader's renewals fail meanwhile, but its liveness thread keeps the watchdog's lease | Within `T_self`, nothing happens |
