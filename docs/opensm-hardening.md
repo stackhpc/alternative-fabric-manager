@@ -824,10 +824,13 @@ guest runs, which Nova holds until the port's job completes, so the
 manager learns each hypervisor's physical ports from the dump at passing
 checks (`--status` lists them), and places a VF that the dump doesn't
 list at all when every physical port learnt for its host is placed, and
-every adapter port behind the missing switches, as the last passing scan
+every adapter port behind the missing switches, as passing scans last
 found them (`ibnetdiscover` at most once every `confirm_checks` checks, or
 the recorded links), is known: a learnt physical port, a Neutron port's
-GUID, or an HA node's port. On a partial check, a network's creation, or
+GUID, or the port of an HA node that runs no learnt VF. A physical port
+seen for two hosts is learnt for none until two passing checks in a row
+agree, and a learnt port is forgotten once three passing scans in a row
+miss it. On a partial check, a network's creation, or
 an update that keeps its pkey, completes, and a port's create or an
 update that keeps its GUID and network completes if the scans either side
 of its sweep placed its GUID in the same place, with no other OpenSM sweep
