@@ -158,6 +158,11 @@ class Config:
     # slow for every check, so the fabric check uses the last verify's
     # result, and fails if it's older than two of these.
     port_verify_interval: float = 60.0
+    # How many fabric checks in a row must see a switch before the manager
+    # records it as expected, and, on a new deployment, every switch before
+    # it records the list (specs/zero-touch.md): 12 is a minute at the
+    # default check_interval.
+    confirm_checks: int = 12
     # Times to try applying a change in a row, before the manager waits for
     # the next check_interval.
     apply_attempts: int = 3
@@ -328,6 +333,8 @@ class Config:
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
+        if self.confirm_checks < 1:
+            raise ConfigError("[opensm] confirm_checks must be at least 1")
         parse_hardening(self.hardening)
         for name in (
             "start_timeout",
@@ -833,6 +840,7 @@ OPTIONS = (
             "sweep_timeout",
             "check_interval",
             "port_verify_interval",
+            "confirm_checks",
             "apply_attempts",
             "job_timeout",
             "default_partition",

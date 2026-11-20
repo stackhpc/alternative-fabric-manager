@@ -209,6 +209,12 @@ class ExpectedSwitch(Base):
     pending: orm.Mapped[bool] = orm.mapped_column(
         default=False, server_default=sa.false()
     )
+    # Its node GUID, from the prober's NodeInfo or ibswitches' own, kept
+    # beside the GUID it was recorded by, which is the switch's port 0 GUID
+    # with per-port M_Key rows: when the source of the list changes, each
+    # switch is translated by it, both ways. Nullable, so that the previous
+    # version, which doesn't write it, can share the database.
+    node_guid: orm.Mapped[str | None] = orm.mapped_column(sa.String(16), nullable=True)
 
 
 class Lease(Base):
@@ -391,6 +397,7 @@ _ADDED_COLUMNS = {
     },
     "expected_switches": {
         "pending": "BOOLEAN NOT NULL DEFAULT 0",
+        "node_guid": "VARCHAR(16)",
     },
 }
 

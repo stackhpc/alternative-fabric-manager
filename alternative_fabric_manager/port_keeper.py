@@ -944,6 +944,34 @@ class PortKeeper:
         outcome.problems = self._problems(ports, neutron, results)
         return outcome
 
+    def switch_gone(self, guid, links):
+        """Whether the last full verify, since OpenSM started, shows every
+        recorded link to a switch down, from the switch ports and this
+        host's port at their other ends: the same evidence of a link down
+        that a job's port gives (Lost ports and jobs)
+
+        An adapter at the other end, other than this host's, is reached only
+        through the switch, so it never shows the link down: a leaf switch
+        stays expected, and its removal needs --confirm-fabric
+        (specs/zero-touch.md, What stays manual). A switch with no recorded
+        link can't be shown gone either. links are the recorded links, read
+        in the caller's session.
+        """
+        if self._last_full is None:
+            return False
+        result = self._last_full[0]
+        ends = [link for link in port_keys.paired(links) if link.guid == guid]
+        if not ends:
+            return False
+        for link in ends:
+            peer = (link.peer_guid, link.peer_port)
+            if result.link_states.get(peer) is False:
+                continue
+            if link.peer_guid == result.own_guid and result.own_link_up is False:
+                continue
+            return False
+        return True
+
     def _job_guids(self, session, ports):
         """The recorded port GUIDs that open jobs name, deferred ones aside"""
         waiting = set(session.scalars(sa.select(db.Deferred.job_id)))

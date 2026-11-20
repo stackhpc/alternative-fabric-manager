@@ -62,6 +62,12 @@ BASE_KEPT = "m_key_base_kept"
 # records, which every such write raises to its own term first (see
 # specs/ha.md, The secured profile)
 LEADER_FENCE = "leader_fence"
+# Where the expected switches were recorded from: ibswitches, whose GUIDs
+# are node GUIDs, or the prober, whose are the switches' port 0 GUIDs (see
+# specs/zero-touch.md, Expected switches)
+EXPECTED_SOURCE = "expected_switches_source"
+IBSWITCHES = "ibswitches"
+PROBER = "prober"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
 # _needs_sync()'s reason for restoring the last swept file
@@ -183,6 +189,11 @@ class Manager:
         self.failed_applies = 0
         # Consecutive checks that found expected switches missing
         self.missing_checks = 0
+        # How many settled fabric checks in a row have seen each switch, by
+        # its GUID: kept in memory, and counted afresh for each OpenSM, so
+        # that a switch is recorded as expected only once the fabric has
+        # been stable for [opensm] confirm_checks (specs/zero-touch.md)
+        self._seen_checks = {}
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
         self._contested_fabric = False
@@ -1016,6 +1027,7 @@ class Manager:
         self.unanswered_checks = 0
         self.failed_applies = 0
         self.missing_checks = 0
+        self._seen_checks = {}
         # A new leader inherits a contested check: its first sweep then
         # doesn't count until a check passes (see Job completion).
         with self._lock, self.sessionmaker() as session:
@@ -1568,7 +1580,10 @@ class Manager:
             # contested until a check passes.
             ok, detail = False, f"Can't query the fabric: {e}"
             self.unanswered_checks += 1
+            # Nor is it a check that saw the switches.
+            self._seen_checks = {}
         else:
+            self._keep_expected(fabric, outcome, sm_contested)
             self.unanswered_checks = 0
             ok, detail = self._judge(fabric)
             if ok and outcome and outcome.problems:
@@ -1669,7 +1684,10 @@ class Manager:
         missing = expected - fabric.switches
         self.missing_checks = self.missing_checks + 1 if missing else 0
         if not expected:
-            return False, "No expected switches: confirm them with --confirm-fabric"
+            return False, (
+                "No expected switches yet: recording them once the fabric has "
+                f"been stable for {self.config.confirm_checks} checks"
+            )
         if missing:
             return False, "Missing switches: " + ", ".join(
                 f"0x{guid:016x}" for guid in sorted(missing)
@@ -1679,6 +1697,140 @@ class Manager:
                 f"0x{guid:016x}" for guid in masters
             )
         return True, "The fabric is complete"
+
+    # The expected switches (specs/zero-touch.md)
+
+    @staticmethod
+    def _master(fabric):
+        """Whether OpenSM's own SM is master, as the SA says"""
+        return 3 in [state for guid, state in fabric.sms if guid in fabric.own_guids]
+
+    def _keep_expected(self, fabric, outcome, sm_contested):
+        """Count the checks in a row that have seen each switch, and keep the
+        expected switches from them: record the list once the fabric is
+        stable, add a switch once it is, translate the list when its source
+        changes, and drop a missing switch the prober shows gone
+
+        Nothing changes, and the counts start again, while the check was
+        contested or OpenSM isn't master: another SM may have changed what
+        the fabric looks like. A check that couldn't query the fabric never
+        gets here. In HA mode these are leader writes, behind the leader
+        fence.
+        """
+        if fabric is None:
+            return
+        if self._contested(fabric) or sm_contested or not self._master(fabric):
+            self._seen_checks = {}
+            return
+        found = set(fabric.switches)
+        if outcome is not None:
+            source, nodes = PROBER, dict(outcome.nodes)
+        else:
+            # ibswitches gives node GUIDs.
+            source, nodes = IBSWITCHES, {guid: guid for guid in found}
+        self._seen_checks = {guid: self._seen_checks.get(guid, 0) + 1 for guid in found}
+        stable = {
+            guid
+            for guid, count in self._seen_checks.items()
+            if count >= self.config.confirm_checks
+        }
+        with self.fenced_session() as session:
+            rows = {
+                int(row.guid, 16): (
+                    None if row.node_guid is None else int(row.node_guid, 16)
+                )
+                for row in session.scalars(sa.select(db.ExpectedSwitch))
+            }
+            state = session.get(db.State, EXPECTED_SOURCE)
+            recorded_source = state.text if state is not None else None
+            expected = dict(rows)
+            if expected and recorded_source != source:
+                expected = self._translate(expected, recorded_source, source, nodes)
+            # Fill in a node GUID the row lacks, as one recorded before they
+            # were kept, so that a later change of source can translate it
+            for guid in expected:
+                if expected[guid] is None and nodes.get(guid) is not None:
+                    expected[guid] = nodes[guid]
+            if not expected:
+                if found and stable == found:
+                    expected = {guid: nodes.get(guid) for guid in found}
+                    LOG.warning(
+                        "Recorded the expected switches, seen by %d checks in a "
+                        "row: %s",
+                        self.config.confirm_checks,
+                        ", ".join(f"0x{guid:016x}" for guid in sorted(found)),
+                    )
+            else:
+                for guid in sorted(stable - set(expected)):
+                    expected[guid] = nodes.get(guid)
+                    LOG.warning(
+                        "Switch 0x%016x, seen by %d checks in a row, is now expected",
+                        guid,
+                        self.config.confirm_checks,
+                    )
+                if source == PROBER:
+                    links = port_keeper.port_keys.load(session)[1]
+                    for guid in sorted(set(expected) - found):
+                        if self.port_keeper.switch_gone(guid, links):
+                            del expected[guid]
+                            LOG.warning(
+                                "Expected switch 0x%016x is missing, and the "
+                                "prober shows every recorded link to it down: "
+                                "it's no longer expected",
+                                guid,
+                            )
+            if expected != rows:
+                session.execute(sa.delete(db.ExpectedSwitch))
+                for guid, node in sorted(expected.items()):
+                    session.add(
+                        db.ExpectedSwitch(
+                            guid=f"{guid:016x}",
+                            pending=False,
+                            node_guid=None if node is None else f"{node:016x}",
+                        )
+                    )
+            if expected and recorded_source != source:
+                if state is None:
+                    session.add(db.State(name=EXPECTED_SOURCE, value=0, text=source))
+                else:
+                    state.text = source
+            session.commit()
+
+    @staticmethod
+    def _translate(expected, recorded_source, source, nodes):
+        """The expected switches, recorded from another source, in this
+        check's terms, by each one's node GUID: a switch the new source can't
+        match stays as it is, expected, and fails the check as missing, so
+        that a switch already missing isn't dropped by the change"""
+        by_node = {node: guid for guid, node in nodes.items() if node is not None}
+        translated = {}
+        unmatched = []
+        for guid, node in expected.items():
+            if node is None and recorded_source != PROBER:
+                # Recorded by ibswitches, or before the source was kept:
+                # its GUID may be the node GUID.
+                node = guid
+            new = by_node.get(node) if node is not None else None
+            if new is None and guid in nodes:
+                new = guid
+            if new is None:
+                translated.setdefault(guid, expected[guid])
+                unmatched.append(guid)
+            else:
+                translated[new] = nodes.get(new, node)
+        LOG.warning(
+            "The expected switches were recorded from %s, and the check now "
+            "finds them with %s: translated them by their node GUIDs%s",
+            recorded_source or "an older version",
+            source,
+            (
+                "; these stay as recorded, expected: "
+                + ", ".join(f"0x{guid:016x}" for guid in sorted(unmatched))
+            )
+            if unmatched
+            else "",
+        )
+        return translated
 
     def confirm_fabric(self):
         """Record the switches OpenSM sees as the fabric's expected ones,
@@ -1698,10 +1850,23 @@ class Manager:
         if fabric is None:
             return confirmation
         found = sorted(fabric.switches)
+        source = IBSWITCHES if probed is None else PROBER
         with self._lock, self.sessionmaker() as session:
             session.execute(sa.delete(db.ExpectedSwitch))
             for guid in found:
-                session.add(db.ExpectedSwitch(guid=f"{guid:016x}", pending=False))
+                node = guid if probed is None else probed.get(guid)
+                session.add(
+                    db.ExpectedSwitch(
+                        guid=f"{guid:016x}",
+                        pending=False,
+                        node_guid=None if node is None else f"{node:016x}",
+                    )
+                )
+            state = session.get(db.State, EXPECTED_SOURCE)
+            if state is None:
+                session.add(db.State(name=EXPECTED_SOURCE, value=0, text=source))
+            else:
+                state.text = source
             session.commit()
         confirmation.switches = found
         if confirmation.switches:
