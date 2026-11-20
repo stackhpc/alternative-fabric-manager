@@ -587,6 +587,10 @@ experimental groups (see HA mode).
 
 ## Per-port M_Keys
 
+specs/zero-touch.md overrides parts of this section: switch trust, the
+`keys_to_try` rule for switches, and how the turn-on is armed and applied.
+Where they differ, it wins.
+
 ### Why
 
 Every port on the fabric has the same M_Key today. Anyone who learns it
