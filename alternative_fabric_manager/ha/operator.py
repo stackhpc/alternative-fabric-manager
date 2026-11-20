@@ -28,9 +28,7 @@ class OperatorError(Exception):
     pass
 
 
-# MariaDB's ER_LOCK_DEADLOCK, which Galera answers a certification conflict
-# with: the transaction rolled back, so it is safe to run again.
-DEADLOCK = 1213
+# A deadlock rolled the transaction back, so it is safe to run again.
 DEADLOCK_ATTEMPTS = 5
 
 
@@ -43,7 +41,7 @@ def _retrying(write, *args):
             return write(*args)
         except sa.exc.DBAPIError as e:
             code = getattr(e.orig, "args", ())[:1]
-            if code != (DEADLOCK,) or attempt == DEADLOCK_ATTEMPTS - 1:
+            if code != (db.DEADLOCK,) or attempt == DEADLOCK_ATTEMPTS - 1:
                 raise
             time.sleep(0.1 * (attempt + 1))
 
