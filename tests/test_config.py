@@ -425,9 +425,9 @@ def test_m_key_per_port_with_the_m_key_group_loads(tmp_path):
     assert _load(tmp_path, text).hardening_groups == {"m_key", "m_key_per_port"}
 
 
-def test_ha_refuses_m_key_per_port():
-    # Leaders with and without the group could alternate until
-    # configuration epochs are enforced (requirement 5).
+def test_ha_allows_m_key_per_port():
+    # Configuration epochs keep leaders with and without the group from
+    # alternating (requirement 5).
     config = config_mod.Config(
         token="t",
         ha=True,
@@ -435,14 +435,7 @@ def test_ha_refuses_m_key_per_port():
         job_timeout=300,
         hardening="all, m_key_per_port",
     )
-    assert any(
-        "per-port M_Keys aren't supported in HA mode yet" in problem
-        for problem in config_mod._ha_problems(config)
-    )
-    with pytest.raises(config_mod.ConfigError, match="HA mode yet"):
-        config.validate()
-    config.hardening = "all"
-    config.validate()
+    assert not any("per-port" in problem for problem in config_mod._ha_problems(config))
 
 
 @pytest.mark.parametrize("driver", ["docker", "none"])
@@ -619,14 +612,21 @@ def test_confirm_fabric_with_no_fabric_to_check_sees_no_switches(tmp_path):
         _cli(path, "--confirm-fabric")
 
 
-def test_port_key_commands_are_refused_in_ha_mode(tmp_path, monkeypatch):
+def test_port_key_commands_work_in_ha_mode(tmp_path, monkeypatch, capsys):
     path = _per_port_conf(tmp_path, hardening="all")
     config = config_mod.Config.load(str(path))
     # HA's own settings aren't the point here: only that ha is set
     config.ha = True
     monkeypatch.setattr(config_mod.Config, "load", lambda _path: config)
-    with pytest.raises(SystemExit, match="HA mode"):
-        _cli(path, "--port-key-states")
+    _cli(path, "--port-key-states")
+
+
+def test_the_takeover_bound_allows_for_a_per_port_start():
+    plain = config_mod.Config(token="t", hardening="all")
+    keyed = config_mod.Config(token="t", hardening="all, m_key_per_port")
+    assert config_mod.takeover_bound(keyed) == (
+        config_mod.takeover_bound(plain) + 1.5 * plain.start_timeout
+    )
 
 
 def test_port_key_commands_are_exclusive(tmp_path):

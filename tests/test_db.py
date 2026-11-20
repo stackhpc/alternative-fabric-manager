@@ -377,3 +377,46 @@ def test_every_statement_waits_causally(config):
     except sa.exc.DBAPIError:
         pytest.skip("a server without wsrep")
     assert value == db.SYNC_WAIT == 7
+
+
+def test_sqlite_sessions_take_turns_across_threads(monkeypatch):
+    # Every SQLite session shares one sqlite3 connection, which two threads
+    # can't use at once: a thread's session waits for another's to close.
+    import threading
+
+    sessionmaker = db.make_sessionmaker(":memory:")
+    opened = threading.Event()
+    order = []
+
+    def other():
+        with sessionmaker() as session:
+            order.append("other")
+            session.get(db.State, "x")
+        opened.set()
+
+    with sessionmaker():
+        # Re-entrant in one thread
+        with sessionmaker() as inner:
+            inner.get(db.State, "x")
+        thread = threading.Thread(target=other)
+        thread.start()
+        assert not opened.wait(0.2)
+        order.append("first")
+    thread.join(5)
+    assert order == ["first", "other"]
+    # A session left open by mistake raises in the other thread, not hangs.
+    monkeypatch.setattr(db, "SQLITE_SESSION_WAIT", 0.1)
+    held = sessionmaker()
+    errors = []
+
+    def blocked():
+        try:
+            sessionmaker()
+        except RuntimeError as e:
+            errors.append(str(e))
+
+    thread = threading.Thread(target=blocked)
+    thread.start()
+    thread.join(5)
+    held.close()
+    assert errors and "held the SQLite session" in errors[0]

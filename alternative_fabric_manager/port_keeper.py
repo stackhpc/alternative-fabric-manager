@@ -10,8 +10,8 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Per-port M_Keys in the single-node manager: before each start, at every
-check, for each job, and the operator's commands
+"""Per-port M_Keys: before each start, at every check, for each job, and
+the operator's commands
 
 specs/secured-profile.md, Per-port M_Keys, The design, is the source of
 truth. port_keys holds the rules and prober the Gets; this module decides
@@ -19,10 +19,16 @@ when each runs and what its result means for OpenSM, the fabric check and
 the jobs. The Manager owns a PortKeeper and calls it from thin hooks.
 
 It acts only while the m_key_per_port group is named or any fabric_ports or
-fabric_links row exists ("active"), never in HA mode, which refuses the
-group, and only with the managed driver, which writes OpenSM's cache volume
-and runs the prober. Otherwise every hook returns at once, so that OpenSM,
-its files, the fabric check and the jobs are as they were without it.
+fabric_links row exists ("active"), and only with the managed driver, which
+writes OpenSM's cache volume and runs the prober. Otherwise every hook
+returns at once, so that OpenSM, its files, the fabric check and the jobs
+are as they were without it.
+
+In HA mode the leader keeps the rows, behind the leader fence (Manager.
+fenced_session); a takeover never reads its host's cache volume, which an
+older term left, and renders it from the rows; every instance's reach probe
+runs the prober (reach_switches); and only the leader, whose checks gather
+it, has a job's evidence (specs/secured-profile.md, HA mode).
 
 The rows have one writer in the manager, the applier's thread (and the
 start, which runs before or on it), but the operator's commands run in
@@ -235,10 +241,9 @@ class PortKeeper:
     def group_named(self):
         return GROUP in self.config.hardening_groups
 
-    @contextlib.contextmanager
     def _session(self):
-        with self.manager._lock, self.manager.sessionmaker() as session:
-            yield session
+        # In HA mode, the leader's sessions are behind the leader fence.
+        return self.manager.fenced_session()
 
     # Whether to act at all
 
@@ -251,7 +256,7 @@ class PortKeeper:
 
     def _usable(self, rows):
         """Whether to act, given whether rows exist"""
-        if self.config.ha or not (self.group_named or rows):
+        if not (self.group_named or rows):
             return False
         if self.config.driver != "managed":
             # Config.validate refuses the group with another driver, but
@@ -270,8 +275,6 @@ class PortKeeper:
     def active(self):
         """Whether the group is named or any row exists, in single node with
         the managed driver"""
-        if self.config.ha:
-            return False
         if self.group_named and self.config.driver == "managed":
             return True
         with self._session() as session:
@@ -280,7 +283,7 @@ class PortKeeper:
 
     def _rows_in(self, session):
         """Whether rows exist and the hooks that take a session act"""
-        if self.config.ha or self.config.driver != "managed":
+        if self.config.driver != "managed":
             return False
         return self._has_rows(session)
 
@@ -343,6 +346,7 @@ class PortKeeper:
         helper,
         bound,
         follow_unconfirmed=False,
+        helper_name=None,
     ):
         """A verify within bound seconds, repeated while it learns that a
         port is a switch: routes go only through recorded switches, so rows
@@ -350,12 +354,14 @@ class PortKeeper:
         yet, are reached one level of switches at a time
 
         Only the switches an operator confirmed are routed through, unless
-        follow_unconfirmed, which --confirm-fabric alone passes.
+        follow_unconfirmed, which --confirm-fabric alone passes. helper_name
+        names the helper container, the prober's by default.
         """
         with self._session() as session:
             trusted = self._trusted(session)
         m_key, base = self._m_keys()
-        run = self.driver.prober(helper=helper)
+        named = {"name": helper_name} if helper_name else {}
+        run = self.driver.prober(helper=helper, **named)
         deadline = time.monotonic() + bound
         for _round in range(DISCOVERY_ROUNDS):
             result = prober.verify(
@@ -430,7 +436,7 @@ class PortKeeper:
         """Refuse a start that would strand ports on derived keys: while any
         row holds one, turning per-port keys off depends on m_key_lookup and
         on the m_key group (The group)"""
-        if self.config.ha or self.config.driver != "managed":
+        if self.config.driver != "managed":
             return
         with self._session() as session:
             derived = session.scalar(
@@ -540,8 +546,16 @@ class PortKeeper:
                 )
 
         # Files that are absent are a lost volume, which the rows rebuild;
-        # files that can't be read or parsed fail the start.
-        volume = self._read_cache(container, strict=True)
+        # files that can't be read or parsed fail the start. In HA mode the
+        # volume is never read: its files are this host's from an older
+        # term, if any, and folding them could put back a link or a key
+        # state the rows have since replaced (specs/secured-profile.md, HA
+        # mode). The rows rebuild it, as a lost volume.
+        if self.config.ha:
+            now = _now()
+            volume = ([], {}, now, now)
+        else:
+            volume = self._read_cache(container, strict=True)
         entries = volume[1]
         problem = port_keys.restore_problem(entries, m_key, base, recorded)
         if problem is not None:
@@ -1081,6 +1095,37 @@ class PortKeeper:
             raise ReloadError("the prober's discovery of the switches ran out of time")
         return set(result.switches)
 
+    def reach_switches(self, bound, helper_name=None):
+        """HA mode's reach probe: the switches this node's port reaches by
+        the prober along the recorded links, with each port's key, within
+        bound seconds; or None to ask ibswitches, as without rows
+
+        It writes no rows: a candidate isn't the leader. Rows a check
+        interval behind the leader's are sent both keys where a verify
+        would send them (specs/secured-profile.md, HA mode).
+        """
+        if self.config.driver != "managed":
+            return None
+        with self.manager._lock, self.manager.sessionmaker() as session:
+            ports, links = port_keys.load(session)
+            target = port_keys.load_running(session)
+            recorded = port_keys.load_fingerprint(session)
+        if not ports:
+            return None
+        result = self._verify(
+            ports,
+            links,
+            target_on=target,
+            nothing=port_keys.nothing_derived(ports, recorded, ()),
+            scope={guid for guid, row in ports.items() if row.switch is not False},
+            helper=True,
+            bound=bound,
+            helper_name=helper_name,
+        )
+        if result.own_port_lost:
+            return set()
+        return set(result.switches)
+
     # Sweeps and jobs, in the manager's session
 
     def sweep_errors(self, session, report):
@@ -1124,12 +1169,25 @@ class PortKeeper:
         """Whether a job, whose sweep has its effect, has its ports'
         evidence too: each recorded port it names answered its key, or
         showed its link down, at a check after the last sweep, or is
-        released. A GUID with no row needs none (Lost ports and jobs)."""
-        if self.config.ha or self.config.driver != "managed":
+        released. A GUID with no row needs none (Lost ports and jobs).
+
+        In HA mode only the leader has the evidence, from its checks:
+        another instance never completes a job on a recorded port, and
+        returns its stored status, which the leader writes."""
+        if self.config.driver != "managed":
             return True
         names = effects.loads(job.effect).get("guids", [])
         if not names:
             return True
+        if self.config.ha and not self.manager.term:
+            return not session.scalar(
+                sa.select(sa.func.count())
+                .select_from(db.FabricPort)
+                .where(
+                    db.FabricPort.guid.in_(names),
+                    db.FabricPort.released.is_(False),
+                )
+            )
         rows = {
             row.guid: row
             for row in session.scalars(
@@ -1169,10 +1227,6 @@ class PortKeeper:
 
     # The operator's commands, beside the running manager
 
-    def _refuse_ha(self):
-        if self.config.ha:
-            raise PortKeysError("per-port M_Keys aren't available in HA mode")
-
     def fold_running(self):
         """--confirm-fabric: fold the links and ports the running OpenSM's
         cache lists into the rows, as a check does; returns why it couldn't,
@@ -1196,7 +1250,7 @@ class PortKeeper:
         named and the target off, record the target on if every
         precondition of the turn-on holds, or say which failed (Turning it
         on). The turn-on itself waits for the manager's next start."""
-        if self.config.ha or not self.group_named:
+        if not self.group_named:
             return
         if self.config.driver != "managed":
             return
@@ -1304,7 +1358,6 @@ class PortKeeper:
 
     def states(self):
         """--port-key-states: each recorded port, and the target; no key"""
-        self._refuse_ha()
         with self._session() as session:
             ports, _links = port_keys.load(session)
             target = port_keys.load_target(session)
@@ -1328,7 +1381,6 @@ class PortKeeper:
     def port_m_key(self, guid):
         """--port-m-key: the port's current key, for -y, under AGENTS.md's
         rule on keys"""
-        self._refuse_ha()
         with self._session() as session:
             ports, _links = port_keys.load(session)
         m_key, base = self._m_keys()
@@ -1345,7 +1397,6 @@ class PortKeeper:
 
     def add_link(self, local, peer):
         """--add-link: a link, both directions, and rows for its ports"""
-        self._refuse_ha()
         (guid, port), (peer_guid, peer_port) = local, peer
         if (guid, port) == (peer_guid, peer_port):
             raise PortKeysError("a link joins two different ports")
@@ -1370,7 +1421,6 @@ class PortKeeper:
     def release_port(self, guid):
         """--release-port: complete a lost port's jobs as they are, and exempt
         it from the lost-port rule, until it answers its key again"""
-        self._refuse_ha()
         with self._session() as session:
             row = session.get(db.FabricPort, port_keys.guid_text(guid))
             if row is None:
@@ -1389,7 +1439,6 @@ class PortKeeper:
         recorded port holds a key derived from it any more, and while it
         stayed no start could turn per-port keys on again.
         """
-        self._refuse_ha()
         _m_key, base = self._m_keys()
         with self._session() as session:
             ports, links = port_keys.load(session)
@@ -1416,7 +1465,6 @@ class PortKeeper:
 
     def forget_port(self, guid):
         """--forget-port: drop one port and its links, for removed hardware"""
-        self._refuse_ha()
         text = port_keys.guid_text(guid)
         with self._session() as session:
             row = session.get(db.FabricPort, text)

@@ -74,6 +74,16 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         self._reach = (None, -REACH_CACHE)
         # Whether the last probe found no image, to log only the change
         self._image_missing = False
+        # The hashes of the cache files the start under way wrote, as OpenSM
+        # sees them, for the start request
+        self._cache_hashes = {}
+        # Called for the switches this node's port reaches by the prober,
+        # with per-port M_Key rows, or None to ask ibswitches
+        self.reach_switches = None
+        # The coordinator's start_gate, which gives the start request's
+        # deadline when it's written, or refuses the start; without one, as
+        # in tests, prepare's deadline
+        self.start_gate = None
 
     def _run_kwargs(self):
         kwargs = super()._run_kwargs()
@@ -123,7 +133,20 @@ class HAManagedDocker(docker_driver.ManagedDocker):
 
     pulls_on_start = False
 
-    def start(self):
+    def write_cache(self, container, files):
+        super().write_cache(container, files)
+        # What was written, for the start request's hashes: the cache is
+        # rendered after it would once have been written
+        self._cache_hashes.update(
+            {
+                f"{docker_driver.OPENSM_CACHE_DIR}/{name}": hashlib.sha256(
+                    text.encode("ascii")
+                ).hexdigest()
+                for name, text in files.items()
+            }
+        )
+
+    def start(self, prepare=None):
         # A reach probed before the image went, or a frozen node's restart,
         # mustn't pull it: the start would wait on the registry, holding the
         # lease (see specs/ha.md, Timeouts). Creating the container doesn't
@@ -143,22 +166,47 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             raise docker_driver.ReloadError(
                 f"OpenSM's image {self.config.image} isn't on this node"
             )
+        self._cache_hashes = {}
+
+        def prepared(container):
+            # The start request once every file OpenSM reads is written:
+            # prepare, with per-port M_Keys, rewrites opensm.conf and renders
+            # the cache (specs/secured-profile.md, HA mode).
+            if prepare is not None:
+                prepare(container)
+            self._write_start_request()
+
+        return super().start(prepare=prepared)
+
+    def _write_start_request(self):
         instance, term, deadline = self._start
-        wd.write_atomically(
-            self.state_dir,
-            wd.START,
-            {
-                "boot_id": wd.boot_id(),
-                "instance": instance,
-                "term": term,
-                "deadline": deadline,
-                "hashes": {
-                    inside: _sha256(outside)
-                    for inside, outside in self._container_paths().items()
-                },
-            },
+        hashes = {
+            inside: _sha256(outside)
+            for inside, outside in self._container_paths().items()
+        }
+        hashes.update(self._cache_hashes)
+        gate = (
+            self.start_gate()
+            if self.start_gate is not None
+            else contextlib.nullcontext(deadline)
         )
-        return super().start()
+        with gate as deadline:
+            # A start after a stop of the same takeover, as when a turn-on
+            # fails and OpenSM is started again, removes that stop request;
+            # the gate refuses once a step-down has revoked the start.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(self.state_dir, wd.STOP))
+            wd.write_atomically(
+                self.state_dir,
+                wd.START,
+                {
+                    "boot_id": wd.boot_id(),
+                    "instance": instance,
+                    "term": term,
+                    "deadline": deadline,
+                    "hashes": hashes,
+                },
+            )
 
     def stop(self):
         """Ask the watchdog to stop OpenSM; kill its container, paused or not,
@@ -217,6 +265,11 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # Fencing); self-stop and the watchdog don't depend on it.
         LOG.info("Asking %s's SM to stop isn't implemented yet", node)
 
+    def node_ports(self):
+        """This host's physical InfiniBand ports, for its node row, probed
+        in the coordinator's helper container"""
+        return self.physical_ports(name=self.reach_name)
+
     def reach(self):
         """Switches this node's port reaches, or None if its port is down"""
         value, when = self._reach
@@ -244,15 +297,30 @@ class HAManagedDocker(docker_driver.ManagedDocker):
                 LOG.warning("No OpenSM image here, so this node isn't eligible")
         if not present:
             return None
-        key = self.m_key()
+        switches = None
+        if self.reach_switches is not None:
+            # With per-port M_Key rows, ibswitches -y with one key can't
+            # pass a re-keyed port: the prober finds the switches, in a
+            # helper container of the coordinator's own.
+            try:
+                switches = self.reach_switches()
+            except Exception as e:  # noqa: BLE001 - nothing reached
+                LOG.warning("Can't probe this node's reach with the prober: %s", e)
+                return None
+        key = None if switches is not None else self.m_key()
         # The key goes in the environment, never the command: a command that
         # exits non-zero raises ContainerError, whose message is the whole
         # command, and that was logged below, M_Key and all.
         command = [
             "sh",
             "-c",
-            f"timeout {REACH_TIMEOUT} ibstat; echo ===; timeout {REACH_TIMEOUT} "
-            "ibswitches " + ('-y "$AFM_M_KEY"' if key else ""),
+            f"timeout {REACH_TIMEOUT} ibstat; echo ===; "
+            + (
+                ""
+                if switches is not None
+                else f"timeout {REACH_TIMEOUT} ibswitches "
+                + ('-y "$AFM_M_KEY"' if key else "")
+            ),
         ]
         try:
             output = self.client.containers.run(
@@ -275,11 +343,13 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         except docker.errors.DockerException as e:
             LOG.warning("Can't probe this node's reach: %s", e)
             return None
-        status, _, switches = output.decode(errors="replace").partition("===")
+        status, _, listed = output.decode(errors="replace").partition("===")
         # An InfiniBand port with its link up, in Init or above
         if not any(
             _PORT_UP.search(port) and _LINK_UP.search(port) and _INFINIBAND.search(port)
             for port in _PORT_BLOCK.split(status)[1:]
         ):
             return None
-        return len(_SWITCH.findall(switches))
+        if switches is not None:
+            return len(switches)
+        return len(_SWITCH.findall(listed))

@@ -24,12 +24,53 @@ import dataclasses
 import datetime
 import json
 import logging
+import secrets
 
 import sqlalchemy as sa
 
+from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
 
 LOG = logging.getLogger(__name__)
+
+
+# The configuration epoch, and the key of the configuration hash's HMAC, as
+# secrets rows (see specs/ha.md, Configuration epochs)
+EPOCH = "config_epoch"
+HASH_KEY = "config_hash_key"
+# An epoch allows one hash, or two during a change.
+MAX_HASHES = 2
+
+
+def _epoch(session, lock=False):
+    """(epoch, allowed hashes as a tuple), or None if none is stored"""
+    row = session.get(db.Secret, EPOCH, with_for_update=lock)
+    if row is None:
+        return None
+    value = json.loads(row.value)
+    return value["epoch"], tuple(value["hashes"])
+
+
+def _store_epoch(session, epoch, hashes):
+    # A fresh nonce, so that rewriting the same epoch still changes the row,
+    # which Galera then certifies against (see acquire)
+    value = json.dumps(
+        {"epoch": epoch, "hashes": sorted(hashes), "nonce": secrets.token_hex(8)}
+    )
+    row = session.get(db.Secret, EPOCH)
+    if row is None:
+        session.add(db.Secret(name=EPOCH, value=value))
+    else:
+        row.value = value
+
+
+class UnsafeSettings(Exception):
+    """An epoch's cluster settings that would shorten a wait while an
+    instance with the old settings may still run OpenSM"""
+
+    def __init__(self, names):
+        super().__init__(", ".join(names))
+        self.names = names
 
 
 class NotPrimary(Exception):
@@ -49,6 +90,9 @@ class LeaseState:
     confirmed_term: int
     # Seconds since leadership last moved, by the database's clock
     moved_age: float = 0.0
+    # The hashes the configuration epoch allows, or None while no epoch is
+    # stored, when every hash is allowed
+    allowed_hashes: tuple | None = None
 
 
 def _utc_now(session):
@@ -81,7 +125,11 @@ class GaleraLease:
 
     def _session(self):
         session = self.sessionmaker()
-        _check_primary(session)
+        try:
+            _check_primary(session)
+        except BaseException:
+            session.close()
+            raise
         return session
 
     @staticmethod
@@ -117,6 +165,7 @@ class GaleraLease:
                 freeze_request_deadline_passed=deadline is not None and now > deadline,
                 confirmed_term=lease.confirmed_term,
                 moved_age=_age(lease.moved_at, now),
+                allowed_hashes=epoch[1] if (epoch := _epoch(session)) else None,
             )
             session.commit()
             return state
@@ -151,12 +200,18 @@ class GaleraLease:
             return lease.confirmed_term == lease.freeze_term
         return False
 
-    def acquire(self, node, instance_uuid, seen_term, seen_counter, released):
+    def acquire(
+        self, node, instance_uuid, seen_term, seen_counter, released, config_hash=None
+    ):
         """Take the lease, if it is still as seen: unchanged since it
         expired, or released. Adds this instance's target-set entry, clears
         its node's verified-stop mark, and removes its node's older entries
         that the mark covers, all in one transaction. Returns the new term,
-        or None if someone else moved first."""
+        or None if someone else moved first.
+
+        With config_hash, only if the configuration epoch allows it; with no
+        epoch stored, the takeover stores one that allows only it (see
+        specs/ha.md, Configuration epochs)."""
         with self._session() as session:
             lease = self._row(session, lock=True)
             if (lease.term, lease.counter, lease.released) != (
@@ -166,6 +221,25 @@ class GaleraLease:
             ):
                 session.rollback()
                 return None
+            if config_hash is not None:
+                epoch = _epoch(session, lock=True)
+                if epoch is None:
+                    _store_epoch(session, 1, [config_hash])
+                    LOG.warning(
+                        "Recorded configuration epoch 1, allowing this node's "
+                        "configuration, %s",
+                        config_hash[:12],
+                    )
+                elif config_hash not in epoch[1]:
+                    session.rollback()
+                    return None
+                else:
+                    # Rewritten, unchanged but for its nonce: Galera
+                    # certifies only rows both transactions change, so an
+                    # epoch recorded meanwhile on another node, perhaps with
+                    # settings this taker's waits don't follow, conflicts
+                    # with this takeover rather than passing it.
+                    _store_epoch(session, *epoch)
             deadline = lease.freeze_request_deadline
             now = _utc_now(session)
             if deadline is not None and deadline.tzinfo is None:
@@ -385,13 +459,148 @@ class GaleraLease:
             return count or 0
 
     def nodes(self):
+        """Each node row, as (name, instance UUID, heartbeat, reach,
+        stopped, configuration hash)"""
         with self._session() as session:
             rows = [
-                (n.name, n.instance_uuid, n.heartbeat, n.reach, n.stopped)
+                (
+                    n.name,
+                    n.instance_uuid,
+                    n.heartbeat,
+                    n.reach,
+                    n.stopped,
+                    n.config_hash,
+                )
                 for n in session.scalars(sa.select(db.Node))
             ]
             session.commit()
             return rows
+
+    # Node port GUIDs (see specs/ha.md, The secured profile)
+
+    def record_ports(self, node, instance_uuid, guids):
+        """Record a successful probe's physical port GUIDs, as integers, in
+        this instance's node row, and among the known SM ports, in one
+        transaction; False if the row isn't this instance's"""
+        texts = sorted(f"{guid:016x}" for guid in guids)
+        if not texts:
+            return False
+        with self._session() as session:
+            row = session.get(db.Node, node)
+            if row is None or row.instance_uuid != instance_uuid:
+                session.rollback()
+                return False
+            row.port_guids = json.dumps(texts)
+            now = _utc_now(session)
+            for text in texts:
+                if session.get(db.KnownSMPort, text) is None:
+                    session.add(db.KnownSMPort(guid=text, own=False, recorded=now))
+            session.commit()
+            return True
+
+    def node_ports(self):
+        """Each node row's port GUIDs, as {name: frozenset of integers}"""
+        with self._session() as session:
+            rows = {
+                n.name: frozenset(int(g, 16) for g in json.loads(n.port_guids or "[]"))
+                for n in session.scalars(sa.select(db.Node))
+            }
+            session.commit()
+            return rows
+
+    def forget_node(self, name, heartbeat=None):
+        """Remove a retired node's row, if it's in no target-set entry and,
+        with heartbeat, its heartbeat is still that, or, without, it's marked
+        stopped. Its port GUIDs stay among the known SM ports."""
+        with self._session() as session:
+            self._row(session, lock=True)
+            row = session.get(db.Node, name, with_for_update=True)
+            entries = session.scalar(
+                sa.select(sa.func.count())
+                .select_from(db.TargetEntry)
+                .where(db.TargetEntry.node == name)
+            )
+            if (
+                row is None
+                or entries
+                or (heartbeat is None and not row.stopped)
+                or (heartbeat is not None and row.heartbeat != heartbeat)
+            ):
+                session.rollback()
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    # Configuration epochs (see specs/ha.md, Configuration epochs)
+
+    def hash_key(self):
+        """The configuration hash's HMAC key, generated once"""
+        with self._session() as session:
+            row = session.get(db.Secret, HASH_KEY)
+            if row is None:
+                row = db.Secret(name=HASH_KEY, value=secrets.token_hex(32))
+                session.add(row)
+                try:
+                    session.commit()
+                except sa.exc.IntegrityError:
+                    # Another instance stored one first.
+                    session.rollback()
+                    row = session.get(db.Secret, HASH_KEY)
+            value = row.value
+            session.commit()
+            return value
+
+    def epoch(self):
+        """(epoch, allowed hashes), or None while none is stored"""
+        with self._session() as session:
+            epoch = _epoch(session)
+            session.commit()
+            return epoch
+
+    def allow_config(self, hashes, seen=False, settings=None):
+        """Record a new epoch that allows exactly these hashes; return its
+        number, or None if seen is given, as the epoch read before, (epoch,
+        hashes) or None, and the epoch has moved since. With settings, the
+        recorder's [ha] settings, as JSON, are stored with it: they're in
+        its hash, so the nodes the epoch allows agree with them. Raises
+        UnsafeSettings, recording nothing, if they move a timing setting in
+        the unsafe direction while the target set isn't empty, when an
+        instance with the old settings may still run OpenSM."""
+        hashes = sorted(set(hashes))
+        if not 1 <= len(hashes) <= MAX_HASHES:
+            raise ValueError(f"an epoch allows 1 to {MAX_HASHES} hashes")
+        with self._session() as session:
+            epoch = _epoch(session, lock=True)
+            if seen is not False and epoch != seen:
+                session.rollback()
+                return None
+            number = (epoch[0] if epoch else 0) + 1
+            row = None
+            if settings is not None:
+                row = session.get(db.Secret, "ha_settings", with_for_update=True)
+                ours = json.loads(settings)
+                unsafe = (
+                    config_mod.unsafe_setting_moves(json.loads(row.value), ours)
+                    if row is not None
+                    else []
+                )
+                targets = session.scalar(
+                    sa.select(sa.func.count()).select_from(db.TargetEntry)
+                )
+                if unsafe and targets:
+                    session.rollback()
+                    raise UnsafeSettings(unsafe)
+            _store_epoch(session, number, hashes)
+            if settings is not None:
+                if row is None:
+                    session.add(db.Secret(name="ha_settings", value=settings))
+                else:
+                    row.value = json.dumps(
+                        {**json.loads(row.value), **ours}, sort_keys=True
+                    )
+            session.commit()
+            return number
 
     # The freeze (see specs/ha.md, Freeze)
 

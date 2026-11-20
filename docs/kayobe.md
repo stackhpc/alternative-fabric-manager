@@ -47,9 +47,10 @@ deployed, see [infiniband-networks.md](infiniband-networks.md).
 - **M_Key and SM_Key protection.** HA mode refuses to start without the
   `m_key` and `sm_key` hardening groups. Read
   [opensm-hardening.md](opensm-hardening.md) before enabling them on a
-  fabric shared with hosts outside OpenStack. HA mode refuses the
-  experimental `m_key_per_port` group (per-port M_Keys), so this
-  deployment can't use it yet.
+  fabric shared with hosts outside OpenStack. The experimental groups,
+  `m_key_per_port` (per-port M_Keys) among them, run in HA mode too,
+  untested there on hardware: see its In HA mode section before naming
+  any, after every node runs a release with configuration epochs.
 
 ## Virtualised and bare metal
 
@@ -442,10 +443,12 @@ image = {{ afm_opensm_image }}
 manager_container = {{ afm_container_name }}
 config_dir = /etc/opensm
 host_config_dir = /etc/opensm
-# Not m_key_per_port, which HA mode refuses (see opensm-hardening.md)
+# The experimental groups, such as m_key_per_port, only as
+# opensm-hardening.md's In HA mode says
 hardening = m_key, sm_key, enforcement
-# HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts)
-job_timeout = 300
+# HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts):
+# 237 s here, or 327 s with m_key_per_port, so 360 covers either
+job_timeout = 360
 start_timeout = 60
 
 [ha]
@@ -626,7 +629,7 @@ neutron_mlnx_physnet_mappings:
 
 Nova must schedule instances only to hosts with a free virtual function,
 and, since a takeover can hold a port's job for up to the job timeout,
-300 s, wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
+360 s, wait longer for its ports to plug. `etc/kayobe/kolla/config/nova.conf`:
 
 ```ini
 [DEFAULT]
@@ -646,7 +649,7 @@ Ironic needs the `neutron` network interface, and must fail a deployment
 whose port fails to bind: keep `[neutron] fail_on_port_binding_failure =
 True`, the default. Its wait for ports, `[agent]
 neutron_agent_max_attempts` × `neutron_agent_status_retry_interval`, is
-1000 s by default, longer than a takeover's 300 s.
+1000 s by default, longer than the job timeout's 360 s.
 
 Inspection records each InfiniBand port's client ID in the Ironic port's
 `extra` `client-id`, if the inspection image can see the port. When Kayobe

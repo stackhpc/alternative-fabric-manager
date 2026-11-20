@@ -27,7 +27,7 @@ def test_sa_rate_is_experimental():
     assert "sa_rate" in config_mod.parse_hardening("all, sa_rate")
 
 
-def test_ha_refuses_sa_rate():
+def test_ha_allows_sa_rate():
     config = config_mod.Config(
         token="x",
         ha=True,
@@ -35,7 +35,7 @@ def test_ha_refuses_sa_rate():
         job_timeout=400,
         hardening="all, sa_rate",
     )
-    assert any("SA request rate" in p for p in config_mod._ha_problems(config))
+    assert not any("SA request rate" in p for p in config_mod._ha_problems(config))
 
 
 def test_the_group_renders_the_threshold():

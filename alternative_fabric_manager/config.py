@@ -253,15 +253,12 @@ class Config:
     @property
     def allowed_sm_in_effect(self):
         """Whether the manager works out and checks OpenSM's
-        allowed_sm_guids list: the group named, or, in single node, the
-        option overridden, which gets the group's checks too
-
-        In HA mode an override is passed to OpenSM unchecked, as 0.3.0 did
-        and its docs told HA deployments to set it: refusing it would stop
-        each upgraded node of such a cluster from starting."""
+        allowed_sm_guids list: the group named, or the option overridden,
+        which gets the group's checks too (in HA mode, against the node
+        rows' ports; see specs/secured-profile.md, HA mode)"""
         if "allowed_sm" in self.hardening_groups:
             return True
-        return "allowed_sm_guids" in self.opensm_conf and not self.ha
+        return "allowed_sm_guids" in self.opensm_conf
 
     @property
     def partitions_file(self):
@@ -452,8 +449,7 @@ class Config:
         the manager can't read this host's ports
 
         See specs/secured-profile.md, Allowed SM GUIDs, Required groups and
-        Overrides. HA mode refuses it in _ha_problems, which validate checks
-        first.
+        Overrides, and HA mode.
         """
         override = self.opensm_conf.get("allowed_sm_guids")
         if override is not None and parse_allowed_sm_guids(override) is None:
@@ -462,11 +458,11 @@ class Config:
                 "and up to 16 hex digits, not 0) separated by commas: OpenSM "
                 "would otherwise disable the list"
             )
-        if self.ha and "allowed_sm_guids" in self.opensm_conf:
-            LOG.warning(
-                "[opensm_conf] allowed_sm_guids is passed to OpenSM unchecked in "
-                "HA mode: it must list every node's physical ports, or a "
-                "takeover's OpenSM may be ignored or refuse to run"
+        if self.ha and override is not None and override.strip() in ("0", "0x0"):
+            # Each leader must accept the others' SMs.
+            raise ConfigError(
+                "[opensm_conf] allowed_sm_guids can't be 0 in HA mode: it must "
+                "list every node's physical ports"
             )
         if not self.allowed_sm_in_effect:
             return
@@ -555,6 +551,100 @@ def cache_volume_writable(volumes):
     return False
 
 
+# opensm.conf options left out of the configuration hash (specs/ha.md,
+# Configuration epochs): rolling ones, which move no protection, so a change
+# to them is rolled out as an upgrade, with no epoch; and node-specific ones,
+# which differ between nodes by design. An option whose name ends in _file
+# or _dir is a path, node-specific too.
+ROLLING_OPTIONS = frozenset(
+    {
+        "sweep_interval",
+        "routing_engine",
+        "log_flags",
+        "force_log_flush",
+        "log_max_size",
+        "accum_log_file",
+        "verbosity",
+    }
+)
+NODE_OPTIONS = frozenset({"guid"})
+
+
+def _hashed_option(name):
+    return not (
+        name in ROLLING_OPTIONS
+        or name in NODE_OPTIONS
+        or name.endswith("_file")
+        or name.endswith("_dir")
+    )
+
+
+def hashed_settings(config):
+    """What the configuration hash covers, as a dict that JSON can encode:
+    everything that decides the partitions and how OpenSM protects the
+    fabric (specs/ha.md, Configuration epochs)"""
+    import json
+
+    template = ""
+    if config.partitions_template:
+        with open(config.partitions_template) as f:
+            template = f.read()
+    return {
+        "template": template,
+        "default_partition": config.default_partition,
+        "flat_pkey": config.flat_pkey,
+        "shared_default_partition": config.shared_default_partition,
+        "ipoib": [config.ipoib_rate, config.ipoib_mtu, config.ipoib_sl],
+        "hardening": sorted(config.hardening_groups),
+        "key_lease_period": config.key_lease_period,
+        # The cluster settings, so that an epoch moved by agreement can move
+        # them too
+        "ha_settings": json.loads(ha_settings(config)),
+        "opensm_conf": {
+            name: str(value).strip()
+            for name, value in sorted(config.opensm_conf.items())
+            if _hashed_option(name)
+        },
+    }
+
+
+def config_hash(config, key):
+    """The configuration hash: an HMAC-SHA256 of hashed_settings, keyed by a
+    secret stored in the database, so that the hash, which isn't secret,
+    can't be used to test guesses of a key set in [opensm_conf]"""
+    import hashlib
+    import hmac
+    import json
+
+    text = json.dumps(hashed_settings(config), sort_keys=True, separators=(",", ":"))
+    return hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest()
+
+
+# The cluster settings whose change could break the waits of specs/ha.md,
+# Timeouts, while an instance with the old value may still run OpenSM: each
+# may only move in the direction given, +1 up and -1 down, unless no
+# instance may be running OpenSM (see Configuration epochs).
+SAFE_SETTING_MOVES = {
+    "lease_timeout": +1,
+    "watchdog_timeout": +1,
+    "self_stop_timeout": -1,
+    "ha_period": -1,
+    "call_timeout": -1,
+}
+
+
+def unsafe_setting_moves(stored, ours):
+    """The settings, as names, that moving from stored to ours (dicts, as
+    ha_settings' JSON) would change in the unsafe direction"""
+    return sorted(
+        name
+        for name, direction in SAFE_SETTING_MOVES.items()
+        if name in stored
+        and name in ours
+        and (ours[name] - stored[name]) * direction < 0
+    )
+
+
 def ha_settings(config):
     """The settings every instance of a cluster must share, as stored"""
     import json
@@ -633,6 +723,12 @@ def takeover_bound(config):
     the new leader's OpenSM starting: as long as the fabric may go without a
     subnet manager in an unclean takeover"""
     apply_bound = config.sweep_timeout + 5 + 5 * config.call_timeout + 10
+    # With per-port M_Keys, a start verifies the ports first (start_timeout
+    # / 2 at most), and a turn-on waits for its success rule (start_timeout):
+    # the usual start. A turn-on that fails takes longer, once.
+    port_keys = (
+        1.5 * config.start_timeout if "m_key_per_port" in config.hardening_groups else 0
+    )
     return (
         apply_bound
         + config.lease_timeout
@@ -641,6 +737,7 @@ def takeover_bound(config):
         + 5
         + config.watchdog_timeout
         + config.start_timeout
+        + port_keys
         + 5
     )
 
@@ -703,37 +800,9 @@ def _ha_problems(config):
         )
     if str(config.opensm_conf.get("m_key_protection_level", "1")) == "0":
         problems.append("M_Key protection level must be 1 or more")
-    # HA needs configuration epochs, so that leaders with and without the
-    # group can't alternate, and a reach probe that works on re-keyed ports
-    # (specs/secured-profile.md, Per-port M_Keys, requirement 5).
-    if "m_key_per_port" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include m_key_per_port: per-port M_Keys "
-            "aren't supported in HA mode yet"
-        )
-    # Untested anywhere: experimental groups are single node until their
-    # hardware tests run (specs/secured-profile.md, SA request rate).
-    if "sa_rate" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include sa_rate: the SA request rate "
-            "limit isn't supported in HA mode yet"
-        )
-    # A takeover by another host hasn't been shown to derive the same class
-    # keys (specs/secured-profile.md, The seed).
-    if "class_keys" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include class_keys: class keys aren't "
-            "supported in HA mode yet"
-        )
-    # HA needs node rows with port GUIDs, configuration epochs, the managed
-    # node SM rule and the fence ask first (specs/secured-profile.md,
-    # Allowed SM GUIDs, HA). A list typed by hand is passed on unchecked, as
-    # in 0.3.0 (see Config.allowed_sm_in_effect).
-    if "allowed_sm" in config.hardening_groups:
-        problems.append(
-            "[opensm] hardening can't include allowed_sm: allowed SMs aren't "
-            "supported in HA mode yet"
-        )
+    # The secured profile's experimental groups run in HA mode too, behind
+    # configuration epochs and the leader fence (specs/secured-profile.md, HA
+    # mode); experimental means untested on hardware, in either mode.
     return problems
 
 

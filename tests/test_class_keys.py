@@ -25,7 +25,7 @@ def test_class_keys_is_experimental():
     assert "class_keys" in config_mod.parse_hardening("all, class_keys")
 
 
-def test_ha_refuses_class_keys():
+def test_ha_allows_class_keys():
     config = config_mod.Config(
         token="x",
         ha=True,
@@ -33,7 +33,7 @@ def test_ha_refuses_class_keys():
         job_timeout=400,
         hardening="all, class_keys",
     )
-    assert any("class keys" in p for p in config_mod._ha_problems(config))
+    assert not any("class keys" in p for p in config_mod._ha_problems(config))
 
 
 def test_the_group_renders_every_class_with_the_seed_and_the_lease():
@@ -236,14 +236,26 @@ def test_disabling_one_class_keeps_the_guard_on_the_others(ck_config, sessionmak
         _start(ck_config, sessionmaker)
 
 
-def test_ha_mode_neither_guards_nor_records(ck_config, sessionmaker):
+def test_ha_mode_guards_and_records_behind_the_fence(ck_config, sessionmaker):
+    from alternative_fabric_manager import manager as manager_module
+
     ck_config.ha = True
     manager = manager_mod.Manager(ck_config, sessionmaker, FakeOpenSM())
+    manager.term = 2
     with sessionmaker() as session:
         session.add(db.State(name=class_keys.RECORD, value=7))
         session.commit()
-    manager.class_keys.refuse_start(seed_kept=True)
-    assert manager.class_keys.recorded() == set()
+    assert manager.class_keys.recorded() == {"vs", "cc", "n2n"}
+    # The record is written behind the fence, which it raises.
+    manager.class_keys.record({"class_keys"}, {"vs_key_enable": "1"})
+    with sessionmaker() as session:
+        assert session.get(db.State, manager_module.LEADER_FENCE).value == 2
+    # A deposed leader reads nothing, and writes nothing.
+    manager.term = 1
+    with pytest.raises(manager_module.StaleLeader):
+        manager.class_keys.recorded()
+    with pytest.raises(manager_module.StaleLeader):
+        manager.class_keys.record({"class_keys"}, {})
 
 
 REJECTED = (

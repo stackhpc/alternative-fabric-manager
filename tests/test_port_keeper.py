@@ -15,7 +15,14 @@ import pytest
 import sqlalchemy as sa
 
 from alternative_fabric_manager import config as config_mod
-from alternative_fabric_manager import db, opensm_conf, port_keeper, port_keys, prober
+from alternative_fabric_manager import (
+    db,
+    effects,
+    opensm_conf,
+    port_keeper,
+    port_keys,
+    prober,
+)
 from alternative_fabric_manager import manager as manager_mod
 from alternative_fabric_manager.drivers import Fabric, ReloadError, SweepReport
 from alternative_fabric_manager.port_keys import DERIVED, M_KEY, UNKNOWN
@@ -408,13 +415,81 @@ def test_inert_without_the_group_or_rows(world):
         assert session.get(db.State, port_keys.RUNNING) is None
 
 
-def test_inert_in_ha_mode(world):
+def _take_over(world, term):
+    """A takeover's start of a new manager in HA mode, at term"""
+    world.manager.stop()
+    manager = world.new_manager()
+    manager.term = term
+    manager.start()
+    return manager
+
+
+def test_a_takeover_renders_the_cache_from_the_rows_not_the_volume(world):
+    # specs/secured-profile.md, HA mode: the volume is this host's from an
+    # older term, which may name links the rows have since replaced.
+    running_with_rows(world)
     world.config.ha = True
-    keeper = world.keeper()
-    assert not keeper.active()
-    assert keeper.check() is None
-    with pytest.raises(port_keeper.PortKeysError, match="HA"):
-        keeper.states()
+    # Closed at once: an open transaction holds a server database's
+    # metadata lock, which the next test's DROP DATABASE waits on.
+    with world.sessionmaker() as session:
+        links = set(port_keys.load(session)[1])
+    stale = "".join(f"0x{Z:016x}:1 0x{S1:016x}:7\n0x{S1:016x}:7 0x{Z:016x}:1\n")
+    world.driver.volume["neighbors"] = (stale, _now() + datetime.timedelta(hours=1))
+    reads = world.driver.reads
+    _take_over(world, 1)
+    # Nothing read before the start, nor folded from the stale file
+    assert world.driver.reads == reads
+    assert Z not in world.rows()
+    with world.sessionmaker() as session:
+        assert set(port_keys.load(session)[1]) == links
+        written = world.driver.writes[-1]["neighbors"]
+        assert written == port_keys.render_neighbors(port_keys.load(session)[1])
+        assert session.get(db.State, manager_mod.LEADER_FENCE).value == 1
+
+
+def test_a_turn_on_in_ha_mode(world):
+    running_with_rows(world)
+    world.config.ha = True
+    assert confirm(world).armed
+    _take_over(world, 2)
+    world.manager.reconcile()
+    assert world.driver.per_port() and world.state()["confirmed"]
+
+
+def test_a_deposed_leader_writes_no_rows(world):
+    running_with_rows(world)
+    world.config.ha = True
+    _take_over(world, 3)
+    deposed = world.manager
+    successor = world.new_manager()
+    successor.term = 4
+    with successor.fenced_session() as session:
+        session.commit()
+    with pytest.raises(manager_mod.StaleLeader):
+        deposed.port_keeper.check()
+
+
+def test_another_instance_never_completes_a_job_on_a_recorded_port(world):
+    running_with_rows(world)
+    world.config.ha = True
+    other = world.new_manager()
+    assert other.term == 0
+    job = db.Job(effect=effects.dumps({"guids": [f"{TN:016x}"]}))
+    with world.sessionmaker() as session:
+        assert not other.port_keeper.job_ready(session, job)
+        # A GUID with no row needs no evidence.
+        job = db.Job(effect=effects.dumps({"guids": [f"{Z:016x}"]}))
+        assert other.port_keeper.job_ready(session, job)
+
+
+def test_the_reach_probe_finds_the_switches_and_writes_nothing(world):
+    running_with_rows(world)
+    world.config.ha = True
+    candidate = world.new_manager()
+    before = world.rows()
+    assert candidate.port_keeper.reach_switches(5) == {S1, S2}
+    assert world.rows() == before
+    assert world.driver.probes[-1] is True
 
 
 def test_rows_with_another_driver_alarm_and_stay_inert(world, caplog):
@@ -1740,8 +1815,8 @@ def test_confirm_fabric_with_ibswitches_prints_guids_only(world, monkeypatch, ca
     assert world.rows() == {}
 
 
-@pytest.mark.parametrize("change", [{"ha": True}, {"driver": "docker"}])
-def test_confirm_fabric_in_ha_or_with_another_driver_confirms_as_before(
+@pytest.mark.parametrize("change", [{"driver": "docker"}])
+def test_confirm_fabric_with_another_driver_confirms_as_before(
     world, monkeypatch, capsys, change
 ):
     running_with_rows(world)

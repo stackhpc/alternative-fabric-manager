@@ -590,9 +590,18 @@ class ManagedDocker(DockerReloader):
         and removed"""
         return f"{self.container_name}-prober"
 
-    def _remove_prober(self):
+    @property
+    def reach_name(self):
+        """The helper container HA mode's coordinator runs its probes in,
+        beside the applier's: its own name, so that neither removes the
+        other's"""
+        return f"{self.container_name}-reach"
+
+    def _remove_prober(self, name=None):
         with contextlib.suppress(docker.errors.NotFound):
-            self.client.containers.get(self.prober_name).remove(force=True, v=True)
+            self.client.containers.get(name or self.prober_name).remove(
+                force=True, v=True
+            )
 
     def start(self, prepare=None):
         """Start OpenSM, with its files already written
@@ -708,7 +717,9 @@ class ManagedDocker(DockerReloader):
         if not written:
             raise ReloadError("Docker didn't write OpenSM's cache")
 
-    def prober(self, helper=False, timeout=PROBE_TIMEOUT, parallel=PROBE_PARALLEL):
+    def prober(
+        self, helper=False, timeout=PROBE_TIMEOUT, parallel=PROBE_PARALLEL, name=None
+    ):
         """A runner for prober.verify: run(gets) -> (own_guids, answers),
         one batch of Gets in parallel, which raises ReloadError (ProbeError
         for what the script did) if it fails
@@ -716,7 +727,8 @@ class ManagedDocker(DockerReloader):
         By default the script runs in the running OpenSM's container; with
         helper, in a container of its own from OpenSM's image, as before a
         start, when no OpenSM runs. The Gets and their keys travel in the
-        script's environment, never its command line.
+        script's environment, never its command line. name is the helper
+        container's, the prober's by default.
         """
 
         def run(gets):
@@ -725,7 +737,7 @@ class ManagedDocker(DockerReloader):
                 # Each Get may take the timeout, a batch of them at a time
                 batches = -(-len(gets) // parallel)
                 wait = batches * (timeout + 2) + 30
-                code, output = self._probe_in_helper(environment, wait)
+                code, output = self._probe_in_helper(environment, wait, name)
             else:
                 code, output = self._probe_in_opensm(environment)
             if code != 0:
@@ -754,12 +766,12 @@ class ManagedDocker(DockerReloader):
         except docker.errors.DockerException as e:
             raise ReloadError(f"Docker: can't run the prober: {e}") from e
 
-    def _probe_in_helper(self, environment, wait):
-        return self._run_helper(probes.SCRIPT, environment, wait)
+    def _probe_in_helper(self, environment, wait, name=None):
+        return self._run_helper(probes.SCRIPT, environment, wait, name)
 
-    def _run_helper(self, script, environment, wait):
-        """Run script by sh in a helper container of OpenSM's image, as
-        the prober's: (status, stdout)"""
+    def _run_helper(self, script, environment, wait, name=None):
+        """Run script by sh in a helper container of OpenSM's image, named
+        name, the prober's by default: (status, stdout)"""
         # Created, not run: containers.run() would pull a missing image, and
         # a start mustn't wait on a registry.
         try:
@@ -770,9 +782,9 @@ class ManagedDocker(DockerReloader):
             raise ReloadError(f"OpenSM's image {self.config.image} isn't on this host")
         container = None
         try:
-            self._remove_prober()
+            self._remove_prober(name)
             container = self.client.containers.create(
-                name=self.prober_name,
+                name=name or self.prober_name,
                 image=self.config.image,
                 entrypoint=["sh", "-c"],
                 command=[script],
@@ -803,7 +815,7 @@ class ManagedDocker(DockerReloader):
 
     # Allowed SMs (specs/secured-profile.md, Allowed SM GUIDs)
 
-    def physical_ports(self):
+    def physical_ports(self, name=None):
         """The port GUIDs of this host's physical InfiniBand ports, as a set
         of ints, read from sysfs in a helper container of OpenSM's image,
         before OpenSM starts; raises ReloadError if it can't tell
@@ -823,7 +835,7 @@ class ManagedDocker(DockerReloader):
                     f"can't pull OpenSM's image: {type(e).__name__}"
                 ) from e
         code, output = self._run_helper(
-            allowed_sm.PORTS_SCRIPT, {}, allowed_sm.PROBE_TIMEOUT
+            allowed_sm.PORTS_SCRIPT, {}, allowed_sm.PROBE_TIMEOUT, name
         )
         if code != 0:
             raise allowed_sm.ProbeError(f"the port probe exited with status {code}")

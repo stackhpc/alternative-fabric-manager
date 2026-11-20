@@ -15,6 +15,7 @@
 import datetime
 import enum
 import os
+import threading
 
 import sqlalchemy as sa
 from sqlalchemy import orm
@@ -33,6 +34,8 @@ Timestamp = sa.DateTime(timezone=True).with_variant(
 # Each database call's timeout, in seconds: a call blocked on an
 # unreachable database must not hold up its loop (see specs/ha.md)
 CALL_TIMEOUT = 3
+# How long a session on SQLite waits for another thread's to close
+SQLITE_SESSION_WAIT = 60
 # MariaDB's error for a variable the server doesn't have
 UNKNOWN_SYSTEM_VARIABLE = 1193
 
@@ -272,6 +275,11 @@ class Node(Base):
     reach: orm.Mapped[int] = orm.mapped_column(default=0)
     # Its adapters' node GUIDs, as a JSON list of hex strings
     adapters: orm.Mapped[str] = orm.mapped_column(sa.Text, default="[]")
+    # Its physical functions' port GUIDs, as a JSON list of 16 hex digits
+    # each, from the last probe that found any (see specs/ha.md, The
+    # secured profile). Nullable, so that the previous version, which
+    # doesn't write it, can share the database during a rolling upgrade.
+    port_guids: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
     # Its OpenSM verified stopped: by which instance, at which lease term
     verified_stop_uuid: orm.Mapped[str] = orm.mapped_column(sa.String(36), default="")
     verified_stop_term: orm.Mapped[int] = orm.mapped_column(default=-1)
@@ -365,6 +373,9 @@ _ADDED_COLUMNS = {
     "applied": {
         "term": "INTEGER NOT NULL DEFAULT 0",
         "contested": "BOOLEAN NOT NULL DEFAULT 0",
+    },
+    "nodes": {
+        "port_guids": "TEXT",
     },
     "networks": {
         "revision": "INTEGER",
@@ -559,6 +570,43 @@ def make_sessionmaker(database, call_timeout=CALL_TIMEOUT):
     return _make_sqlite_sessionmaker(database)
 
 
+class _ExclusiveSession(orm.Session):
+    """A session that has SQLite's one connection to itself until it closes
+
+    Every session shares one sqlite3 connection (see
+    _make_sqlite_sessionmaker), and two threads using it at once share its
+    transaction and cursors, and can crash the interpreter. The manager
+    already serialises its sessions with its lock; this covers the rest,
+    such as an HA coordinator's threads in the unit tests. The lock is
+    taken after the manager's, never before, so the wait only bounds a
+    session left open by mistake: it raises rather than hangs.
+    """
+
+    def __init__(self, *args, exclusive, **kwargs):
+        if not exclusive.acquire(timeout=SQLITE_SESSION_WAIT):
+            raise RuntimeError(
+                f"Another thread held the SQLite session for over "
+                f"{SQLITE_SESSION_WAIT} s"
+            )
+        self._exclusive = exclusive
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self._release()
+            raise
+
+    def _release(self):
+        lock, self._exclusive = self._exclusive, None
+        if lock is not None:
+            lock.release()
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._release()
+
+
 def _make_sqlite_sessionmaker(database):
     """Return a session factory for an SQLite file, creating the schema"""
     if database != ":memory:":
@@ -582,4 +630,10 @@ def _make_sqlite_sessionmaker(database):
     if database != ":memory:":
         # It holds the fabric's OpenSM keys.
         os.chmod(database, 0o600)
-    return orm.sessionmaker(engine, expire_on_commit=False)
+    return orm.sessionmaker(
+        engine,
+        class_=_ExclusiveSession,
+        expire_on_commit=False,
+        # Re-entrant: a thread may open a session inside another.
+        exclusive=threading.RLock(),
+    )

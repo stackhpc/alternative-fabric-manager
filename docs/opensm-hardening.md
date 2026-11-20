@@ -392,7 +392,8 @@ Each is designed in specs/secured-profile.md. Some are groups already,
 experimental, untested on hardware: `m_key_per_port`, `allowed_sm`,
 `class_keys` and `sa_rate`, each with the manager's checks, chosen by
 naming it beside `all`, and planned to join `all` once their hardware
-tests pass. HA mode refuses all four.
+tests pass. HA mode allows all four, experimental there too: see In HA
+mode below for what changes, and what to test.
 
 Each group has a "Before enabling" checklist, drawn from the hardware tests
 the spec plans for it. Its first enabling on a fabric is that test: follow
@@ -400,9 +401,11 @@ the checklist, and record what you saw.
 
 Try them only on a fabric you control, or with the agreement of everyone
 who shares it. Back up the database first (it holds the keys), and record
-what you set, so that you can undo it. In HA mode, put the same
-`[opensm_conf]` lines on every node before restarting any: each node writes
-its own `opensm.conf`, and the manager doesn't yet check that they match.
+what you set, so that you can undo it. In HA mode, change every node's
+configuration, restarting the leader last: configuration epochs keep a
+node whose configuration differs from the leader's from leading, and the
+epoch moves to the new configuration by itself once every live node has
+it (specs/ha.md, Configuration epochs).
 On a deployment whose configuration is managed, such as Kayobe's, add them
 there, not by hand, or the next reconfigure removes them.
 
@@ -424,10 +427,9 @@ short-lived container of OpenSM's image named like the prober's
 (`opensm-prober`). It reads sysfs only, and leaves out virtual functions
 (devices with a `device/physfn` link) and mlx5 sub-functions, which belong
 to tenants, and ports whose link layer isn't InfiniBand. Choose it with
-`hardening = all, allowed_sm`, in single-node mode. The manager refuses it:
-- in HA mode ("allowed SMs aren't supported in HA mode yet"): each node's
-  list must hold every other node's ports, which the manager doesn't record
-  yet;
+`hardening = all, allowed_sm`. In HA mode the list is every node's ports,
+which each node's manager records in its node row (see In HA mode). The
+manager refuses it:
 - without the `m_key` or `sm_key` groups, or with `m_key_protection_level
   0`: an ignored subnet manager is harmless only without the keys;
 - with a driver other than `managed`.
@@ -437,10 +439,9 @@ to tenants, and ports whose link layer isn't InfiniBand. Choose it with
 digits, separated by commas, and the manager writes it in its own
 spelling. An override puts the list in effect even without the group, with
 the same rules: a list typed by hand, as earlier versions of this doc
-suggested, is now checked in single-node mode. In HA mode it's passed to
-OpenSM unchecked, with a warning, as before 0.4.0: it must list every
-node's physical ports, or a takeover's OpenSM may be ignored or refuse to
-run.
+suggested, is now checked. In HA mode it can't be `0`, and a start refuses
+one that leaves out any node row's port, naming the port: check a list
+typed by hand before upgrading an HA cluster.
 
 Before every start, the manager refuses to start OpenSM, logs "Not
 starting OpenSM: ...", and tries again at every `[opensm] check_interval`,
@@ -550,9 +551,9 @@ n2n_key_lease_period <[opensm] key_lease_period>
 key_mgr_seed <the stored seed>
 ```
 
-- **HA mode refuses it** ("class keys aren't supported in HA mode yet"):
-  seed-only derivation has been shown on one host, not across a takeover
-  by another.
+- **In HA mode it's experimental too**: seed-only derivation has been
+  shown on one host, not across a takeover by another. Every leader reads
+  the same seed from the database.
 - **Not on the start that stores the seed.** A start of the manager that
   finds no seed stored, as on a fresh install or after restoring a backup
   from before the seed, stores one and starts OpenSM without class keys,
@@ -654,10 +655,9 @@ has the same effect, and nothing refuses it: do step 1 before either.
 
 **Experimental, untested on hardware.** `sa_rate_threshold` limits how many
 SA requests a port may send per 100 ms. OpenSM drops the rest, and logs
-`ERR 4C11`. The `sa_rate` group, chosen with `hardening = all, sa_rate` in
-single-node mode, sets it to 1000. `[opensm_conf] sa_rate_threshold`
-overrides the value, and sets the limit even without the group. HA mode
-refuses the group.
+`ERR 4C11`. The `sa_rate` group, chosen with `hardening = all, sa_rate`,
+sets it to 1000. `[opensm_conf] sa_rate_threshold` overrides the value,
+and sets the limit even without the group.
 
 The manager logs each GUID OpenSM limited, once for each OpenSM it starts:
 "OpenSM dropped SA requests from GUID 0x... (port 0x...): N in 100 ms,
@@ -723,10 +723,9 @@ only while per-port M_Keys are on.
 Per-port M_Keys are experimental, untested on hardware as a group, and
 not in `all`. Read Before enabling per-port M_Keys first. Choose them with
 `hardening = all, m_key_per_port`, or with `m_key_per_port` in an explicit
-list. The manager refuses the group:
-- in HA mode ("per-port M_Keys aren't supported in HA mode yet"), and with
-  a driver other than `managed`: the manager must write OpenSM's cache and
-  run its prober in OpenSM's image;
+list. In HA mode, see In HA mode. The manager refuses the group:
+- with a driver other than `managed`: the manager must write OpenSM's
+  cache and run its prober in OpenSM's image;
 - without the `m_key` group;
 - without a writable volume at `/var/cache/opensm` in `[opensm] volumes`,
   which the default `opensm_cache:/var/cache/opensm` is. A mode with `ro`
@@ -748,9 +747,9 @@ changes what OpenSM enforces, and the last two re-key every port.
 
 In the commands below, `docker exec alternative-fabric-manager
 alternative-fabric-manager` runs the command beside the running manager,
-as for `--show-keys`. The commands other than `--confirm-fabric` refuse in
-HA mode ("per-port M_Keys aren't available in HA mode"). GUIDs are
-hexadecimal, with or without `0x`.
+as for `--show-keys`; in HA mode, on any node, except that
+`--confirm-fabric` arms the turn-on only on the leader's node, where
+OpenSM's cache is. GUIDs are hexadecimal, with or without `0x`.
 
 #### Confirming the fabric arms the turn-on
 
@@ -1168,8 +1167,7 @@ turn-off. Still to run:
 - a turn-on with a base that differs from the `m_key` the ports hold, and
   a turn-on whose start fails and is set back;
 - a lease of 0, and a port reset seen from a second host;
-- a takeover on a second host, before HA mode allows the group, and a
-  re-cabled port.
+- a takeover on a second host (see In HA mode), and a re-cabled port.
 
 Not yet decided: a node that's down at the turn-on keeps its `m_key`
 record, and is sent the stored `m_key` when it comes back, perhaps with a
@@ -1216,6 +1214,69 @@ implemented group hasn't been run on hardware yet (see Still to be shown).
   hold `m_key` before `--forget-port-keys`. If a start fails part-way, the
   manager retries on the target (see Turning them on). If the database and
   the cache volume don't belong together, see Backups and restores.
+
+
+### In HA mode
+
+**Experimental, untested on hardware in HA mode.** The four groups run in
+HA mode as in single node, with these differences (specs/secured-profile.md,
+HA mode):
+
+- **Configuration epochs.** Every node's configuration has a hash, which
+  `--config-epoch` lists with the epoch. Only a node whose hash the epoch
+  allows may lead. The epoch moves by itself once every live node has the
+  same hash, so change every node and restart the leader last.
+  `--allow-config [HASH]` moves it by hand. A node naming an experimental
+  group isn't a candidate while a node of a release without configuration
+  epochs is live: upgrade every node first, then name the groups.
+- **Node ports.** Each node's manager records its physical InfiniBand
+  ports in its node row, in a short-lived container named like OpenSM's
+  with `-reach` (`opensm-reach`). They're known SM ports from then on.
+  `--forget-node NODE` removes a retired node's row, so that its ports
+  leave the `allowed_sm_guids` list at the next takeover; it's refused
+  while the node may run OpenSM or its manager is live. The fabric check
+  fails on any other node's SM, by these ports.
+- **`allowed_sm`.** The list is every node row's ports. A node without
+  them isn't a candidate. A new node's ports join the running list at the
+  next takeover.
+- **`m_key_per_port`.** The leader keeps the records. A takeover renders
+  OpenSM's cache from them, never from its host's cache volume, which an
+  older term left. Each node's reach probe runs the prober, in its
+  `-reach` container, rather than `ibswitches -y` with one key. The
+  takeover's bound grows by `4 × start_timeout`, and `job_timeout` must
+  exceed a takeover with a per-port start, 1.5 × `start_timeout` longer:
+  with docs/kayobe.md's settings, 327 s rather than 237 s, which its
+  `job_timeout = 360` covers, below Nova's `vif_plugging_timeout` of 420 s.
+  `job_timeout` is a cluster setting: change it on every node, as for an
+  epoch, and it moves with the epoch once every live node has it.
+  A job on a recorded port completes only from the leader's checks.
+- **`class_keys`, `sa_rate`.** As in single node; every leader reads the
+  same seed.
+
+#### Before enabling in HA mode
+
+On a fabric you control, with backups of the database and a non-zero
+`key_lease_period`, first run each group's own checklist on a single node.
+Then, on two hosts:
+- `--config-epoch` on each node shows one hash, allowed. Change one node's
+  configuration: it's listed NOT allowed, logs the alarm, and never takes
+  the lease; restore it.
+- With `allowed_sm`: every node row lists its ports
+  (`--known-sm-ports`), `opensm.conf`'s `allowed_sm_guids` on the leader
+  holds both hosts' ports, and a takeover by the other host starts OpenSM
+  as master with no `ERR 2F1C` or `0F09` for the old leader's port.
+  Then stop the old leader's manager uncleanly (`docker kill`) and check
+  that the new leader takes over within a takeover's bound.
+- With `class_keys`: after a takeover by the other host, a VS key Get
+  with the derived key still answers on a port keyed by the first host
+  (hardware test 3's second-host leg), and no `ERR 9828` appears.
+- With `m_key_per_port`: turn it on through the leader, then move the
+  leadership (`docker stop` the leader): the new leader's log shows the
+  cache rendered from the records, SUBNET UP, and no Bad M_Key traps from
+  ports; `--port-key-states` lists no port lost. Each candidate's node
+  row shows a non-zero reach. Then turn it off the same way.
+- After each: the fabric check passes on the leader ("The fabric is
+  complete"), and a port bound to a network goes ACTIVE.
 
 ## Turning hardening on for a running fabric
 

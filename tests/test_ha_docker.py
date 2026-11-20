@@ -111,6 +111,46 @@ def test_opensm_runs_under_the_watchdog_with_a_start_request(driver, config):
     assert (request["instance"], request["term"]) == ("u", 3)
 
 
+def test_the_start_request_follows_what_prepare_wrote(driver, config, monkeypatch):
+    # With per-port M_Keys, prepare rewrites opensm.conf and renders the
+    # cache after the container is created: the request's hashes must be of
+    # those, or the watchdog refuses the start.
+    import hashlib
+
+    written = {}
+    monkeypatch.setattr(
+        ha_docker.docker_driver.ManagedDocker,
+        "write_cache",
+        lambda self, container, files: written.update(files),
+    )
+
+    def prepare(container):
+        assert not os.path.exists(os.path.join(config.ha_state_dir, wd.START))
+        with open(config.opensm_conf_file, "w") as f:
+            f.write("rewritten")
+        driver.write_cache(container, {"neighbors": "n\n", "guid2mkey": "g\n"})
+
+    driver.prepare("u", 3, 1e12)
+    driver.start(prepare=prepare)
+    with open(os.path.join(config.ha_state_dir, wd.START)) as f:
+        hashes = json.load(f)["hashes"]
+    assert hashes["/etc/opensm/opensm.conf"] == (
+        hashlib.sha256(b"rewritten").hexdigest()
+    )
+    assert hashes["/var/cache/opensm/neighbors"] == hashlib.sha256(b"n\n").hexdigest()
+    assert hashes["/var/cache/opensm/guid2mkey"] == hashlib.sha256(b"g\n").hexdigest()
+    assert written == {"neighbors": "n\n", "guid2mkey": "g\n"}
+    # The next start's request names only what it wrote.
+    driver.stop()
+    driver.prepare("u", 4, 1e12)
+    driver.start()
+    with open(os.path.join(config.ha_state_dir, wd.START)) as f:
+        assert set(json.load(f)["hashes"]) == {
+            "/etc/opensm/partitions.conf",
+            "/etc/opensm/opensm.conf",
+        }
+
+
 def test_stop_asks_then_kills_and_clears_the_watchdogs_files(driver, config):
     driver.prepare("u", 3, 1e12)
     driver.write_lease("u", 3, 1e12)
@@ -158,6 +198,26 @@ def test_reach_counts_switches_from_a_port_that_is_up(driver):
     # The key in the environment, never on the command
     assert '-y "$AFM_M_KEY"' in " ".join(run["command"])
     assert run["environment"] == {"AFM_M_KEY": "0x1"}
+
+
+def test_with_per_port_rows_reach_counts_the_probers_switches(driver):
+    # ibswitches -y with one key can't pass a re-keyed port.
+    driver.m_key = lambda: "0x1"
+    driver.reach_switches = lambda: {0x10, 0x20}
+    driver.client.probe = IBSTAT_UP + b"===\n"
+    assert driver.reach() == 2
+    run = driver.client.runs[-1]
+    assert "ibswitches" not in " ".join(run["command"])
+    assert run["environment"] == {}
+
+
+def test_a_prober_that_fails_reaches_nothing(driver):
+    def fail():
+        raise RuntimeError("no route")
+
+    driver.reach_switches = fail
+    driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
+    assert driver.reach() is None
 
 
 def test_reach_is_none_when_the_port_is_down(driver):
