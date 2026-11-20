@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 import pytest
 from fastapi import testclient
@@ -92,6 +94,32 @@ def _patient_server_engines(monkeypatch):
         return make(url, max(call_timeout, 30))
 
     monkeypatch.setattr(db, "_make_server_engine", patient)
+
+
+@pytest.fixture(autouse=True)
+def _coordinators_stopped(monkeypatch):
+    """Stop every coordinator a test made, and wait for its threads: a
+    takeover thread left running reads the test's in-memory SQLite after
+    the test has dropped it, which crashed CI with a segfault."""
+    from alternative_fabric_manager.ha import coordinator as coordinator_mod
+
+    made = []
+    init = coordinator_mod.Coordinator.__init__
+
+    def tracked(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        made.append(self)
+
+    monkeypatch.setattr(coordinator_mod.Coordinator, "__init__", tracked)
+    yield
+    for coordinator in made:
+        coordinator._stop.set()
+    deadline = time.monotonic() + 10
+    for thread in threading.enumerate():
+        target = getattr(thread, "_target", None)
+        if getattr(target, "__self__", None) in made:
+            thread.join(max(0, deadline - time.monotonic()))
+            assert not thread.is_alive(), f"{thread.name} didn't stop"
 
 
 @pytest.fixture
