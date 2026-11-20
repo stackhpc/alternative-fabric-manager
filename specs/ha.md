@@ -1459,7 +1459,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       fence, node port GUIDs, `--forget-node`, and each group as The
       secured profile says. Their hardware runs in HA mode are still to
       come.
-- [ ] Complete grants on a partial check (see While a switch is missing):
+- [x] Complete grants on a partial check (see While a switch is missing):
       placing ports from the check's own scan (`ibnetdiscover` where
       the check runs `ibswitches`), at the checks either side of the
       sweep, vports through OpenSM's virtualization dump; the possibly

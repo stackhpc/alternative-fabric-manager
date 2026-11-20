@@ -808,6 +808,36 @@ have seen each switch:
   down that comes back hung holds jobs again. Once it answers the check
   passes; for one that won't, `--release-port <guid>`.
 
+**While a switch is missing** (specs/ha.md, While a switch is missing),
+grants that it can't matter to still complete. A check that fails only
+because expected switches are missing (OpenSM is master, no SM contests
+it, it queried the fabric in full, and nothing else fails it) is
+*partial*. It places the ports from its own scan: with ports recorded, from
+the recorded links of the ports its verify reached, the prober verifying
+every port at each check while a switch is missing; otherwise from an
+`ibnetdiscover` scan run in the same check, read-only, with `-y <m_key>`
+as `ibswitches` has it. Virtual functions are placed through OpenSM's
+`/var/log/opensm-virtualization.dump`: a vport listed once, ACTIVE, at a
+non-zero index of a placed physical port. On a partial check, a network's
+creation completes, and a port's create or an update that keeps its GUID
+and network completes if the scans either side of its sweep placed its
+GUID in the same place, with no other OpenSM sweep start logged between
+them, its pkey isn't *tainted*, and, unless it's a virtual function
+(`binding:vnic_type` `direct`), its host isn't tainted and no revocation is
+open for another port on it. Deletions, network updates, and ports moving
+network or changing GUID wait for the whole fabric. A pkey or host is
+tainted while some port may still hold it stale: the manager records
+every membership it writes, before writing it, and forgets those the
+partitions no longer have only at a passing check after a sweep of the whole fabric. Once the
+switches are back, the manager sweeps again before any job completes in
+full. A partial check is still a failed check: it raises the alarm, which,
+like `--status`, names the missing switches and the open jobs, tainted
+pkeys and tainted hosts they hold, and counts towards stepping down. After
+`--confirm-fabric` drops a switch, which may be a hung one still
+forwarding, the taint stays until `--confirm-fabric --reset-held`, whose
+message names the pkeys it untaints: run it once the switch is unplugged
+or wiped.
+
 Nothing is added, dropped or recorded, and the counts start again, while
 the check couldn't query the fabric (a verify that ran out of time counts
 as that), saw another master, or OpenSM wasn't master. The counts also
