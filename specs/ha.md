@@ -560,7 +560,9 @@ matters where the check runs `ibswitches`.
 missing: OpenSM is master, the check is contested by no SM, it queried the
 fabric in full, and it finds no enforcement error, no unanswered key, no
 failing apply, and nothing else that fails a check. In prober mode,
-while some expected switch is missing, a port never sent a key because
+while this check's own verify finds some expected switch missing (never
+an older full verify's, which may predate the switch's return), a port
+never sent a key because
 each switch that didn't answer on its route (the shortest the recorded
 links give, which the prober follows) is an expected switch that is
 missing or one whose link is down is no unanswered key; one behind any
