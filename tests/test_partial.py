@@ -1200,3 +1200,35 @@ def test_a_port_behind_a_down_link_still_fails_a_whole_fabric(world):  # noqa: F
     assert not world.check()
     assert "didn't answer their M_Keys" in world.applied().check_detail
     assert not world.applied().check_partial
+
+
+def test_a_reused_full_verify_excuses_nothing_once_the_switch_is_back(
+    world,  # noqa: F811
+    monkeypatch,
+):
+    from alternative_fabric_manager import prober
+    from alternative_fabric_manager.drivers import ReloadError
+
+    turned_on(world)
+    world.sim.down |= {(S1, 2), (S2, 1)}
+    assert not world.check()
+    assert world.applied().check_partial
+    full = world.keeper()._last_full
+    # S2 is back, but the next full verify fails, so the check reuses the
+    # one taken while S2 was missing.
+    world.sim.down -= {(S1, 2), (S2, 1)}
+    keeper = world.keeper()
+    original = keeper._verify
+
+    def failing(ports, links, scope=None, **kwargs):
+        if scope == prober.FULL:
+            raise ReloadError("the prober failed")
+        return original(ports, links, scope=scope, **kwargs)
+
+    monkeypatch.setattr(keeper, "_verify", failing)
+    ok = world.check(due=False)
+    assert keeper._last_full is full
+    # This check's own verify finds every expected switch: T3 isn't
+    # excused, so the check doesn't pass on the stale verify.
+    assert not ok, world.applied().check_detail
+    assert not world.applied().check_partial

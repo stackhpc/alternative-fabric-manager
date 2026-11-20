@@ -1011,12 +1011,15 @@ class PortKeeper:
                 return None
             target = port_keys.load_running(session)
             expected = expected_guids(session)
-            # The expected switches as recorded, by which the full verify's
-            # switches say whether any is missing
-            expected_rows = {
-                int(row.guid, 16)
+            # The expected switches as recorded, each with its node GUID,
+            # by which this check's own verify says whether any is missing
+            expected_rows = [
+                (
+                    int(row.guid, 16),
+                    None if row.node_guid is None else int(row.node_guid, 16),
+                )
                 for row in session.scalars(sa.select(db.ExpectedSwitch))
-            }
+            ]
             recorded = port_keys.load_fingerprint(session)
             applied = session.get(db.Applied, 1)
             generation = (applied.generation or 0) if applied is not None else 0
@@ -1106,7 +1109,11 @@ class PortKeeper:
             full=full,
         )
         outcome.problems = self._problems(
-            ports, neutron, results, expected, expected_rows
+            ports,
+            neutron,
+            results,
+            expected,
+            self._any_missing(expected_rows, result, outcome.nodes),
         )
         if not full and not outcome.complete:
             # A full verify's own rule says so below; the switches' or the
@@ -1336,9 +1343,24 @@ class PortKeeper:
             switch in expected or switch in result.link_down for switch in blocking
         )
 
-    def _problems(
-        self, ports, neutron, results, expected=frozenset(), expected_rows=frozenset()
-    ):
+    @staticmethod
+    def _any_missing(expected_rows, result, nodes):
+        """Whether this check's own verify misses some expected switch,
+        each matched as the check matches it: by the GUID it was recorded
+        by, or its node GUID, against the switches the verify found and
+        their node GUIDs, so that a list recorded from ibswitches, before
+        it's translated, counts the same. Never an older full verify's: one
+        taken while a switch was missing would excuse ports after it's back
+        (specs/ha.md, A partial check)."""
+        found = set(result.switches) | {
+            node for node in nodes.values() if node is not None
+        }
+        return any(
+            guid not in found and (node is None or node not in found)
+            for guid, node in expected_rows
+        )
+
+    def _problems(self, ports, neutron, results, expected=frozenset(), missing=False):
         """Why the fabric check fails, as far as per-port keys go"""
         problems = []
         if any(result.own_port_lost for result in results):
@@ -1350,9 +1372,6 @@ class PortKeeper:
             problems.append("no full verify of the ports' M_Keys yet")
             return problems
         result, began = full
-        # Whether the full verify misses some expected switch, without which
-        # no port it couldn't reach is excused
-        missing = bool(set(expected_rows) - result.switches)
         if time.monotonic() - began > 2 * self.config.port_verify_interval:
             problems.append(
                 "the last full verify of the ports' M_Keys is older than two "
