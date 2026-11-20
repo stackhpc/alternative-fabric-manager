@@ -75,7 +75,9 @@ ports (`--port-key-states` lists any), the deploy differs (see
   list between `ibswitches`' node GUIDs and the prober's port 0 GUIDs by
   itself. "Missing switches" for a switch that was removed or replaced
   needs `--confirm-fabric`, once the hardware change is done.
-- **HA mode refuses the group**; per-port M_Keys are single-node only.
+- **In HA mode the group is experimental too**: name it only after every
+  node runs a release with configuration epochs, and see
+  docs/opensm-hardening.md, In HA mode.
 
 ## Wire networking-mlnx to AFM
 
