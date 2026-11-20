@@ -340,6 +340,9 @@ class VerifyResult:
     link_states: dict = dataclasses.field(default_factory=dict)
     own_link_up: bool | None = None
     unrecorded: list = dataclasses.field(default_factory=list)
+    # Rows the recorded links reach only through switches that didn't
+    # answer, never sent a key
+    unrouted: set = dataclasses.field(default_factory=set)
     complete: bool = True
     gets: int = 0
     batches: int = 0
@@ -508,6 +511,7 @@ class _Verify:
         try:
             if self._own_port():
                 self._walk()
+                self._unrouted()
         except _OutOfTime:
             self.result.complete = False
         if self.scope == FULL:
@@ -671,6 +675,19 @@ class _Verify:
                 self._switch_ports([hop for hop in switches if hop.guid in answered])
             level = port_keys.next_hops(self.links, own, routes, answered)
         self._linked(others)
+
+    def _unrouted(self):
+        """The rows the recorded links reach only through switches that
+        didn't answer: never sent a key, so not ports that refused one, as
+        those behind a missing switch are (specs/ha.md, While a switch is
+        missing)"""
+        switches = {guid for guid, row in self.rows.items() if row.switch is True}
+        possible = port_keys.all_routes(
+            self.links, self.result.own_guid, switches | {self.result.own_guid}
+        )
+        self.result.unrouted = {
+            guid for guid in possible if guid in self.rows and guid not in self._routes
+        }
 
     def _linked(self, hops):
         """Probe the hops whose link is up, and return them"""

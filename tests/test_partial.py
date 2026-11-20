@@ -10,6 +10,8 @@ from alternative_fabric_manager import db, partial, scan
 from alternative_fabric_manager.drivers import Fabric, ReloadError, SweepReport
 from tests import conftest
 from tests.conftest import GUID, NETWORK_ID, PORT_ID
+from tests.fabric_sim import S1, S2
+from tests.test_port_keeper import HV, turned_on, world  # noqa: F401 - the fixture
 
 LEAF_A = 0xEC0D9A0300B12560
 LEAF_B = 0xEC0D9A0300B12570
@@ -595,3 +597,25 @@ def test_scan_place_is_what_the_manager_compares():
     # The places are JSON round-trippable, as the sweep records them.
     placed = scan.place({1: ["port", "00000000000000aa", 3]}, [])
     assert json.loads(json.dumps(placed[1])) == placed[1]
+
+
+# Prober mode
+
+
+def test_prober_mode_has_partial_checks_and_completes_grants(world):  # noqa: F811
+    turned_on(world)
+    manager = world.manager
+    # S2, and T3 behind it, are cut off: T3 was never sent a key.
+    world.sim.down |= {(S1, 2), (S2, 1)}
+    assert not world.check()
+    applied = world.applied()
+    assert applied.check_partial, applied.check_detail
+    manager.put_network(NETWORK_ID, conftest.network())
+    job = manager.put_port(PORT_ID, conftest.port())
+    world.full_verify_due()
+    manager.reconcile()
+    assert _status(manager, job) == COMPLETED
+    # A port that refuses its key still fails the check.
+    world.sim.ports[HV].key = 0x3333333333333333
+    assert not world.check()
+    assert not world.applied().check_partial

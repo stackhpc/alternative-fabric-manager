@@ -171,6 +171,10 @@ class FakeOpenSM:
         self.calls += 1
         return self.report or SweepReport()
 
+    def sweep_starts(self):
+        """A sweep start logged at each start and reload, as OpenSM's"""
+        return ("opensm", self.runs + self.calls)
+
     def fabric(self, m_key=None, sa_key=None, switches=None):
         self.fabric_calls.append((m_key, sa_key, switches))
         if not self.is_running:

@@ -248,6 +248,8 @@ class CheckOutcome:
     # Every verify of the check, from which a partial check places the ports
     # they reached (specs/ha.md, Where a port is)
     results: list = dataclasses.field(default_factory=list)
+    # Whether the check ran a full verify, which reached every port it could
+    full: bool = False
 
 
 class PortKeeper:
@@ -1094,6 +1096,7 @@ class PortKeeper:
             verify=result,
             complete=all(each.complete for each in results),
             results=results,
+            full=full,
         )
         outcome.problems = self._problems(ports, neutron, results)
         if not full and not outcome.complete:
@@ -1347,6 +1350,9 @@ class PortKeeper:
             for row in ports.values()
             if row.switch is not True
             and row.guid not in result.link_down
+            # Behind a switch that didn't answer, as a missing one, it was
+            # never sent a key: the missing switch fails the check instead.
+            and row.guid not in result.unrouted
             and port_keys.guid_text(row.guid) not in neutron
             and not row.released
             and row.guid not in result.keyed
