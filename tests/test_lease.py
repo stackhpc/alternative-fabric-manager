@@ -359,3 +359,49 @@ def test_a_pending_switch_is_expected(lease):
         session.add(db.ExpectedSwitch(guid="0000000000000052", pending=True))
         session.commit()
     assert lease.expected_switches() == 2
+
+
+def test_operators_commands_retry_a_galera_certification_conflict(lease, monkeypatch):
+    # Galera aborts a freeze request that races the leader's renewal of the
+    # lease row, as a deadlock at commit: the request rolled back, so the
+    # command runs it again rather than failing.
+    import sqlalchemy as sa
+
+    from alternative_fabric_manager.ha import operator
+
+    monkeypatch.setattr(operator.time, "sleep", lambda _s: None)
+    term = _frozen(lease)
+    request_unfreeze = lease.request_unfreeze
+    calls = []
+
+    def conflicting():
+        calls.append(1)
+        if len(calls) == 1:
+            raise sa.exc.OperationalError(
+                "UPDATE lease", {}, Exception(operator.DEADLOCK, "Deadlock found")
+            )
+        return request_unfreeze()
+
+    monkeypatch.setattr(lease, "request_unfreeze", conflicting)
+    operator.unfreeze(_Config(), lease, 0)
+    assert len(calls) == 2
+    assert lease.read().freeze_state == "ending"
+    assert lease.read().freeze_term == term
+
+    # Any other error, such as a lost connection whose outcome is unknown,
+    # isn't retried.
+    def lost():
+        calls.append(1)
+        raise sa.exc.OperationalError(
+            "UPDATE lease", {}, Exception(2013, "Lost connection")
+        )
+
+    calls.clear()
+    monkeypatch.setattr(lease, "request_unfreeze", lost)
+    with pytest.raises(sa.exc.OperationalError):
+        operator.unfreeze(_Config(), lease, 0)
+    assert len(calls) == 1
+
+
+class _Config:
+    ha_period = 1.0

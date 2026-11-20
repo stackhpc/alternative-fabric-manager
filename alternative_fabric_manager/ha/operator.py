@@ -17,6 +17,8 @@ import re
 import socket
 import time
 
+import sqlalchemy as sa
+
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import db
 from alternative_fabric_manager.ha import lease as lease_mod
@@ -24,6 +26,26 @@ from alternative_fabric_manager.ha import lease as lease_mod
 
 class OperatorError(Exception):
     pass
+
+
+# MariaDB's ER_LOCK_DEADLOCK, which Galera answers a certification conflict
+# with: the transaction rolled back, so it is safe to run again.
+DEADLOCK = 1213
+DEADLOCK_ATTEMPTS = 5
+
+
+def _retrying(write, *args):
+    """Run one of the lease's compare-and-set writes, again if Galera
+    aborted it, as the leader's renewal of the same row can (see specs/ha.md,
+    Galera specifics)"""
+    for attempt in range(DEADLOCK_ATTEMPTS):
+        try:
+            return write(*args)
+        except sa.exc.DBAPIError as e:
+            code = getattr(e.orig, "args", ())[:1]
+            if code != (DEADLOCK,) or attempt == DEADLOCK_ATTEMPTS - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 def freeze(config, lease, sessionmaker):
@@ -40,7 +62,7 @@ def freeze(config, lease, sessionmaker):
                 "The leader's last fabric check in this term didn't pass"
             )
     by = f"{socket.gethostname()}"
-    if not lease.request_freeze(state.term, by, config.self_stop_timeout):
+    if not _retrying(lease.request_freeze, state.term, by, config.self_stop_timeout):
         raise OperatorError("The lease moved, or a takeover isn't finished")
     deadline = time.monotonic() + config.self_stop_timeout + config.ha_period
     while time.monotonic() < deadline:
@@ -48,14 +70,14 @@ def freeze(config, lease, sessionmaker):
             return state.holder_node
         time.sleep(config.ha_period / 2)
     # The acknowledgement may have committed since the last read.
-    if lease.withdraw_freeze() == "frozen":
+    if _retrying(lease.withdraw_freeze) == "frozen":
         return state.holder_node
     raise OperatorError("The leader didn't acknowledge the freeze")
 
 
 def unfreeze(config, lease, wait):
     """End the freeze; the leader acknowledges it when it renews normally"""
-    if lease.request_unfreeze() not in ("ending", ""):
+    if _retrying(lease.request_unfreeze) not in ("ending", ""):
         raise OperatorError("The cluster isn't frozen")
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
@@ -79,7 +101,7 @@ def force_unfreeze(lease):
             "Only while a freeze ends: the cluster isn't unfreezing; "
             "run --unfreeze first"
         )
-    if not lease.confirm(state.term, state.holder_uuid):
+    if not _retrying(lease.confirm, state.term, state.holder_uuid):
         raise OperatorError("The freeze changed meanwhile: check --status")
     return state.holder_node, state.term
 
@@ -196,7 +218,7 @@ def forget_node(config, lease, name, wait=time.sleep):
             raise OperatorError(
                 f"{name}'s manager is live: its heartbeat moved. Stop it first"
             )
-    if not lease.forget_node(name, heartbeat if not stopped else None):
+    if not _retrying(lease.forget_node, name, heartbeat if not stopped else None):
         raise OperatorError(
             f"{name}'s row changed meanwhile: its manager may be live, or "
             "joined the target set"

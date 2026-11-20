@@ -1118,7 +1118,11 @@ the OpenStack services do. SQLAlchemy makes the backend a
   from several Galera nodes would conflict at commit.
 - **Retry on deadlock.** Galera reports a certification conflict as a
   deadlock at commit. Retry the whole request transaction, validation
-  included, as oslo.db does for OpenStack services.
+  included, as oslo.db does for OpenStack services. The operators'
+  commands retry theirs too: a freeze request races the leader's renewal
+  of the same lease row, and Galera aborts one of them. A deadlock is a
+  certain abort, unlike a lost connection, and each command's write is a
+  compare-and-set, so retrying it is safe.
 - **Map constraint errors.** A pkey or GUID clash that reaches a unique
   constraint, or a port whose network is gone, is a 400, not a 500.
 - **Read what the cluster committed.** Every manager session sets
