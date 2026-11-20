@@ -1004,7 +1004,7 @@ def test_sigterm_to_a_candidate_marks_it_stopped(cluster):
     term = lease.read().term
     cluster.signal(candidate, signal.SIGTERM)
     _exits_within(cluster, candidate, cluster.timings["shutdown_timeout"] + 5)
-    rows = {name: stopped for name, _uuid, _hb, _reach, stopped in lease.nodes()}
+    rows = {name: stopped for name, _uuid, _hb, _reach, stopped, _hash in lease.nodes()}
     assert rows[f"node-{candidate}"]
     # The leader is undisturbed.
     assert cluster.leader() == leader and lease.read().term == term
@@ -1209,7 +1209,7 @@ def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
     wait_for(
         lambda: all(
             reach == 1
-            for name, _uuid, _hb, reach, _stopped in lease.nodes()
+            for name, _uuid, _hb, reach, _stopped, _hash in lease.nodes()
             if name != f"node-{leader}"
         ),
         30,
