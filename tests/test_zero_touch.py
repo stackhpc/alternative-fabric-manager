@@ -478,7 +478,10 @@ def test_a_failed_turn_on_is_recorded_and_never_rearmed(auto, caplog):
     assert world.state()["target"] is False
     assert arming(world) == port_keeper.FAILED_REASON
     lines = world.keeper().states()
-    assert "failed turn-on recorded: yes" in lines
+    assert (
+        "failed turn-on recorded: yes (a change of configuration, or "
+        "--confirm-fabric, clears it)"
+    ) in lines
     # The hash is never shown, nor logged.
     shown = "\n".join(lines) + "\n".join(r.getMessage() for r in caplog.records)
     assert config_hash not in shown
@@ -515,3 +518,167 @@ def test_a_failure_record_holds_no_key():
     assert f"{BASE:x}" not in record
     with pytest.raises(ValueError):
         port_keys.failure_record(BASE, "")
+
+
+# Review fixes
+
+
+def test_a_dropped_spine_returning_hung_holds_jobs_again(stable):
+    world = stable
+    world.manager.start()
+    world.manager.reconcile()
+    _spine(world)
+    assert world.check()
+    world.sim.down |= {(S1, 6), (S2, 3), (0x53, 1), (0x53, 2)}
+    assert world.check(), world.applied().check_detail
+    assert expected(world) == {S1, S2}
+    # Back, its links up, its agent hung: it may forward with stale tables.
+    world.sim.down -= {(S1, 6), (S2, 3), (0x53, 1), (0x53, 2)}
+    world.sim.ports[0x53].key = 0x3333333333333333
+    for due in (True, False):
+        assert not world.check(due=due)
+        assert "0x0000000000000053" in world.applied().check_detail
+        assert "don't answer" in world.applied().check_detail
+    # Released by an operator, as for a lost port
+    world.keeper().release_port(0x53)
+    assert world.check(), world.applied().check_detail
+
+
+def test_a_switch_is_dropped_only_on_this_checks_verify(stable):
+    world = stable
+    world.manager.start()
+    world.manager.reconcile()
+    _spine(world)
+    world.sim.down |= {(S1, 6), (S2, 3), (0x53, 1), (0x53, 2)}
+    world.check()
+    keeper = world.keeper()
+    old = keeper._last_full
+    expect(world, S1, S2, 0x53)
+    # Its links are up again; the last full verify still shows them down.
+    world.sim.down -= {(S1, 6), (S2, 3), (0x53, 1), (0x53, 2)}
+    world.sim.ports[0x53].key = 0x3333333333333333
+    keeper._last_full = old
+    world.check(due=False)
+    assert 0x53 in expected(world)
+
+
+def test_a_verify_that_ran_out_of_time_counts_as_a_failed_query(stable, monkeypatch):
+    world = stable
+    world.manager.start()
+    world.check()
+    keeper = world.keeper()
+    real = keeper._verify
+
+    def short(*args, **kwargs):
+        kwargs["bound"] = 1e-9
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(keeper, "_verify", short)
+    for due in (True, False):
+        world.check(due=due)
+    assert world.manager._seen_checks == {}
+    monkeypatch.setattr(keeper, "_verify", real)
+    checks(world, CHECKS - 1)
+    assert expected(world) == set()
+    world.check()
+    assert expected(world) == {S1, S2}
+    # The switches' verify, without a full one, running out of time fails it.
+    monkeypatch.setattr(keeper, "_verify", short)
+    assert not world.check(due=False)
+    outcome = keeper.check()
+    assert not outcome.complete
+    assert any("ran out of time" in problem for problem in outcome.problems)
+
+
+def test_the_counts_start_again_when_opensm_restarts(stable):
+    world = stable
+    world.manager.start()
+    checks(world, CHECKS - 1)
+    world.driver.stop()
+    world.manager._check_opensm()
+    world.check()
+    assert expected(world) == set()
+    checks(world, CHECKS - 1)
+    assert expected(world) == {S1, S2}
+
+
+def test_a_held_leader_doesnt_apply(auto):
+    world = auto
+    world.manager.leader_held = lambda: True
+    world.check()
+    assert world.state()["target"] is True
+    assert world.driver.is_running
+    with world.sessionmaker() as session:
+        assert port_keys.load_time(session, port_keys.LAST_APPLY) is None
+    # Once the freeze ends
+    world.manager.leader_held = lambda: False
+    world.check()
+    assert not world.driver.is_running
+
+
+def test_a_deferred_job_doesnt_hold_the_apply(auto):
+    world = auto
+    _port_job(world)
+    with world.sessionmaker() as session:
+        for job in session.scalars(sa.select(db.Job)):
+            session.add(
+                db.Deferred(
+                    kind="port", object_id=str(job.id), job_id=job.id, data="{}"
+                )
+            )
+        session.commit()
+    world.check()
+    assert world.state()["target"] is True
+    assert not world.driver.is_running
+
+
+def test_an_overdue_apply_completes_an_open_job_only_after_the_restart(auto):
+    world = auto
+    history = len(world.sim.history)
+    job = _port_job(world)
+    # Armed, but held by the open job, which isn't swept yet
+    world.check()
+    assert world.state()["target"] is True and world.driver.is_running
+    set_time(world, port_keys.TARGET_CHANGED, time_ago(86401))
+    # The overdue apply stops OpenSM within the reconcile that sweeps the
+    # job: it can't complete on that sweep's evidence.
+    world.manager.reconcile()
+    assert not world.driver.is_running
+    assert world.manager.get_job(job).status != db.JobStatus.COMPLETED
+    world.manager.reconcile()
+    assert world.manager.get_job(job).status != db.JobStatus.COMPLETED
+    # The applier starts OpenSM on the target; the job completes on the
+    # port's evidence from after that start's sweep.
+    world.manager._check_opensm()
+    assert world.driver.per_port() and world.state()["confirmed"]
+    world.manager.reconcile()
+    assert world.manager.get_job(job).status == db.JobStatus.COMPLETED
+    assert world.sim.ports[TN].key == derived(TN)
+    assert not tenants_given_m_key(world.sim, history, {TN, HV, T3, T4})
+
+
+def test_fallbacks_rise_and_the_third_records_a_failed_turn_on(auto, caplog):
+    world = auto
+    world.check()
+    assert world.state()["target"] is True and not world.driver.is_running
+    levels = []
+    for _ in range(3):
+        world.driver.probe_error = manager_mod.ReloadError("the prober failed")
+        caplog.clear()
+        world.manager._check_opensm()
+        world.driver.probe_error = None
+        assert world.driver.is_running and not world.driver.per_port()
+        levels += [
+            r.levelname for r in caplog.records if "starts in a row);" in r.getMessage()
+        ]
+        world.driver.stop()
+    assert levels == ["WARNING", "ERROR", "ERROR"]
+    assert world.state()["target"] is False
+    assert any(
+        "failed turn-on recorded: yes" in line for line in world.keeper().states()
+    )
+    # It stops restarting.
+    world.manager._check_opensm()
+    set_time(world, port_keys.LAST_APPLY, time_ago(3601))
+    world.check()
+    assert world.driver.is_running and world.state()["target"] is False

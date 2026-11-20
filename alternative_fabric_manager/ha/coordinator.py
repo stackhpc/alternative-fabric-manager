@@ -155,6 +155,9 @@ class Coordinator:
         # /healthz
         self._database_seen = None
         manager.on_opensm_stopped = self._opensm_stopped
+        # The manager doesn't apply the per-port M_Key target while a
+        # freeze holds this leader
+        manager.leader_held = lambda: self.held
 
     # Lifecycle
 
@@ -668,7 +671,13 @@ class Coordinator:
     def _discretionary_trigger(self):
         """Why an established leader should hand over, if a live candidate
         could do better and the cooldown has passed (see Stepping down)"""
-        if self.held or self.role != Role.LEADER:
+        if self.held:
+            # A request made before the freeze: the manager asks again once
+            # it ends.
+            if getattr(self.manager, "apply_requested", None):
+                self.manager.apply_requested = None
+            return None
+        if self.role != Role.LEADER:
             return None
         # The per-port M_Key target, which only a start applies: unlike the
         # other triggers, it needs no other candidate, since this node may

@@ -780,10 +780,19 @@ have seen each switch:
   switch without ports recorded, needs `--confirm-fabric`, and, with
   ports recorded, `--release-port` for the dead leaf's ports, or their
   jobs wait. A switch whose links are up but that doesn't answer stays,
-  since it may still forward.
+  since it may still forward. The evidence is always the check's own
+  verify;
+- with ports recorded, any port recorded as a switch, expected or not,
+  that doesn't answer while a recorded link to it is up fails the check:
+  "switches 0x... don't answer, behind links that are up: they may still
+  forward with stale partitions". So a spine dropped while its links were
+  down that comes back hung holds jobs again. Once it answers the check
+  passes; for one that won't, `--release-port <guid>`.
 
-Nothing is added, dropped or recorded while the check couldn't query the
-fabric, saw another master, or OpenSM wasn't master.
+Nothing is added, dropped or recorded, and the counts start again, while
+the check couldn't query the fabric (a verify that ran out of time counts
+as that), saw another master, or OpenSM wasn't master. The counts also
+start again whenever OpenSM starts.
 
 The prober follows every port that answers as a switch, as OpenSM's own
 sweeps do, but the check counts only the expected switches it finds, so a
@@ -857,7 +866,8 @@ manager turns them on only once its records show every port ready:
    `--port-key-states` shows the reason. Once they pass, it records the
    target on, logging "Per-port M_Keys are armed".
 4. **The manager applies it.** At a fabric check that passes with no open
-   job, while the target differs from what OpenSM runs with, it restarts
+   job (a deferred job, which waits for another object, doesn't count),
+   while the target differs from what OpenSM runs with, it restarts
    OpenSM, "Restarting OpenSM: the per-port M_Key target is on, and
    OpenSM runs with them off: a start applies it", at most once an hour.
    On a busy cloud with no quiet check, once a day has passed since the
@@ -870,7 +880,8 @@ manager turns them on only once its records show every port ready:
    OpenSM with `m_key_per_port` and the base. OpenSM then re-keys every
    port it reaches. The log shows "Starting OpenSM with per-port M_Keys on
    (target on); N ports are changing". A restart you choose, or a crash
-   restart, applies the target the same way.
+   restart, applies the target the same way. In HA mode, a leader held by
+   a freeze doesn't apply it until the freeze ends.
 
 To check on it, `--port-key-states`:
 
@@ -880,8 +891,8 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
 ```
 
 Its first line is the target and what OpenSM last started with, such as
-`target off, OpenSM last started off`; then `failed turn-on recorded: yes`
-or `no`, and `arming blocked by: ...`, or `-` when nothing blocks it. Each
+`target off, OpenSM last started off`; then `failed turn-on recorded: yes
+(a change of configuration, or --confirm-fabric, clears it)` or `no`, and `arming blocked by: ...`, or `-` when nothing blocks it. Each
 line after them is a recorded port: its GUID, `switch`, `hca` or `-` (not
 yet known), the key it holds (`m_key`, `derived` or `unknown`), and its
 flags (`lapsed`, `reachable`, `released`, or `-`). It never shows a key,
@@ -938,7 +949,14 @@ OpenSM starts as it last ran, without per-port M_Keys: "The verify before
 this start failed, so OpenSM starts with per-port M_Keys off, as it last
 ran, rather than beginning to turn them on; the next start tries again".
 The target stays on, so the manager applies it again, at most once an
-hour. But once OpenSM has started with them, before a start has met the
+hour, with "(N starts in a row)" in that line, a warning the first time
+and an error after. On a turn-on, the third start in a row that falls
+back is recorded as a failed turn-on, with the target set back to off,
+which OpenSM still runs with: "Per-port M_Keys: 3 starts in a row
+couldn't verify the ports to turn them on, so the target is set back to
+off and the failure is recorded ...". Fix what stops the verify, then
+change the configuration or run `--confirm-fabric`. A turn-off keeps
+trying hourly. But once OpenSM has started with them, before a start has met the
 success rule (for example after the manager restarts during a turn-on),
 the fabric may be part-way, and neither target is safe: a verify that
 fails then stops the start, "The verify before this start failed while

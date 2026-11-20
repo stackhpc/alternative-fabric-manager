@@ -194,9 +194,10 @@ class Manager:
         # Consecutive checks that found expected switches missing
         self.missing_checks = 0
         # How many settled fabric checks in a row have seen each switch, by
-        # its GUID: kept in memory, and counted afresh for each OpenSM, so
-        # that a switch is recorded as expected only once the fabric has
-        # been stable for [opensm] confirm_checks (specs/zero-touch.md)
+        # its GUID: kept in memory, and counted afresh at every start of
+        # OpenSM (_start_opensm), so that a switch is recorded as expected
+        # only once the fabric has been stable for [opensm] confirm_checks
+        # under the running OpenSM (specs/zero-touch.md)
         self._seen_checks = {}
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
@@ -226,6 +227,9 @@ class Manager:
         # start applies the per-port M_Key target, which the coordinator
         # reads and clears (specs/zero-touch.md, Applying)
         self.apply_requested = None
+        # In HA mode, the coordinator's: whether a freeze holds this
+        # leader, which keeps OpenSM where it is
+        self.leader_held = None
 
     # The leader fence
 
@@ -953,6 +957,11 @@ class Manager:
             self._config_hash = config_mod.config_hash(self.config, key)
             return self._config_hash
 
+    def may_apply(self):
+        """Whether OpenSM may be restarted to apply the per-port M_Key
+        target: not while a freeze holds this leader"""
+        return not (self.leader_held is not None and self.leader_held())
+
     def request_apply(self, why):
         """Restart OpenSM so that its start applies the per-port M_Key
         target: in single node, stop it, and the applier's next iteration
@@ -1163,6 +1172,7 @@ class Manager:
         would lock OpenSM out refuses the start with ReloadError.
         """
         self._allowed_list = None
+        self._seen_checks = {}
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
         self.class_keys.reset()
@@ -1782,6 +1792,12 @@ class Manager:
         if self._contested(fabric) or sm_contested or not self._master(fabric):
             self._seen_checks = {}
             return
+        if outcome is not None and not outcome.complete:
+            # A verify that ran out of time is a failed query: part of the
+            # switches would look like all of them, and one it didn't reach
+            # like one that's gone.
+            self._seen_checks = {}
+            return
         found = set(fabric.switches)
         if outcome is not None:
             source, nodes = PROBER, dict(outcome.nodes)
@@ -1801,7 +1817,9 @@ class Manager:
                 )
                 for row in session.scalars(sa.select(db.ExpectedSwitch))
             }
-            state = session.get(db.State, EXPECTED_SOURCE)
+            # Locked, so that a --confirm-fabric beside it waits for this
+            # transaction rather than interleaving with it
+            state = session.get(db.State, EXPECTED_SOURCE, with_for_update=True)
             recorded_source = state.text if state is not None else None
             expected = dict(rows)
             if expected and recorded_source != source:
@@ -1831,7 +1849,7 @@ class Manager:
                 if source == PROBER:
                     links = port_keeper.port_keys.load(session)[1]
                     for guid in sorted(set(expected) - found):
-                        if self.port_keeper.switch_gone(guid, links):
+                        if self.port_keeper.switch_gone(guid, links, outcome.verify):
                             del expected[guid]
                             LOG.warning(
                                 "Expected switch 0x%016x is missing, and the "

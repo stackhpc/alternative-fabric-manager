@@ -62,6 +62,9 @@ ARMING = "port_keys_arming"
 # target last changed, as Unix times: the hourly cap, and the day after
 # which it applies whatever the jobs
 LAST_APPLY = "port_keys_last_apply"
+# How many starts in a row fell back to the target OpenSM last ran on,
+# because their verify failed
+FALLBACKS = "port_keys_fallbacks"
 TARGET_CHANGED = "port_keys_target_changed"
 
 # What a port holds: the stored m_key, its key derived from the base, or

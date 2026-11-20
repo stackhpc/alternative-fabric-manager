@@ -25,6 +25,7 @@ from alternative_fabric_manager import (
 )
 from alternative_fabric_manager import manager as manager_mod
 from alternative_fabric_manager.drivers import Fabric, ReloadError, SweepReport
+from alternative_fabric_manager.ha import lease as lease_mod
 from alternative_fabric_manager.port_keys import DERIVED, M_KEY, UNKNOWN
 from tests import conftest
 from tests.fabric_sim import BASE, OWN, S1, S2, M, Sim
@@ -448,6 +449,13 @@ def test_a_takeover_renders_the_cache_from_the_rows_not_the_volume(world):
 def test_a_turn_on_in_ha_mode(world):
     running_with_rows(world)
     world.config.ha = True
+    # Only under an epoch that allows exactly this configuration
+    confirmation = confirm(world)
+    assert not confirmation.armed
+    assert any("configuration epoch" in p for p in confirmation.problems)
+    with world.sessionmaker() as session:
+        lease_mod._store_epoch(session, 1, [world.manager.config_hash()])
+        session.commit()
     assert confirm(world).armed
     _take_over(world, 2)
     world.manager.reconcile()
