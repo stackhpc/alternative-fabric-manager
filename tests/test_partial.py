@@ -715,6 +715,15 @@ def test_learning_takes_only_a_settled_unambiguous_vport(manager, fabric):
     assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
 
 
+def test_a_node_rows_port_is_learnt(manager, fabric):
+    # On an all-in-one or hyperconverged host, OpenSM's node is also the
+    # hypervisor, so its physical port carries instances' VFs.
+    with manager.sessionmaker.begin() as session:
+        session.add(db.Node(name="hv1", port_guids=f'["{OWN:016x}"]'))
+    _learn_hv1(manager, fabric)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+
+
 def test_a_learnt_port_the_passing_scan_doesnt_find_is_dropped(manager, fabric):
     _learn_hv1(manager, fabric)
     del fabric.ports[OWN]

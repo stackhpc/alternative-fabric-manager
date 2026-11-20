@@ -2378,8 +2378,9 @@ class Manager:
         vports of its virtual functions, taking each from any other host
         (specs/ha.md, Where a port is). Only a vport the dump lists once,
         ACTIVE, at an index above 0, of a direct port bound to a host with
-        no open job, on a physical port that is no recorded port's GUID nor
-        a node row's port, as a migration or a bare metal port might be."""
+        no open job, on a physical port that is no recorded port's GUID, as
+        a bare metal port's is. A node row's port can be learnt: a
+        control-plane host that runs instances is a hypervisor too."""
         ports = {
             row.guid: row
             for row in session.scalars(
@@ -2392,8 +2393,6 @@ class Manager:
             for job in session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN)))
         }
         recorded = set(session.scalars(sa.select(db.Port.guid)))
-        for text in session.scalars(sa.select(db.Node.port_guids)):
-            recorded |= {g.lower() for g in json.loads(text or "[]")}
         entries = scan.parse_virtualization_dump(dump)
         counts = {}
         for entry in entries:

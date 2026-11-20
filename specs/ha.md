@@ -595,9 +595,11 @@ paused until the port's job completes. So the manager **learns each
 hypervisor's physical ports**: at each passing check, never a partial
 one, every vport the dump lists exactly once, ACTIVE, at an index above 0,
 whose GUID is a recorded port's, of `binding:vnic_type` `direct`, bound to
-host H and with no open job, on a physical port that is neither a
-recorded port's GUID nor a node row's port, records (H, that physical
-port) in `host_ports`. Learning a physical port for H removes it from any
+host H and with no open job, on a physical port that isn't a recorded
+port's GUID, as a bare metal node's is, records (H, that physical port)
+in `host_ports`. A node row's port can be learnt: a control-plane host
+that also runs instances, as in a hyperconverged or all-in-one
+deployment, is a hypervisor too. Learning a physical port for H removes it from any
 other host's; a passing check's scan that doesn't find a learnt physical
 port drops it. A virtual function's GUID that **neither dump read lists
 at all** is placed if H has at least one learnt physical port, and the
