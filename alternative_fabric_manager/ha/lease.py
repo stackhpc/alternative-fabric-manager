@@ -125,7 +125,11 @@ class GaleraLease:
 
     def _session(self):
         session = self.sessionmaker()
-        _check_primary(session)
+        try:
+            _check_primary(session)
+        except BaseException:
+            session.close()
+            raise
         return session
 
     @staticmethod
