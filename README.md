@@ -82,14 +82,18 @@ Before you start it:
 - **Treat the manager as root on its host.** It uses the Docker socket to
   start OpenSM's container and read its log, and whatever can use that
   socket can control the host.
-- **On a new database, record the fabric's switches** once OpenSM has
-  swept, with `docker exec alternative-fabric-manager
+- **On a new database, the manager records the fabric's switches** by
+  itself, once its fabric checks have seen the same switches for
+  `[opensm] confirm_checks` checks in a row (a minute by default): until
+  then no job completes ("No expected switches yet"). It adds new
+  switches the same way. Running `docker exec alternative-fabric-manager
   alternative-fabric-manager --config-file
-  /etc/alternative-fabric-manager/afm.conf --confirm-fabric`: until then
-  no job completes ("No expected switches"). Run it again whenever
-  switches are added or removed. With the experimental `m_key_per_port`
-  group named, it also arms the turn-on of per-port M_Keys: see
-  docs/opensm-hardening.md, Per-port M_Keys, before running it there.
+  /etc/alternative-fabric-manager/afm.conf --confirm-fabric` is optional:
+  it records them at once, and is needed only to drop a switch that was
+  removed or replaced. With the experimental `m_key_per_port` group
+  named, it also arms the turn-on of per-port M_Keys, as the manager
+  itself does once the fabric is ready: see docs/opensm-hardening.md,
+  Per-port M_Keys.
 
 `--status` shows who holds the lease in HA mode, its term, and any freeze,
 including an unfreeze still pending and the manager to check.
