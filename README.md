@@ -43,9 +43,10 @@ applies the recorded state:
 
 **The database is the source of truth.** Every `[opensm] check_interval`
 seconds, AFM checks that OpenSM is running, and that the partitions file
-is the one it last applied and the one the recorded state renders to. If the file was edited by hand, or
-an apply failed, AFM writes it again and has OpenSM apply it. A failed
-job's change stays in the recorded state, so the next apply includes it.
+is the one it last applied and the one the recorded state renders to.
+If the file was edited by hand, or an apply failed, AFM writes it again and
+has OpenSM apply it. A failed job's change stays in the recorded state, so
+the next apply includes it.
 
 **A 400 is final.** networking-mlnx sets the port to `ERROR` and doesn't
 retry, so AFM answers 400 only to requests that can never succeed:
@@ -53,7 +54,9 @@ retry, so AFM answers 400 only to requests that can never succeed:
 - a port without a usable client ID;
 - a port on a network that has no partition and isn't waiting for one;
 - a network whose VLAN ID is a reserved or static partition's pkey;
-- a request older than one already applied for the same object.
+- a late request: a create or update of a network that was deleted, or a
+  request whose Neutron revision is older than one AFM already has for the
+  same object, applied or waiting.
 
 A request that may succeed later waits instead. A network whose VLAN ID is
 still another network's partition key, or a port whose GUID is still
@@ -206,7 +209,7 @@ which send subnet management packets, such as `ibnetdiscover` and
 it:
 
 ```sh
-KEY=$(alternative-fabric-manager --config-file /etc/alternative-fabric-manager/afm.conf \
+KEY=$(docker exec alternative-fabric-manager alternative-fabric-manager \
   --show-keys | awk '$1 == "m_key" {print $2}')
 ```
 
@@ -225,13 +228,15 @@ Name them beside `all` or in a list of groups, for example
 
 | Group | What it does | Requires | Read first |
 | --- | --- | --- | --- |
-| `m_key_per_port` | Gives each port an M_Key of its own, so that a key read from one port no longer opens every switch. Naming it turns per-port M_Keys on by itself, re-keying every port. It leaves keys on ports. A tool's `-y` then needs that port's own key: `KEY=$(alternative-fabric-manager --port-m-key <guid>)` | The managed driver and the `m_key` group | Per-port M_Keys |
+| `m_key_per_port` | Gives each port an M_Key of its own, so that a key read from one port no longer opens every switch. Naming it turns per-port M_Keys on by itself, re-keying every port. It leaves keys on ports. A tool's `-y` then needs that port's own key: `KEY=$(docker exec alternative-fabric-manager alternative-fabric-manager --port-m-key <guid>)` | The managed driver and the `m_key` group | Per-port M_Keys |
 | `allowed_sm` | Makes OpenSM ignore every subnet manager outside this host's physical ports, so a tenant's can't win the election. An ignored one on a port whose host may hold the fabric's keys (`--record-sm-port`) fails the fabric check | The managed driver, and the `m_key` and `sm_key` groups | Allowed subnet managers, and its Before enabling checklist |
 | `class_keys` | Keys every port's vendor-specific, congestion control and node-to-node classes from a stored seed. It leaves keys on ports; turn it off by disabling first | | Class keys, and its Before enabling checklist |
 | `sa_rate` | Limits each port's SA requests | | SA request rate |
 
 The sections in the last column are in
-[docs/opensm-hardening.md](docs/opensm-hardening.md).
+[docs/opensm-hardening.md](docs/opensm-hardening.md). Every hardening
+group, these included, takes effect only with the managed driver, which
+writes `opensm.conf`.
 
 ## The partitions file
 
