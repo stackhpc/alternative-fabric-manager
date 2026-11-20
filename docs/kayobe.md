@@ -446,6 +446,11 @@ host_config_dir = /etc/opensm
 # The experimental groups, such as m_key_per_port, only as
 # opensm-hardening.md's In HA mode says
 hardening = m_key, sm_key, enforcement
+# An hour by default: a Galera outage longer than the lease stops every
+# OpenSM long enough for a tenant to read the M_Key. 0 makes keys
+# permanent, at the cost of recovering a lost database (see
+# opensm-hardening.md, The lease); freeze before database maintenance.
+key_lease_period = 3600
 # HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts):
 # 237 s here, or 327 s with m_key_per_port, so 360 covers either
 job_timeout = 360

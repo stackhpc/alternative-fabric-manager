@@ -37,7 +37,8 @@ case, but its cost is high with leases of 0: every port keeps a key no SM
 holds, a power cycle of the whole fabric clears only volatile ones, and
 adapters with a non-volatile M_Key need reconfiguring on their own hosts,
 which may be tenants'. The default `[opensm] key_lease_period`, an hour,
-makes such a loss recoverable by waiting; a deployment that sets it to 0
+is expected to make such a loss recoverable by waiting (not yet shown on
+hardware); a deployment that sets it to 0
 accepts that cost, and docs/opensm-hardening.md says so. A
 start that stored the base still doesn't begin them (A new base key).
 

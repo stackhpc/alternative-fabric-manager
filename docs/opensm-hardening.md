@@ -48,8 +48,9 @@ A single OpenSM option can still be overridden in `[opensm_conf]`, for
 example `sa_etm_max_num_mcgs = 256`, and wins over the groups.
 
 The keys the manager sets on ports have a lease of an hour by default: a
-port that no subnet manager reaches for an hour drops its protection, so
-that a lost key recovers by waiting. `[opensm] key_lease_period` changes
+port sent a wrong-keyed packet that no subnet manager then reaches for an
+hour drops its protection, so that a lost key is expected to recover by
+waiting (not yet shown on hardware). `[opensm] key_lease_period` changes
 that for every such key at once, and `0` makes them permanent (see
 Permanent keys).
 
@@ -57,7 +58,7 @@ Permanent keys).
 | --- | --- | --- | --- | --- |
 | `m_key` | `m_key` | `0` | Random, shared | A host reading or changing port settings with SMPs |
 | `m_key` | `m_key_protection_level` | `0` | `2` | As above |
-| `m_key` | `m_key_lease_period` | `0` | `[opensm] key_lease_period`, `3600` by default | A port giving up its protection, and its M_Key, while no SM runs |
+| `m_key` | `m_key_lease_period` | `0` | `[opensm] key_lease_period`, `3600` by default | A port giving up its protection, and its M_Key, during an outage of every SM shorter than the lease; `0` for any outage |
 | `sm_key` | `sm_key` | `0x1` | Random, shared | A rogue subnet manager taking over by handover |
 | `sa_key` | `sa_key` | `0x1` | Random, shared | Any client being trusted by the SA with the well-known key |
 | `sa_trust` | `sa_enhanced_trust_model` | `FALSE` | `TRUE` | Untrusted clients using SA requests beyond the minimal set |
@@ -168,16 +169,22 @@ lease, a host sending SMPs without the M_Key gets a port's protection, and the
 M_Key, back. The manager stops OpenSM whenever it restarts, and in high
 availability every OpenSM is shut down while the database can't be reached,
 so short windows are expected. The default lease is an hour, far longer
-than a restart or a takeover: only an outage of the subnet manager that
-long opens the window.
+than a restart or a takeover: only an outage of every subnet manager that
+long opens the window. In HA mode that includes a database outage: every
+OpenSM stops while Galera has no Primary component, so a quorum loss or
+maintenance of the database lasting over an hour opens it, and noticing
+doesn't help, since no OpenSM can start without the database. Freeze the
+lease before planned database maintenance (specs/ha.md, Freeze).
 
-A lease of `0` closes it for good, at the cost of recovery: a fabric whose
-M_Key is lost, for example with the manager's database, can't be
-configured by a new subnet manager until every port is reset, by
-power-cycling or by firmware tools. The default favours recovery, since a
-lost database is likelier than an hour with no subnet manager going
-unnoticed; a fabric that prefers the opposite sets `key_lease_period = 0`
-(see Permanent keys). Back up the database either way.
+A lapse gives a tenant the M_Key for good: without per-port M_Keys it is
+one key for every port, and the manager can't rotate it yet. A lease of
+`0` closes the window, at the cost of recovery: a fabric whose M_Key is
+lost, for example with the manager's database, can't be configured by a
+new subnet manager until every port is reset, by power-cycling or by
+firmware tools. The default favours recovery, which is expected but not
+yet shown on hardware (see Permanent keys); a fabric that prefers the
+opposite, or whose database may be out for an hour, sets
+`key_lease_period = 0`. Back up the database either way.
 
 ## Permanent keys
 
@@ -200,8 +207,9 @@ key_lease_period = 3600
 
 A release before this default had permanent keys by default. Upgrading a
 deployment that doesn't set `key_lease_period` gives every port the hour's
-lease at the next start: on a fabric others share, agree it, or set
-`key_lease_period = 0` in the same change to keep permanent keys.
+lease at the next start (in HA mode, once the configuration epoch moves:
+specs/ha.md, Configuration epochs): on a fabric others share, agree it,
+or set `key_lease_period = 0` in the same change to keep permanent keys.
 
 With a lease, a port that is sent a packet with the wrong key starts a
 countdown. Packets with the right key, such as OpenSM's sweeps, stop it.

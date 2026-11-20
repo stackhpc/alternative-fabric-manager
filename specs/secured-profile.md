@@ -465,9 +465,9 @@ running OpenSM to recover from a changed or lost seed.
 ### Leases
 
 The leases follow `[opensm] key_lease_period`, like the M_Key's: one option
-sets every key lease the manager writes, 0 (permanent) by default, so that
-an operator opts out of permanent keys in one line (see
-docs/opensm-hardening.md, Permanent keys), an hour by default, as for the
+sets every key lease the manager writes, and 0 opts in to permanent keys
+in one line (see docs/opensm-hardening.md, Permanent keys). It is an hour
+by default, as for the
 M_Key (see docs/opensm-hardening.md, The lease): longer than any restart or
 takeover, during which AFM stops OpenSM and a lapsed lease would let a host
 clear a port's protection. Hardware test 3 checks that a lease of 0 means
