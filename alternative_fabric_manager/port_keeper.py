@@ -692,7 +692,8 @@ class PortKeeper:
         if not verified and target != running:
             effective = running
             target = self._fell_back(target, running, result is None)
-        elif target != running or effective == target:
+        else:
+            # A start on its target: the fallbacks in a row end.
             self._count_fallbacks(0)
 
         with self._session() as session:
