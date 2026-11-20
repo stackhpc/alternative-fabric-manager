@@ -69,16 +69,19 @@ partitions_template =
 # [opensm_conf] overrides any single option.
 hardening = all
 # The lease, in seconds, of every key the manager sets on ports: the M_Key,
-# and the class keys once a group sets them. 0, the default, makes them
-# permanent: a port never drops its protection, and a port whose key is lost
-# stays locked until it's power-cycled. Up to 65535 opts out: a port drops
-# its protection once no subnet manager has reached it for that long. Any
-# tenant can then read the M_Key, which is shared by every port and can't be
-# rotated yet, so an outage longer than the lease compromises the fabric for
-# good. Use minutes, longer than any restart or takeover; 60 suits only a
-# test fabric. The same on every node in HA mode. See
-# docs/opensm-hardening.md, Permanent keys.
-key_lease_period = 0
+# and the class keys once a group sets them, up to 65535. A port drops its
+# protection once no subnet manager has reached it for that long after a
+# wrong-keyed packet, so a port whose key is lost, for example with the
+# database, is expected to be keyed again by waiting. Any tenant can then
+# read the port's M_Key, which without m_key_per_port is shared by every
+# port and can't be rotated yet: an outage of every subnet manager (in HA
+# mode, of the database too) longer than the lease compromises the fabric
+# for good. 3600, the default, is far
+# longer than any restart or takeover; 60 suits only a test fabric. 0 makes
+# the keys permanent: a port never drops its protection, and a port whose
+# key is lost stays locked until it's reset. The same on every node in HA
+# mode. See docs/opensm-hardening.md, Permanent keys.
+key_lease_period = 3600
 start_timeout = 120
 sweep_timeout = 30
 check_interval = 5

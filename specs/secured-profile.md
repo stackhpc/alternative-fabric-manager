@@ -465,24 +465,25 @@ running OpenSM to recover from a changed or lost seed.
 ### Leases
 
 The leases follow `[opensm] key_lease_period`, like the M_Key's: one option
-sets every key lease the manager writes, 0 (permanent) by default, so that
-an operator opts out of permanent keys in one line (see
-docs/opensm-hardening.md, Permanent keys). The default is 0 for the same
-reason as the M_Key's (see docs/opensm-hardening.md, The lease): AFM stops
-OpenSM during restarts and takeovers, and a lease that ran out while no SM
-ran would let a host clear a port's protection. Hardware test 3 checks that
-a lease of 0 means "never expires" for these classes, as it does for the
-M_Key. If it doesn't, the default for these classes is the longest lease
-OpenSM accepts, and the doc says so.
+sets every key lease the manager writes, and 0 opts in to permanent keys
+in one line (see docs/opensm-hardening.md, Permanent keys). It is an hour
+by default, as for the
+M_Key (see docs/opensm-hardening.md, The lease): longer than any restart or
+takeover, during which AFM stops OpenSM and a lapsed lease would let a host
+clear a port's protection. Hardware test 3 checks that a lease of 0 means
+"never expires" for these classes, as it does for the M_Key. If it doesn't,
+a deployment that opts in to permanent keys gets the longest lease OpenSM
+accepts for these classes, and the doc says so.
 
 The cost of a lease of 0 is recovery. In the first run, ports keyed with a
 lost seed answered again after OpenSM had been stopped for longer than the
 60 s lease. Whether the lease or something else did it isn't established
 (see Results). With a lease of 0 the ports are expected to stay keyed until
-a power cycle clears them, which test 3 also checks. The default stays 0,
-the same choice made for the M_Key. An operator who prefers recovery sets
-`key_lease_period` and accepts the window. That is a policy choice the
-option makes, not something a test decides.
+a power cycle clears them, which test 3 also checks. The default is an
+hour, the same choice made for the M_Key: recovery by waiting, with a
+window only after an hour with no SM. An operator who prefers permanent
+keys sets `key_lease_period = 0` and accepts the recovery cost. That is a
+policy choice the option makes, not something a test decides.
 
 ### Turning the keys off, and downgrades
 
@@ -586,6 +587,10 @@ on ports, so HA mode allows it, experimental, as it does the other
 experimental groups (see HA mode).
 
 ## Per-port M_Keys
+
+specs/zero-touch.md overrides parts of this section: switch trust, the
+`keys_to_try` rule for switches, and how the turn-on is armed and applied.
+Where they differ, it wins.
 
 ### Why
 

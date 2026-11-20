@@ -724,7 +724,10 @@ def test_opensm_conf_has_no_seed(manager, config, hardening):
         if k not in ("key_mgr_seed", "m_key_base")
     }
     assert content == opensm_conf.render(
-        {}, hardening=config.hardening_groups, keys=keys
+        {},
+        hardening=config.hardening_groups,
+        keys=keys,
+        key_lease_period=config.key_lease_period,
     )
 
 

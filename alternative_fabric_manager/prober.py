@@ -307,10 +307,9 @@ class VerifyResult:
     - own_guid: which of this host's ports answered, or None;
     - own_port_lost: this host's port answered neither key (or the host has
       no port), so OpenSM can't sweep: the caller fails the start;
-    - switches: the node GUIDs (NodeInfo's Guid, as ibswitches gives them)
-      of recorded switches that answered with the port GUID recorded on
-      their route, what the fabric check compares with the expected
-      switches;
+    - switches: the GUIDs of switch rows (their port 0's) that answered as
+      a switch with the GUID recorded on their route, of which the fabric
+      check counts the expected ones;
     - answered: port GUIDs that answered with their recorded GUID;
     - keyed: those of them whose answer showed which key they hold
       (ProtectBits 2 or more);
@@ -321,6 +320,8 @@ class VerifyResult:
     - link_down: port GUIDs not sent anything because their link is down;
     - link_states: (switch port GUID, port) to whether its link is up, as
       the switch's PortInfo said;
+    - own_link_up: whether this host's port's link is up, as its own
+      PortInfo said, or None if it didn't;
     - unrecorded: (switch port GUID, port) whose link is up with no
       recorded link, from a full verify only;
     - complete: False if the deadline ended the verify early, with
@@ -337,6 +338,7 @@ class VerifyResult:
     unconfirmed: set = dataclasses.field(default_factory=set)
     link_down: set = dataclasses.field(default_factory=set)
     link_states: dict = dataclasses.field(default_factory=dict)
+    own_link_up: bool | None = None
     unrecorded: list = dataclasses.field(default_factory=list)
     complete: bool = True
     gets: int = 0
@@ -383,8 +385,6 @@ def verify(
     now,
     deadline=None,
     clock=time.monotonic,
-    trusted_switches=None,
-    follow_unconfirmed=False,
 ):
     """Probe recorded ports along recorded links with the keys the rules
     allow, and say what each answer means for the rows
@@ -397,19 +397,14 @@ def verify(
     GUIDs; now stamps last_seen; deadline, on clock's scale, is checked
     between batches. The arguments are left as they were.
 
-    trusted_switches, if given, holds the GUIDs of the switches an operator
-    confirmed, as the fabric check compares them: each a switch row's own
-    GUID, which the answer on its route must match. Only those count as
-    switches no tenant controls, which may be sent both keys, and only
-    those are routed through and counted in result.switches, since a Get
-    that passes through a node shows it the key. A row says it's a switch
-    because its NodeInfo did, and an adapter can answer as one, with any
-    node GUID it likes, so NodeInfo's Guid never decides trust. Without
-    trusted_switches, every row recorded as a switch counts.
-
-    follow_unconfirmed routes through, and counts, every row that answers
-    as a switch, trusted or not, for --confirm-fabric to find switches
-    to confirm; which keys a port is sent still follows trusted_switches.
+    Every row that answers as a switch is routed through and counted in
+    result.switches, as OpenSM's own sweeps go through whatever answers as
+    one (specs/zero-touch.md, Switch trust is dropped). Which of them the
+    fabric check counts is the caller's: the expected switches found, so
+    that a new switch, or an adapter answering as one, never makes a
+    fragment look complete. And keys_to_try sends a switch row only what
+    OpenSM would send it, so following it hands a spoofer no key OpenSM
+    wouldn't.
     """
     return _Verify(
         ports,
@@ -423,8 +418,6 @@ def verify(
         now=now,
         deadline=deadline,
         clock=clock,
-        trusted_switches=trusted_switches,
-        follow_unconfirmed=follow_unconfirmed,
     ).go()
 
 
@@ -458,11 +451,7 @@ class _Verify:
         now,
         deadline,
         clock,
-        trusted_switches=None,
-        follow_unconfirmed=False,
     ):
-        self.trusted = None if trusted_switches is None else set(trusted_switches)
-        self.follow_unconfirmed = follow_unconfirmed
         self.rows = dict(ports)
         # A link recorded in one direction only isn't followed.
         self.links = port_keys.paired(links)
@@ -609,6 +598,7 @@ class _Verify:
             self.result.own_guid = answered
             self._record(answered, name, node, port)
             self._own_link = _link_up(port)
+            self.result.own_link_up = self._own_link
             return True
         self.result.own_port_lost = True
         for guid in candidates:
@@ -618,16 +608,10 @@ class _Verify:
 
     # Beyond it
 
-    def _trusted(self, guid):
-        """Whether a row's own GUID is a switch an operator confirmed"""
-        return self.trusted is None or guid in self.trusted
-
     def _followed(self, guid):
         """Whether a row is a switch that routes may go through, and that
-        the fabric check counts"""
-        if self._row(guid).switch is not True:
-            return False
-        return self.follow_unconfirmed or self._trusted(guid)
+        result.switches counts: any row whose NodeInfo said it's one"""
+        return self._row(guid).switch is True
 
     def _in_scope(self, guid, needed):
         if self.scope == FULL:
@@ -668,16 +652,14 @@ class _Verify:
             for hop in level:
                 if not self._in_scope(hop.guid, needed):
                     continue
-                # A switch that isn't followed is probed as any other port.
                 if self._followed(hop.guid):
                     switches.append(hop)
                 else:
                     others.append(hop)
             for hop in self._linked(switches):
                 node = self._node_info.get(hop.guid)
-                # Only a followed switch that says it's one again is routed
-                # through, and counted, by the GUID its route's answer
-                # matched: the identity trust is decided by.
+                # Only a switch that says it's one again is routed through,
+                # and counted, by the GUID its route's answer matched.
                 if (
                     hop.guid in self.result.answered
                     and node is not None
@@ -757,16 +739,15 @@ class _Verify:
         pending = []
         for hop in hops:
             row = self._row(hop.guid)
-            # By the row's own GUID, which the answer must match, never its
-            # NodeInfo's Guid, which an adapter answering as a switch can
-            # set to a confirmed switch's
-            infrastructure = row.guid == self.result.own_guid or (
-                row.switch is True and self._trusted(row.guid)
-            )
+            own = row.guid == self.result.own_guid
             names = [
                 name
                 for name in port_keys.keys_to_try(
-                    row.holds, self.target_on, infrastructure, self.nothing_derived
+                    row.holds,
+                    self.target_on,
+                    port_keys.is_infrastructure(row, self.result.own_guid),
+                    self.nothing_derived,
+                    own_port=own,
                 )
                 if self._key(name, hop.guid) is not None
             ]

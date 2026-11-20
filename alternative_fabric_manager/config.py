@@ -158,6 +158,11 @@ class Config:
     # slow for every check, so the fabric check uses the last verify's
     # result, and fails if it's older than two of these.
     port_verify_interval: float = 60.0
+    # How many fabric checks in a row must see a switch before the manager
+    # records it as expected, and, on a new deployment, every switch before
+    # it records the list (specs/zero-touch.md): 12 is a minute at the
+    # default check_interval.
+    confirm_checks: int = 12
     # Times to try applying a change in a row, before the manager waits for
     # the next check_interval.
     apply_attempts: int = 3
@@ -234,13 +239,15 @@ class Config:
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
-    # M_Key, and later the class keys). 0, the default, makes them permanent:
-    # a port never drops its protection. A positive lease lets ports keyed
-    # with a lost key be keyed again, but any outage with no SM longer than
-    # the lease lets a tenant read the fabric's M_Key, for good
+    # M_Key, and later the class keys). An hour by default, so that ports
+    # keyed with a lost key, such as with a lost database, are expected to
+    # be keyed again by waiting, rather than by resetting every port; any
+    # outage of every SM (in HA mode, of the database too) longer than the
+    # lease lets a tenant read the fabric's M_Key, for good: it can't be
+    # rotated yet. 0 opts in to permanent keys: a port never drops its protection
     # (docs/opensm-hardening.md, Permanent keys). [opensm_conf] can still
     # override a single lease. Fabric-affecting: the same on every HA node.
-    key_lease_period: int = 0
+    key_lease_period: int = 3600
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)
@@ -328,6 +335,8 @@ class Config:
             raise ConfigError("[opensm] default_partition must end with ;")
         if self.apply_attempts < 1:
             raise ConfigError("[opensm] apply_attempts must be at least 1")
+        if self.confirm_checks < 1:
+            raise ConfigError("[opensm] confirm_checks must be at least 1")
         parse_hardening(self.hardening)
         for name in (
             "start_timeout",
@@ -833,6 +842,7 @@ OPTIONS = (
             "sweep_timeout",
             "check_interval",
             "port_verify_interval",
+            "confirm_checks",
             "apply_attempts",
             "job_timeout",
             "default_partition",

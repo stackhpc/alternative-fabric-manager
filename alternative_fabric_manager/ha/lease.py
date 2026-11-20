@@ -37,6 +37,7 @@ LOG = logging.getLogger(__name__)
 # The configuration epoch, and the key of the configuration hash's HMAC, as
 # secrets rows (see specs/ha.md, Configuration epochs)
 EPOCH = "config_epoch"
+# Shared with the single-node manager's (manager.CONFIG_HASH_KEY)
 HASH_KEY = "config_hash_key"
 # An epoch allows one hash, or two during a change.
 MAX_HASHES = 2
@@ -49,6 +50,12 @@ def _epoch(session, lock=False):
         return None
     value = json.loads(row.value)
     return value["epoch"], tuple(value["hashes"])
+
+
+def read_epoch(session):
+    """(epoch, allowed hashes as a tuple), or None if none is stored, in the
+    caller's session"""
+    return _epoch(session)
 
 
 def _store_epoch(session, epoch, hashes):
@@ -449,11 +456,10 @@ class GaleraLease:
     def expected_switches(self):
         """How many switches a complete fabric has"""
         with self._session() as session:
-            # A pending switch isn't expected yet.
+            # pending, which an older version wrote, is ignored
+            # (specs/zero-touch.md).
             count = session.scalar(
-                sa.select(sa.func.count())
-                .select_from(db.ExpectedSwitch)
-                .where(db.ExpectedSwitch.pending.is_(False))
+                sa.select(sa.func.count()).select_from(db.ExpectedSwitch)
             )
             session.commit()
             return count or 0

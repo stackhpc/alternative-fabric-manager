@@ -567,11 +567,14 @@ KEYS_TO_TRY = [
         )
         for target in (True, False)
         for nothing in (True, False)
-        if (holds, target, nothing) != (DERIVED, True, False)
+        if (target, nothing) != (True, False) or holds == M_KEY
     ],
-    # A switch recorded derived once anything can be: never m_key, which an
-    # adapter claiming the switch's GUID on its route could read
+    # A switch, with the target on once anything can be derived, gets m_key
+    # only if its row holds it, as OpenSM sends it only where guid2mkey
+    # names it (specs/zero-touch.md): an unknown switch row gets its derived
+    # key alone, as a tenant's does
     (DERIVED, True, True, False, (DERIVED,)),
+    (UNKNOWN, True, True, False, (DERIVED,)),
     (M_KEY, True, False, False, (M_KEY, DERIVED)),
     (DERIVED, True, False, False, (DERIVED,)),
     (UNKNOWN, True, False, False, (DERIVED,)),
@@ -597,12 +600,21 @@ def test_keys_to_try_follows_the_probers_rule(holds, target_on, infra, nothing, 
     assert port_keys.keys_to_try(holds, target_on, infra, nothing) == keys
 
 
-def test_this_hosts_own_port_keeps_both_keys():
+@pytest.mark.parametrize("holds", [DERIVED, UNKNOWN])
+def test_this_hosts_own_port_keeps_both_keys(holds):
     # Nothing else can answer as it, so it's sent both whatever its row says.
-    assert port_keys.keys_to_try(DERIVED, True, True, False, own_port=True) == (
+    assert port_keys.keys_to_try(holds, True, True, False, own_port=True) == (
         DERIVED,
         M_KEY,
     )
+
+
+@pytest.mark.parametrize("holds", [DERIVED, UNKNOWN])
+def test_a_switch_gets_m_key_only_if_its_row_holds_it(holds):
+    # With the target on and anything derived, a switch not on m_key is sent
+    # what OpenSM would send it: its derived key alone.
+    assert port_keys.keys_to_try(holds, True, True, False) == (DERIVED,)
+    assert port_keys.keys_to_try(M_KEY, True, True, False) == (M_KEY, DERIVED)
 
 
 @pytest.mark.parametrize("holds", [DERIVED, UNKNOWN])

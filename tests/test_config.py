@@ -285,7 +285,10 @@ def test_more_invalid(tmp_path, text, match):
 
 
 def test_key_lease_period(tmp_path):
-    assert _load(tmp_path, "[api]\ntoken = x\n").key_lease_period == 0
+    # An hour by default, so that a lost key recovers by waiting
+    assert _load(tmp_path, "[api]\ntoken = x\n").key_lease_period == 3600
+    config = _load(tmp_path, "[api]\ntoken = x\n[opensm]\nkey_lease_period = 0\n")
+    assert config.key_lease_period == 0
     config = _load(tmp_path, "[api]\ntoken = x\n[opensm]\nkey_lease_period = 60\n")
     assert config.key_lease_period == 60
 

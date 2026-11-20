@@ -349,6 +349,41 @@ def test_a_missing_switch_moves_leadership_to_a_node_that_reaches_more(lease, cl
     assert a.role == coordinator_mod.Role.STARTING
 
 
+def test_applying_the_per_port_target_steps_down_alone(lease, clock):
+    # specs/zero-touch.md, Applying: no other candidate, nor the cooldown, is
+    # needed, and the lease is released, so that a takeover's start, this
+    # node's own included, applies the target.
+    a = make(lease, "a", step_down_cooldown=300)
+    lead(a)
+    term = a.term
+    a.manager.apply_requested = "the per-port M_Key target is on"
+    a.calls.clear()
+    a._lead()
+    assert a.role == coordinator_mod.Role.STARTING
+    assert "runner.stop" in a.calls
+    assert a.manager.apply_requested is None
+    assert lease.read().released
+    # It may take the lease back itself.
+    a._rejoin()
+    a._watch()
+    a._takeover.join(5)
+    assert a.role == coordinator_mod.Role.LEADER and a.term > term
+
+
+def test_a_held_leader_drops_an_apply_request(lease, clock):
+    # A freeze keeps OpenSM where it is: the request is dropped, and the
+    # manager, which asks whether it's held, asks again once it ends.
+    a = make(lease, "a", step_down_cooldown=0)
+    lead(a)
+    a.manager.apply_requested = "the per-port M_Key target is on"
+    a.held = True
+    assert a.manager.leader_held()
+    assert a._discretionary_trigger() is None
+    assert a.manager.apply_requested is None
+    a.held = False
+    assert not a.manager.leader_held()
+
+
 def test_a_new_leadership_counts_failures_afresh(tmp_path):
     from alternative_fabric_manager import manager as manager_mod
     from alternative_fabric_manager.drivers import NoOpenSM

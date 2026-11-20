@@ -324,6 +324,25 @@ class Cluster:
             "a leader",
         )
 
+    def wait_leading(self, lease, timeout=TAKEOVER + 30):
+        """(leader, term) once the leader's takeover has finished, not just
+        started its OpenSM: a takeover whose writes fail steps down, and the
+        next term starts another OpenSM"""
+
+        def leading():
+            leader = self.leader()
+            if leader is None:
+                return None
+            state = lease.read()
+            if state.holder_node != f"node-{leader}":
+                return None
+            text = (self.tmp / f"instance-{leader}.log").read_text()
+            if f"Leading, term {state.term}\n" in text:
+                return leader, state.term
+            return None
+
+        return wait_for(leading, timeout, "a leader past its takeover")
+
     def sm_pids(self, i):
         return [
             entry["pid"]
@@ -1041,9 +1060,10 @@ def test_sigterm_during_a_takeover_releases_without_starting_opensm(cluster):
 
 @pytest.mark.timings(lease_timeout=14.0, self_stop_timeout=10.0)
 def test_a_galera_blip_shorter_than_self_stop_keeps_opensm(cluster):
-    leader = cluster.wait_leader()
+    cluster.wait_leader()
     _config, lease, _sessionmaker = _operator(cluster)
-    term = lease.read().term
+    # A blip during the takeover fails it, which rightly restarts OpenSM.
+    leader, term = cluster.wait_leading(lease)
     pids = cluster.sm_pids(leader)
     for i in NODES:
         docker("pause", galera_name(i))
@@ -1085,9 +1105,9 @@ def test_two_galera_nodes_down_stops_every_opensm(cluster):
 @pytest.mark.timings(lease_timeout=14.0, self_stop_timeout=10.0)
 def test_a_candidate_cut_off_from_galera_disturbs_nothing(cluster):
     leader = cluster.wait_leader()
-    candidate = next(i for i in NODES if i != leader)
     _config, lease, _sessionmaker = _operator(cluster, leader)
-    term = lease.read().term
+    leader, term = cluster.wait_leading(lease)
+    candidate = next(i for i in NODES if i != leader)
     pids = cluster.sm_pids(leader)
     started = time.monotonic()
     _isolate(cluster, candidate, True)

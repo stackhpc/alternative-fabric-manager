@@ -446,6 +446,11 @@ host_config_dir = /etc/opensm
 # The experimental groups, such as m_key_per_port, only as
 # opensm-hardening.md's In HA mode says
 hardening = m_key, sm_key, enforcement
+# An hour by default: a Galera outage longer than the lease stops every
+# OpenSM long enough for a tenant to read the M_Key. 0 makes keys
+# permanent, at the cost of recovering a lost database (see
+# opensm-hardening.md, The lease); freeze before database maintenance.
+key_lease_period = 3600
 # HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts):
 # 237 s here, or 327 s with m_key_per_port, so 360 covers either
 job_timeout = 360
@@ -793,14 +798,20 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 ## First deployment
 
 1. Deploy: `kayobe overcloud service deploy`.
-2. Record the fabric's switches, on the leader, the controller running the
-   `opensm` container. Until then no job completes ("No expected
-   switches"). Here and below, set `ENGINE=podman` on Podman hosts:
+2. Wait for the leader to record the fabric's switches, which it does by
+   itself once its fabric checks have seen the same switches for
+   `[opensm] confirm_checks` checks in a row (a minute by default). Until
+   then no job completes ("No expected switches yet"). Optionally, record
+   them at once on the leader, the controller running the `opensm`
+   container; here and below, set `ENGINE=podman` on Podman hosts:
 
    ```sh
    ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
    ```
+
+   Run it later only after removing or replacing a switch, which the
+   manager doesn't drop by itself while its links may be up.
 
 3. Run the networking-mlnx tempest plugin against the deployment.
 4. Create an InfiniBand network and boot an instance on it, as in
