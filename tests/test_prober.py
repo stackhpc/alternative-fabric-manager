@@ -518,15 +518,35 @@ def test_rule5_a_row_not_known_to_be_a_switch_isnt_infrastructure():
 
 
 def test_rule5_switches_get_both_keys():
-    # A switch whose row isn't derived, or with the target off: both keys
-    for holds, target_on in ((UNKNOWN, True), (DERIVED, False)):
+    # A switch with the target off, or before anything can be derived: both
+    # keys
+    for holds, target_on, nothing in (
+        (DERIVED, False, False),
+        (UNKNOWN, True, True),
+        (UNKNOWN, False, False),
+    ):
         sim = fabric()
         sim.ports[S1].key = M
-        result = check(sim, rows=sim.rows(holds={S1: holds}), target_on=target_on)
+        result = check(
+            sim,
+            rows=sim.rows(holds={S1: holds}),
+            target_on=target_on,
+            nothing_derived=nothing,
+        )
         assert sim.keys_sent(S1)[:4] == [derived(S1)] * 2 + [M, M]
         assert result.ports[S1].holds == M_KEY
         # Its ports' link states are asked with the key it answered.
         assert all(key == M for to, key, _attr, port in sim.sent if to == S1 and port)
+
+
+def test_rule5_an_unknown_switch_gets_its_derived_key_alone_once_keys_are_on():
+    # As OpenSM, which sends the stored M_Key only where guid2mkey names it
+    # (specs/zero-touch.md)
+    sim = fabric()
+    sim.ports[S1].key = M
+    result = check(sim, rows=sim.rows(holds={S1: UNKNOWN}))
+    assert M not in sim.keys_sent(S1)
+    assert S1 in result.unanswered
 
 
 def test_rule5_a_derived_switch_isnt_sent_m_key_once_keys_are_on():
@@ -759,9 +779,8 @@ def test_a_result_holds_no_key():
     assert result.gets == len(sim.sent)
 
 
-# Trust: by a switch row's own GUID, which its route's answer matched
+# No switch trust: every row that answers as a switch is followed
 
-CONFIRMED = {S1, S2}
 X = 0xD1
 BEHIND_X = 0xD2
 
@@ -781,57 +800,37 @@ def _impostor(sim, key):
 
 
 @pytest.mark.parametrize("scope", [FULL, SWITCHES, frozenset({X})])
-def test_trust_an_adapter_claiming_a_confirmed_switchs_guid_isnt_sent_m_key(scope):
+def test_an_adapter_answering_as_a_switch_is_sent_what_opensm_would(scope):
+    # Recorded derived, as OpenSM keyed it: its derived key alone, never m_key
     sim = fabric()
     rows = _impostor(sim, 0x3333333333333333)
-    result = check(sim, rows=rows, scope=scope, trusted_switches=CONFIRMED)
+    result = check(sim, rows=rows, scope=scope)
     assert M not in sim.keys_sent(X)
     assert sim.keys_sent(X) == [derived(X)] * 2
     assert X not in result.switches
 
 
-def test_trust_an_unconfirmed_switch_isnt_routed_through_or_counted():
+def test_every_switch_that_answers_is_followed_and_counted():
     sim = fabric()
     rows = _impostor(sim, derived(X))
-    result = check(sim, rows=rows, trusted_switches=CONFIRMED)
+    result = check(sim, rows=rows)
     assert X in result.keyed
-    assert X not in result.switches and result.switches == CONFIRMED
-    # A Get through it would show it the key.
-    assert sim.keys_sent(BEHIND_X) == []
+    assert result.switches == {S1, S2, X}
+    # Routed through, with the port behind it sent its derived key only
+    assert BEHIND_X in result.keyed
+    assert set(sim.keys_sent(BEHIND_X)) == {derived(BEHIND_X)}
 
 
-def test_trust_a_switch_whose_node_guid_differs_is_trusted_by_its_port_guid():
+def test_a_switch_whose_node_guid_differs_is_found_by_its_port_guid():
     sim = fabric()
     sim.ports[S1].node_guid = 0x0EC0D9A0300B12560
     sim.ports[S1].key = M
-    # Unknown, which a tenant's port would be sent only its derived key for
-    rows = sim.rows(holds={S1: UNKNOWN})
-    result = check(sim, rows=rows, trusted_switches=CONFIRMED)
-    # Infrastructure: both keys, so it answers the one it holds
+    # Recorded on m_key, which it holds, so it's sent m_key too
+    rows = sim.rows(holds={S1: M_KEY})
+    result = check(sim, rows=rows)
     assert S1 in result.keyed and result.ports[S1].holds == M_KEY
     assert S1 in result.switches
-
-
-def test_trust_with_none_confirmed_reaches_only_this_hosts_port_and_its_peer():
-    sim = fabric()
-    result = check(sim, trusted_switches=set())
-    assert result.switches == set()
-    assert {to for to, *_ in sim.sent} == {OWN, S1}
-
-
-def test_trust_confirm_mode_follows_unconfirmed_switches_without_both_keys():
-    sim = fabric()
-    result = check(sim, trusted_switches={S1}, follow_unconfirmed=True)
-    assert result.switches == {S1, S2}
-    assert T3 in result.keyed
-    assert check(fabric(), trusted_switches={S1}).switches == {S1}
-    # Still a tenant's rule for the unconfirmed one: its derived key only
-    sim = fabric()
-    sim.ports[S2].key = M
-    rows = sim.rows(holds={S2: DERIVED})
-    result = check(sim, rows=rows, trusted_switches={S1}, follow_unconfirmed=True)
-    assert M not in sim.keys_sent(S2)
-    assert S2 not in result.switches
+    assert result.ports[S1].node_guid == 0x0EC0D9A0300B12560
 
 
 def test_a_half_link_isnt_followed():

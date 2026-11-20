@@ -53,7 +53,7 @@ _INFINIBAND = re.compile(r"Link layer:\s*InfiniBand\b")
 _PORT_BLOCK = re.compile(r"^\s*(?:CA '|Port \d+:)", re.M)
 # How long the probe may take
 REACH_TIMEOUT = 20
-_SWITCH = re.compile(r"^Switch\s*:\s*0x[0-9a-fA-F]+", re.M)
+_SWITCH = re.compile(r"^Switch\s*:\s*(0x[0-9a-fA-F]+)", re.M)
 
 
 def _sha256(path):
@@ -80,6 +80,10 @@ class HAManagedDocker(docker_driver.ManagedDocker):
         # Called for the switches this node's port reaches by the prober,
         # with per-port M_Key rows, or None to ask ibswitches
         self.reach_switches = None
+        # Called for the expected switches' GUIDs, node GUIDs included, so
+        # that ibswitches' count is of the expected switches found; None,
+        # or an empty set, counts every switch
+        self.expected_switches = None
         # The coordinator's start_gate, which gives the start request's
         # deadline when it's written, or refuses the start; without one, as
         # in tests, prepare's deadline
@@ -352,4 +356,12 @@ class HAManagedDocker(docker_driver.ManagedDocker):
             return None
         if switches is not None:
             return len(switches)
-        return len(_SWITCH.findall(listed))
+        found = {int(guid, 16) for guid in _SWITCH.findall(listed)}
+        # A new switch, or an adapter answering as one, never makes this
+        # node reach more (specs/zero-touch.md); until any switch is
+        # expected, as on a new deployment, every switch counts, or no
+        # candidate would be eligible.
+        expected = self.expected_switches() if self.expected_switches else None
+        if expected:
+            found &= expected
+        return len(found)

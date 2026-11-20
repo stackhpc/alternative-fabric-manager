@@ -23,7 +23,10 @@ Find out before changing anything:
   notes add a group to `all` and the deployment uses `all` or removals
   only: agree it, or opt out of the new group with `-group` in the same
   change (the older release refuses `-group` for a group it doesn't know,
-  so a rollback must remove it again).
+  so a rollback must remove it again). Likewise the first release with an
+  hour's `key_lease_period` by default, on a deployment that doesn't set
+  it: agree the lease, or set `key_lease_period = 0` to keep permanent
+  keys.
 - **The mode**: single-node (`[database] database`, an SQLite file in the
   `afm_data` volume) or HA (`[ha] ha = true`, with `[database] connection`
   to MariaDB or Galera).
@@ -43,22 +46,20 @@ ports (`--port-key-states` lists any), the deploy differs (see
   derives from. Keep a backup taken after the start that stored the base
   (the first start of a release with the group) and after any turn-on;
   an older one can lose the ports.
-- **`--confirm-fabric` can turn them on.** On a deployment that names
-  `m_key_per_port` with per-port M_Keys off, `--confirm-fabric` arms the
-  turn-on when every precondition holds (the base stored by an earlier
-  start, links recorded, no switch confirmed for the first time by that
-  run, and every recorded port behind an up link answering the stored
-  `m_key`), and the manager's next restart then re-keys every port. So
-  there it needs the fabric owner's agreement, and is never a routine
-  step of a redeploy: skip step 5 on such a deployment unless that is the
-  agreed change. If a precondition fails it still confirms the switches,
-  prints "the switches are confirmed, but per-port M_Keys aren't armed:"
-  and why, and exits non-zero. With the group not named, or the keys
-  already on, it only confirms.
+- **Naming the group turns them on.** On a deployment that names
+  `m_key_per_port` with per-port M_Keys off, the manager arms the turn-on
+  by itself once every precondition holds (the base stored by an earlier
+  start, links recorded, and every recorded port behind an up link
+  answering the stored `m_key`), and then restarts OpenSM, which re-keys
+  every port, at a passing check with no open job. `--confirm-fabric`
+  arms it at once, and clears a recorded failed turn-on. So on such a
+  deployment, every redeploy may be the one that turns them on: deploy
+  it only with the fabric owner's agreement. `--port-key-states` shows
+  the target and what blocks the arming.
 - **Never begin or end them in a routine redeploy:** don't name the group,
-  don't remove it, and don't run `--confirm-fabric` to arm them, as part
-  of a deploy. Each re-keys every port and needs the fabric owner's
-  agreement.
+  don't remove it, and don't run `--confirm-fabric` on a deployment that
+  names it, as part of a deploy. Each re-keys every port and needs the
+  fabric owner's agreement.
 - **Check the states before and after**:
   ```sh
   sudo docker exec alternative-fabric-manager alternative-fabric-manager \
@@ -71,13 +72,15 @@ ports (`--port-key-states` lists any), the deploy differs (see
   it) can't render OpenSM's cache: turn per-port M_Keys off first, and
   wait until `--port-key-states` shows every port, HCAs included, holding
   `m_key`. Restoring an older database is a downgrade too.
-- **Confirmed switches gate the prober:** with ports recorded,
-  `--confirm-fabric` runs the prober and records every port that
-  answers as a switch, by its port 0 GUID. Check the list it prints before
-  relying on it (an adapter can answer as a switch). If the check reports
-  "Missing switches" for a switch confirmed before ports were recorded,
-  confirm again: `ibswitches` gave its node GUID.
-- **HA mode refuses the group**; per-port M_Keys are single-node only.
+- **The expected switches keep themselves:** with ports recorded, the
+  prober follows every port that answers as a switch, and the fabric
+  check counts the expected ones it finds. The manager translates the
+  list between `ibswitches`' node GUIDs and the prober's port 0 GUIDs by
+  itself. "Missing switches" for a switch that was removed or replaced
+  needs `--confirm-fabric`, once the hardware change is done.
+- **In HA mode the group is experimental too**: name it only after every
+  node runs a release with configuration epochs, and see
+  docs/opensm-hardening.md, In HA mode.
 
 ## Wire networking-mlnx to AFM
 
@@ -144,10 +147,14 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    HA mode also needs the watchdog's tmpfs and the host's processes:
    `-v /run/alternative-fabric-manager:/run/alternative-fabric-manager`
    and `-v /proc:/host/proc:ro`.
-5. **On a new database, confirm the fabric**, or no job ever completes
-   ("No expected switches: confirm them with --confirm-fabric"). On a
-   deployment that names `m_key_per_port` with the keys off, this can arm
-   their turn-on: see Per-port M_Keys above first.
+5. **On a new database, wait for the expected switches**: the manager
+   records them once its checks have seen the same switches for
+   `[opensm] confirm_checks` checks in a row (a minute by default), and no
+   job completes until then ("No expected switches yet: recording them
+   once the fabric has been stable for N checks"). Confirming the fabric
+   is optional: it records them at once. On a deployment that names
+   `m_key_per_port` with the keys off, it also arms their turn-on: see
+   Per-port M_Keys above first.
    ```sh
    sudo docker exec alternative-fabric-manager alternative-fabric-manager \
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric

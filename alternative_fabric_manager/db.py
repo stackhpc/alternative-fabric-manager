@@ -198,19 +198,26 @@ class Applied(Base):
 
 
 class ExpectedSwitch(Base):
-    """A switch that a complete fabric has, as an operator confirmed"""
+    """A switch that a complete fabric has, as the manager recorded it once
+    the fabric was stable, or an operator confirmed (specs/zero-touch.md)"""
 
     __tablename__ = "expected_switches"
 
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
-    # Found by the prober for the first time by the last --confirm-fabric:
-    # not expected, trusted or routed through until a later run finds it
-    # again, since anything can answer as a switch. With a server default,
-    # so that a version without it can still add rows during a rolling
-    # upgrade.
+    # Written by the previous version, which didn't expect a switch the
+    # prober found for the first time until a later --confirm-fabric found
+    # it again. Kept for that version during a rolling upgrade; this one
+    # ignores it, and writes it false. With a server default, so that a
+    # version without it can still add rows.
     pending: orm.Mapped[bool] = orm.mapped_column(
         default=False, server_default=sa.false()
     )
+    # Its node GUID, from the prober's NodeInfo or ibswitches' own, kept
+    # beside the GUID it was recorded by, which is the switch's port 0 GUID
+    # with per-port M_Key rows: when the source of the list changes, each
+    # switch is translated by it, both ways. Nullable, so that the previous
+    # version, which doesn't write it, can share the database.
+    node_guid: orm.Mapped[str | None] = orm.mapped_column(sa.String(16), nullable=True)
 
 
 class Lease(Base):
@@ -393,6 +400,7 @@ _ADDED_COLUMNS = {
     },
     "expected_switches": {
         "pending": "BOOLEAN NOT NULL DEFAULT 0",
+        "node_guid": "VARCHAR(16)",
     },
 }
 

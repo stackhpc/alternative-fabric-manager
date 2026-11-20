@@ -50,6 +50,22 @@ RUNNING = "port_keys_running"
 # or adopted the target from ports that hold derived keys already (Restores):
 # until then, every start with the target on is held to it
 CONFIRMED = "port_keys_confirmed"
+# A turn-on whose start failed and was set back, as "<the base's
+# fingerprint>:<the configuration hash>", the hash an HMAC keyed by a secret
+# in the database: while it matches the running configuration and base,
+# nothing arms the turn-on again (specs/zero-touch.md). Never shown.
+FAILED_TURN_ON = "port_keys_failed_turn_on"
+# Why the manager's checks don't arm the turn-on, for --port-key-states:
+# empty when nothing blocks it, or it doesn't apply
+ARMING = "port_keys_arming"
+# When the manager last restarted OpenSM to apply the target, and when the
+# target last changed, as Unix times: the hourly cap, and the day after
+# which it applies whatever the jobs
+LAST_APPLY = "port_keys_last_apply"
+# How many starts in a row fell back to the target OpenSM last ran on,
+# because their verify failed
+FALLBACKS = "port_keys_fallbacks"
+TARGET_CHANGED = "port_keys_target_changed"
 
 # What a port holds: the stored m_key, its key derived from the base, or
 # neither as far as the manager knows
@@ -574,9 +590,17 @@ def keys_to_try(holds, target_on, infrastructure, nothing_derived, own_port=Fals
     "m_key"
 
     This is what keeps the old key from tenants (specs/secured-profile.md,
-    The prober):
-    - infrastructure, this host's own port or a switch's port 0, which no
-      tenant controls, gets both;
+    The prober, as specs/zero-touch.md changes it):
+    - this host's own port (own_port), which nothing else can answer as,
+      gets both, whatever its row says;
+    - a switch's port 0 (infrastructure) gets both too, except that with
+      the target on and anything able to hold a derived key, it gets m_key
+      only if its row says m_key. A row is a switch's because its NodeInfo
+      said so, which an adapter with custom firmware could say too, and
+      OpenSM itself would send such a row only its derived key, since only
+      a guid2mkey entry, which a row holding m_key alone gets, names the
+      stored M_Key. So the prober sends nothing OpenSM wouldn't, and an
+      unknown switch row gets its derived key alone, as a tenant's does;
     - otherwise the derived key, whenever the target is on or the row says
       derived;
     - m_key only if the row says m_key, or the target is off (every port is
@@ -584,22 +608,15 @@ def keys_to_try(holds, target_on, infrastructure, nothing_derived, own_port=Fals
       nothing_derived (nothing can hold a derived key yet).
     The key the row records goes first, so that a port on m_key during a
     slow transition isn't sent a wrong key at every check; an unknown row
-    tries its derived key first. So with the target on, a tenant's port
-    recorded derived or unknown is never sent m_key once anything can hold
-    a derived key.
-
-    A switch is trusted by the GUID on its route, which an adapter that got
-    OpenSM to record a link under a confirmed switch's GUID can claim. So
-    with the target on and anything able to hold a derived key, a switch
-    recorded derived isn't sent m_key either: the real one never needs it
-    then. Only this host's own port (own_port), which nothing else can
-    answer as, keeps both keys whatever its row says.
+    tries its derived key first. So with the target on, a port recorded
+    derived or unknown, other than this host's own, is never sent m_key
+    once anything can hold a derived key.
     """
     if holds not in HOLDS:
         raise ValueError(f"holds must be one of {', '.join(HOLDS)}")
     if infrastructure:
         allowed = {DERIVED, M_KEY}
-        if not own_port and target_on and not nothing_derived and holds == DERIVED:
+        if not own_port and target_on and not nothing_derived and holds != M_KEY:
             allowed = {DERIVED}
     else:
         allowed = set()
@@ -893,6 +910,49 @@ def save_confirmed(session, on):
     """Record whether a start with the target on has met the success rule,
     in the session's transaction"""
     _save_flag(session, CONFIRMED, on)
+
+
+def load_text(session, name):
+    """A state row's text, or None with no row"""
+    row = session.get(db.State, name)
+    return None if row is None else row.text
+
+
+def save_text(session, name, text):
+    """Record a state row's text, None deleting the row, in the session's
+    transaction"""
+    row = session.get(db.State, name)
+    if text is None:
+        if row is not None:
+            session.delete(row)
+        return
+    if row is None:
+        session.add(db.State(name=name, value=0, text=text))
+    else:
+        row.text = text
+
+
+def load_time(session, name):
+    """A Unix time a state row records, or None with no row"""
+    row = session.get(db.State, name)
+    return None if row is None else row.value
+
+
+def save_time(session, name, when):
+    """Record a Unix time, as whole seconds, in the session's transaction"""
+    row = session.get(db.State, name)
+    if row is None:
+        session.add(db.State(name=name, value=int(when)))
+    else:
+        row.value = int(when)
+
+
+def failure_record(base, config_hash):
+    """What a failed turn-on records: the base's fingerprint and the
+    configuration hash, never the base or the configuration"""
+    if not re.fullmatch(r"[0-9a-f]{64}", config_hash or ""):
+        raise ValueError("not a configuration hash")
+    return f"{fingerprint(base)}:{config_hash}"
 
 
 def load_fingerprint(session):

@@ -28,6 +28,7 @@ import datetime
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -62,6 +63,15 @@ BASE_KEPT = "m_key_base_kept"
 # records, which every such write raises to its own term first (see
 # specs/ha.md, The secured profile)
 LEADER_FENCE = "leader_fence"
+# Where the expected switches were recorded from: ibswitches, whose GUIDs
+# are node GUIDs, or the prober, whose are the switches' port 0 GUIDs (see
+# specs/zero-touch.md, Expected switches)
+EXPECTED_SOURCE = "expected_switches_source"
+IBSWITCHES = "ibswitches"
+PROBER = "prober"
+# The configuration hash's HMAC key, shared with HA mode's epochs (see
+# ha/lease.py, HASH_KEY)
+CONFIG_HASH_KEY = "config_hash_key"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
 # _needs_sync()'s reason for restoring the last swept file
@@ -183,6 +193,12 @@ class Manager:
         self.failed_applies = 0
         # Consecutive checks that found expected switches missing
         self.missing_checks = 0
+        # How many settled fabric checks in a row have seen each switch, by
+        # its GUID: kept in memory, and counted afresh at every start of
+        # OpenSM (_start_opensm), so that a switch is recorded as expected
+        # only once the fabric has been stable for [opensm] confirm_checks
+        # under the running OpenSM (specs/zero-touch.md)
+        self._seen_checks = {}
         # Whether the last fabric check saw another master, or OpenSM's own
         # not master: no sweep counts, nor is one made, until a check passes
         self._contested_fabric = False
@@ -205,6 +221,15 @@ class Manager:
         self.class_keys = class_keys.ClassKeys(self)
         # The SA request rate limit's drops, logged
         self.sa_rate = sa_rate.SARate(self)
+        # This configuration's hash, worked out once it's needed
+        self._config_hash = None
+        # In HA mode, why the leader should step down so that a takeover's
+        # start applies the per-port M_Key target, which the coordinator
+        # reads and clears (specs/zero-touch.md, Applying)
+        self.apply_requested = None
+        # In HA mode, the coordinator's: whether a freeze holds this
+        # leader, which keeps OpenSM where it is
+        self.leader_held = None
 
     # The leader fence
 
@@ -905,6 +930,53 @@ class Manager:
             row = session.get(db.State, BASE_KEPT)
             return bool(row is not None and row.value)
 
+    def config_hash(self):
+        """This configuration's hash, as HA mode's epochs use it: an HMAC
+        keyed by a secret in the database, generated once, so that a hash
+        that's recorded, as a failed per-port M_Key turn-on's is, doesn't let
+        anyone who sees it test guesses of a key set in [opensm_conf]. The
+        same in single node, so that a single-node database moved to HA mode
+        keeps its record's meaning."""
+        if self._config_hash is not None:
+            return self._config_hash
+        for attempt in range(2):
+            with self._lock, self.sessionmaker() as session:
+                row = session.get(db.Secret, CONFIG_HASH_KEY)
+                if row is None:
+                    row = db.Secret(name=CONFIG_HASH_KEY, value=secrets.token_hex(32))
+                    session.add(row)
+                    try:
+                        session.commit()
+                    except sa.exc.IntegrityError:
+                        # Another process stored one first: read it back.
+                        session.rollback()
+                        if attempt:
+                            raise
+                        continue
+                key = row.value
+            self._config_hash = config_mod.config_hash(self.config, key)
+            return self._config_hash
+
+    def may_apply(self):
+        """Whether OpenSM may be restarted to apply the per-port M_Key
+        target: not while a freeze holds this leader"""
+        return not (self.leader_held is not None and self.leader_held())
+
+    def request_apply(self, why):
+        """Restart OpenSM so that its start applies the per-port M_Key
+        target: in single node, stop it, and the applier's next iteration
+        starts it again, as after OpenSM stops; in HA mode, ask the
+        coordinator to step down and release the lease, so that a
+        takeover's start, possibly this node's own, applies it
+        (specs/zero-touch.md, Applying)"""
+        if self.config.ha:
+            self.apply_requested = why
+            return
+        LOG.warning("Restarting OpenSM: %s", why)
+        self.driver.stop()
+        self._written = None
+        self._wakeup.set()
+
     def _key(self, name):
         """The key OpenSM uses, if any: an override, or a hardened one"""
         if name in self.config.opensm_conf:
@@ -1016,6 +1088,8 @@ class Manager:
         self.unanswered_checks = 0
         self.failed_applies = 0
         self.missing_checks = 0
+        self._seen_checks = {}
+        self.apply_requested = None
         # A new leader inherits a contested check: its first sweep then
         # doesn't count until a check passes (see Job completion).
         with self._lock, self.sessionmaker() as session:
@@ -1098,6 +1172,7 @@ class Manager:
         would lock OpenSM out refuses the start with ReloadError.
         """
         self._allowed_list = None
+        self._seen_checks = {}
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
         self.class_keys.reset()
@@ -1568,7 +1643,10 @@ class Manager:
             # contested until a check passes.
             ok, detail = False, f"Can't query the fabric: {e}"
             self.unanswered_checks += 1
+            # Nor is it a check that saw the switches.
+            self._seen_checks = {}
         else:
+            self._keep_expected(fabric, outcome, sm_contested)
             self.unanswered_checks = 0
             ok, detail = self._judge(fabric)
             if ok and outcome and outcome.problems:
@@ -1603,6 +1681,13 @@ class Manager:
             applied.check_time = _now()
             applied.contested = self._contested_fabric
             session.commit()
+        if ok:
+            # At a check that passes: arm the per-port M_Key turn-on, and
+            # apply the target (specs/zero-touch.md)
+            try:
+                self.port_keeper.after_check()
+            except (ReloadError, port_keeper.PortKeysError) as e:
+                LOG.error("Can't arm or apply per-port M_Keys: %s", e)
         return ok
 
     def _log_findings(self):
@@ -1629,14 +1714,10 @@ class Manager:
         if fabric is None:
             return True, "No fabric to check"
         with self._lock, self.sessionmaker() as session:
-            # A pending switch isn't expected until it's confirmed again.
+            # pending, which an older version wrote, is ignored: nothing is
+            # pending any more (specs/zero-touch.md).
             expected = {
-                int(s.guid, 16)
-                for s in session.scalars(
-                    sa.select(db.ExpectedSwitch).where(
-                        db.ExpectedSwitch.pending.is_(False)
-                    )
-                )
+                int(s.guid, 16) for s in session.scalars(sa.select(db.ExpectedSwitch))
             }
             # HA: the other nodes' ports, whose SMs may hold the keys
             managed = {}
@@ -1673,7 +1754,10 @@ class Manager:
         missing = expected - fabric.switches
         self.missing_checks = self.missing_checks + 1 if missing else 0
         if not expected:
-            return False, "No expected switches: confirm them with --confirm-fabric"
+            return False, (
+                "No expected switches yet: recording them once the fabric has "
+                f"been stable for {self.config.confirm_checks} checks"
+            )
         if missing:
             return False, "Missing switches: " + ", ".join(
                 f"0x{guid:016x}" for guid in sorted(missing)
@@ -1683,6 +1767,148 @@ class Manager:
                 f"0x{guid:016x}" for guid in masters
             )
         return True, "The fabric is complete"
+
+    # The expected switches (specs/zero-touch.md)
+
+    @staticmethod
+    def _master(fabric):
+        """Whether OpenSM's own SM is master, as the SA says"""
+        return 3 in [state for guid, state in fabric.sms if guid in fabric.own_guids]
+
+    def _keep_expected(self, fabric, outcome, sm_contested):
+        """Count the checks in a row that have seen each switch, and keep the
+        expected switches from them: record the list once the fabric is
+        stable, add a switch once it is, translate the list when its source
+        changes, and drop a missing switch the prober shows gone
+
+        Nothing changes, and the counts start again, while the check was
+        contested or OpenSM isn't master: another SM may have changed what
+        the fabric looks like. A check that couldn't query the fabric never
+        gets here. In HA mode these are leader writes, behind the leader
+        fence.
+        """
+        if fabric is None:
+            return
+        if self._contested(fabric) or sm_contested or not self._master(fabric):
+            self._seen_checks = {}
+            return
+        if outcome is not None and not outcome.complete:
+            # A verify that ran out of time is a failed query: part of the
+            # switches would look like all of them, and one it didn't reach
+            # like one that's gone.
+            self._seen_checks = {}
+            return
+        found = set(fabric.switches)
+        if outcome is not None:
+            source, nodes = PROBER, dict(outcome.nodes)
+        else:
+            # ibswitches gives node GUIDs.
+            source, nodes = IBSWITCHES, {guid: guid for guid in found}
+        self._seen_checks = {guid: self._seen_checks.get(guid, 0) + 1 for guid in found}
+        stable = {
+            guid
+            for guid, count in self._seen_checks.items()
+            if count >= self.config.confirm_checks
+        }
+        with self.fenced_session() as session:
+            rows = {
+                int(row.guid, 16): (
+                    None if row.node_guid is None else int(row.node_guid, 16)
+                )
+                for row in session.scalars(sa.select(db.ExpectedSwitch))
+            }
+            # Locked, so that a --confirm-fabric beside it waits for this
+            # transaction rather than interleaving with it
+            state = session.get(db.State, EXPECTED_SOURCE, with_for_update=True)
+            recorded_source = state.text if state is not None else None
+            expected = dict(rows)
+            if expected and recorded_source != source:
+                expected = self._translate(expected, recorded_source, source, nodes)
+            # Fill in a node GUID the row lacks, as one recorded before they
+            # were kept, so that a later change of source can translate it
+            for guid in expected:
+                if expected[guid] is None and nodes.get(guid) is not None:
+                    expected[guid] = nodes[guid]
+            if not expected:
+                if found and stable == found:
+                    expected = {guid: nodes.get(guid) for guid in found}
+                    LOG.warning(
+                        "Recorded the expected switches, seen by %d checks in a "
+                        "row: %s",
+                        self.config.confirm_checks,
+                        ", ".join(f"0x{guid:016x}" for guid in sorted(found)),
+                    )
+            else:
+                for guid in sorted(stable - set(expected)):
+                    expected[guid] = nodes.get(guid)
+                    LOG.warning(
+                        "Switch 0x%016x, seen by %d checks in a row, is now expected",
+                        guid,
+                        self.config.confirm_checks,
+                    )
+                if source == PROBER:
+                    links = port_keeper.port_keys.load(session)[1]
+                    for guid in sorted(set(expected) - found):
+                        if self.port_keeper.switch_gone(guid, links, outcome.verify):
+                            del expected[guid]
+                            LOG.warning(
+                                "Expected switch 0x%016x is missing, and the "
+                                "prober shows every recorded link to it down: "
+                                "it's no longer expected",
+                                guid,
+                            )
+            if expected != rows:
+                session.execute(sa.delete(db.ExpectedSwitch))
+                for guid, node in sorted(expected.items()):
+                    session.add(
+                        db.ExpectedSwitch(
+                            guid=f"{guid:016x}",
+                            pending=False,
+                            node_guid=None if node is None else f"{node:016x}",
+                        )
+                    )
+            if expected and recorded_source != source:
+                if state is None:
+                    session.add(db.State(name=EXPECTED_SOURCE, value=0, text=source))
+                else:
+                    state.text = source
+            session.commit()
+
+    @staticmethod
+    def _translate(expected, recorded_source, source, nodes):
+        """The expected switches, recorded from another source, in this
+        check's terms, by each one's node GUID: a switch the new source can't
+        match stays as it is, expected, and fails the check as missing, so
+        that a switch already missing isn't dropped by the change"""
+        by_node = {node: guid for guid, node in nodes.items() if node is not None}
+        translated = {}
+        unmatched = []
+        for guid, node in expected.items():
+            if node is None and recorded_source != PROBER:
+                # Recorded by ibswitches, or before the source was kept:
+                # its GUID may be the node GUID.
+                node = guid
+            new = by_node.get(node) if node is not None else None
+            if new is None and guid in nodes:
+                new = guid
+            if new is None:
+                translated.setdefault(guid, expected[guid])
+                unmatched.append(guid)
+            else:
+                translated[new] = nodes.get(new, node)
+        LOG.warning(
+            "The expected switches were recorded from %s, and the check now "
+            "finds them with %s: translated them by their node GUIDs%s",
+            recorded_source or "an older version",
+            source,
+            (
+                "; these stay as recorded, expected: "
+                + ", ".join(f"0x{guid:016x}" for guid in sorted(unmatched))
+            )
+            if unmatched
+            else "",
+        )
+        return translated
 
     def confirm_fabric(self):
         """Record the switches OpenSM sees as the fabric's expected ones,
@@ -1694,28 +1920,33 @@ class Manager:
         # A cache that can't be read stops only the turn-on, not the
         # switches' confirmation.
         fold_problem = keeper.fold_running()
-        # The prober follows any row that answers as a switch, which an
-        # adapter can: one it finds that wasn't confirmed or pending before
-        # is recorded as pending, which nothing trusts, for the operator to
-        # check, and is confirmed only when a later run finds it again.
-        # ibswitches' switches are confirmed at once, as they always were.
-        prober = keeper.uses_prober()
-        known = keeper.recorded_switches() if prober else set()
+        # No switch is pending: whatever answers as one is recorded, since
+        # the list is only what a complete fabric has (specs/zero-touch.md).
         confirmation = port_keeper.Confirmation()
-        fabric = self._fabric(keeper.switches())
+        probed = keeper.switches()
+        fabric = self._fabric(None if probed is None else set(probed))
         if fabric is None:
             return confirmation
         found = sorted(fabric.switches)
-        pending = [guid for guid in found if guid not in known] if prober else []
+        source = IBSWITCHES if probed is None else PROBER
         with self._lock, self.sessionmaker() as session:
             session.execute(sa.delete(db.ExpectedSwitch))
             for guid in found:
+                node = guid if probed is None else probed.get(guid)
                 session.add(
-                    db.ExpectedSwitch(guid=f"{guid:016x}", pending=guid in pending)
+                    db.ExpectedSwitch(
+                        guid=f"{guid:016x}",
+                        pending=False,
+                        node_guid=None if node is None else f"{node:016x}",
+                    )
                 )
+            state = session.get(db.State, EXPECTED_SOURCE)
+            if state is None:
+                session.add(db.State(name=EXPECTED_SOURCE, value=0, text=source))
+            else:
+                state.text = source
             session.commit()
         confirmation.switches = found
-        confirmation.pending = pending
         if confirmation.switches:
             keeper.arm(confirmation, fold_problem)
         return confirmation

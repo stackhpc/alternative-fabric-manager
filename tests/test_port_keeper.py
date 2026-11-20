@@ -25,6 +25,7 @@ from alternative_fabric_manager import (
 )
 from alternative_fabric_manager import manager as manager_mod
 from alternative_fabric_manager.drivers import Fabric, ReloadError, SweepReport
+from alternative_fabric_manager.ha import lease as lease_mod
 from alternative_fabric_manager.port_keys import DERIVED, M_KEY, UNKNOWN
 from tests import conftest
 from tests.fabric_sim import BASE, OWN, S1, S2, M, Sim
@@ -33,13 +34,17 @@ TN = conftest.GUID  # a bare metal tenant's port, a Neutron port's GUID
 HV = 0xC1  # a hypervisor's port: no Neutron port has its GUID
 T3 = 0xB3  # another host's port, behind S2
 T4 = 0xB4  # behind a link that goes down
-X = 0xD1  # an adapter that answers as a switch, never confirmed
+X = 0xD1  # an adapter that answers as a switch
 Z = 0xE1  # a port OpenSM hasn't recorded
 VF = 0x12345600007821B7  # a virtual function's GUID: never a row
 NETWORK = conftest.NETWORK_ID
 OTHER_NETWORK = "d13bba05-eb07-45ba-ace2-765706b2d701"
 VF_PORT = "f13bba05-eb07-45ba-ace2-765706b2d701"
 STRANGER = 0x3333333333333333
+# The manager's own arming and applying (specs/zero-touch.md), which the
+# scenarios here leave out, so that they drive the turn-on by hand;
+# tests/test_zero_touch.py puts it back
+AFTER_CHECK = port_keeper.PortKeeper.after_check
 
 
 def derived(guid):
@@ -292,6 +297,7 @@ def world(config, monkeypatch, caplog):
     monkeypatch.setattr(port_keeper, "CONFIRM_POLL", 0.01)
     # The applier's loop isn't run: the tests drive reconcile themselves.
     monkeypatch.setattr(manager_mod.Manager, "_run", lambda self: None)
+    monkeypatch.setattr(port_keeper.PortKeeper, "after_check", lambda self: None)
     config.driver = "managed"
     config.hardening = "all, m_key_per_port"
     config.start_timeout = 1.0
@@ -332,37 +338,31 @@ def arm(world):
         session.commit()
 
 
-def promote(world):
-    """Confirm the pending switches, as a second --confirm-fabric would,
-    without arming the turn-on"""
+def expect(world, *switches):
+    """Record the expected switches, as a --confirm-fabric would, without
+    arming the turn-on"""
     with world.sessionmaker() as session:
-        session.execute(sa.update(db.ExpectedSwitch).values(pending=False))
+        session.execute(sa.delete(db.ExpectedSwitch))
+        for guid in switches:
+            session.add(db.ExpectedSwitch(guid=port_keys.guid_text(guid)))
         session.commit()
 
 
-def expected(world, pending=False):
+def expected(world):
     with world.sessionmaker() as session:
         return {
-            int(row.guid, 16)
-            for row in session.scalars(
-                sa.select(db.ExpectedSwitch).where(
-                    db.ExpectedSwitch.pending.is_(pending)
-                )
-            )
+            int(row.guid, 16) for row in session.scalars(sa.select(db.ExpectedSwitch))
         }
 
 
 def running_with_rows(world):
     """The group named, OpenSM started, its cache folded at a check, and the
-    switches confirmed: the first confirmation, which leaves every switch
-    pending and so doesn't arm the turn-on, then the switches promoted"""
+    switches the prober finds recorded as expected, with the target off"""
     world.manager.start()
     world.manager.reconcile()
-    first = confirm(world)
-    assert first.switches == [S1, S2] and first.pending == [S1, S2]
-    assert not first.armed and world.state()["target"] is False
-    promote(world)
+    expect(world, S1, S2)
     world.manager.reconcile()
+    assert world.state()["target"] is False
     return world
 
 
@@ -393,8 +393,7 @@ def test_inert_without_the_group_or_rows(world):
     job = world.manager.put_port(conftest.PORT_ID, conftest.port())
     world.manager.reconcile()
     confirmation = confirm(world)
-    assert confirmation.pending == [] and confirmation.note is None
-    assert not confirmation.problems
+    assert confirmation.note is None and not confirmation.problems
     world.manager.reconcile()
     assert world.manager.get_job(job).status == db.JobStatus.COMPLETED
     # Nothing read, written or probed; OpenSM started as before
@@ -406,7 +405,10 @@ def test_inert_without_the_group_or_rows(world):
     # opensm.conf is byte-identical to the render before per-port keys
     keys = world.manager.keys()
     expected = opensm_conf.render(
-        {}, hardening=world.config.hardening_groups, keys=keys
+        {},
+        hardening=world.config.hardening_groups,
+        keys=keys,
+        key_lease_period=world.config.key_lease_period,
     )
     with open(world.config.opensm_conf_file) as f:
         assert f.read() == expected
@@ -450,6 +452,13 @@ def test_a_takeover_renders_the_cache_from_the_rows_not_the_volume(world):
 def test_a_turn_on_in_ha_mode(world):
     running_with_rows(world)
     world.config.ha = True
+    # Only under an epoch that allows exactly this configuration
+    confirmation = confirm(world)
+    assert not confirmation.armed
+    assert any("configuration epoch" in p for p in confirmation.problems)
+    with world.sessionmaker() as session:
+        lease_mod._store_epoch(session, 1, [world.manager.config_hash()])
+        session.commit()
     assert confirm(world).armed
     _take_over(world, 2)
     world.manager.reconcile()
@@ -490,6 +499,23 @@ def test_the_reach_probe_finds_the_switches_and_writes_nothing(world):
     assert candidate.port_keeper.reach_switches(5) == {S1, S2}
     assert world.rows() == before
     assert world.driver.probes[-1] is True
+
+
+def test_the_reach_probe_counts_only_expected_switches(world):
+    running_with_rows(world)
+    # Something new that answers as a switch, which a check has recorded
+    world.sim.add(X, switch=True, ports=2, key=M)
+    world.sim.cable(S1, 7, X, 1)
+    world.driver.sweep()
+    world.check()
+    world.config.ha = True
+    candidate = world.new_manager()
+    # Followed, but a candidate never reaches more for it
+    assert candidate.port_keeper.reach_switches(5) == {S1, S2}
+    # Until any switch is expected, every switch counts, or no candidate
+    # would be eligible on a new deployment.
+    expect(world)
+    assert candidate.port_keeper.reach_switches(5) == {S1, S2, X}
 
 
 def test_rows_with_another_driver_alarm_and_stay_inert(world, caplog):
@@ -623,10 +649,14 @@ def test_confirm_fabric_doesnt_arm_when_the_verify_runs_out_of_time(world, monke
     keeper = world.keeper()
     real = keeper._verify
 
-    def verify(*args, follow_unconfirmed=False, **kwargs):
-        if not follow_unconfirmed:
+    calls = []
+
+    def verify(*args, **kwargs):
+        # The discovery of the switches first, then the arming's verify
+        calls.append(None)
+        if len(calls) > 1:
             kwargs["bound"] = 1e-9
-        return real(*args, follow_unconfirmed=follow_unconfirmed, **kwargs)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(keeper, "_verify", verify)
     _refused(world, "ran out of time")
@@ -738,16 +768,18 @@ def test_a_part_way_turn_on_is_retried_on_the_target(world, caplog):
     world.driver.after_sweep = mend
     world.manager.stop()
     world.new_manager()
-    # The start fails, with OpenSM stopped and the target kept on.
+    # The start fails part-way: OpenSM is left running on the target, which
+    # it hasn't met the success rule on yet (specs/zero-touch.md).
     world.manager.start()
-    assert not world.driver.is_running
+    assert world.driver.is_running and world.driver.per_port()
     assert any("part-way" in r.getMessage() for r in caplog.records)
     state = world.state()
     assert state["target"] and state["running"] and not state["confirmed"]
     assert world.rows()[TN].holds == DERIVED and world.rows()[S2].holds == M_KEY
-    # The applier's check starts it again, on the target, until it succeeds.
+    # The retry, which the hourly apply makes, starts it on the target held
+    # to the success rule, until it succeeds.
     world.driver.on_start = world.driver.after_sweep = None
-    world.manager.reconcile()
+    world.driver.stop()
     world.manager._check_opensm()
     assert world.driver.is_running and world.driver.per_port()
     assert world.state()["confirmed"]
@@ -1103,17 +1135,17 @@ def test_a_prober_failure_is_a_failed_query(world):
     assert "prober" in world.applied().check_detail
 
 
-def test_a_second_confirmation_promotes_the_pending_switches(world):
+def test_a_first_confirmation_records_the_switches_and_arms_at_once(world):
+    # No second run: nothing is pending (specs/zero-touch.md).
     world.manager.start()
     world.manager.reconcile()
-    first = confirm(world)
-    assert first.pending == [S1, S2] and not first.armed
-    # Pending switches aren't expected, so the check can't pass yet.
-    assert expected(world) == set() and expected(world, pending=True) == {S1, S2}
-    second = confirm(world)
-    assert second.switches == [S1, S2] and second.pending == []
-    assert expected(world) == {S1, S2} and expected(world, pending=True) == set()
-    assert second.armed
+    confirmation = confirm(world)
+    assert confirmation.switches == [S1, S2] and confirmation.armed
+    assert expected(world) == {S1, S2}
+    with world.sessionmaker() as session:
+        assert not any(
+            row.pending for row in session.scalars(sa.select(db.ExpectedSwitch))
+        )
 
 
 def test_confirm_fabric_uses_the_prober_while_rows_exist(world):
@@ -1122,10 +1154,10 @@ def test_confirm_fabric_uses_the_prober_while_rows_exist(world):
     assert world.driver.fabric_calls[-1][2] == {S1, S2}
 
 
-def test_an_unconfirmed_switch_isnt_given_both_keys(world):
+def test_an_adapter_answering_as_a_switch_isnt_sent_m_key_once_keyed(world):
     running_with_rows(world)
     # An adapter that answers NodeInfo as a switch, after the switches were
-    # confirmed
+    # recorded
     world.sim.add(X, switch=True, key=M)
     world.sim.cable(S1, 7, X, 1)
     world.driver.sweep()
@@ -1485,13 +1517,13 @@ def test_keeper_bounds_the_start_verify(world, monkeypatch):
     assert bounds == [(prober.FULL, True, world.config.start_timeout / 2)]
 
 
-# Trust is by a switch row's own GUID
+# Anything that answers as a switch is followed, and sent what OpenSM sends
 
 
-def test_a_tenant_claiming_a_confirmed_switchs_guid_is_never_sent_m_key(world):
+def test_a_tenant_claiming_an_expected_switchs_guid_is_never_sent_m_key(world):
     running_with_rows(world)
-    # An adapter that answers NodeInfo as a switch, with S1's GUID, a
-    # confirmed switch's, as its node GUID
+    # An adapter that answers NodeInfo as a switch, with S1's GUID, an
+    # expected switch's, as its node GUID
     world.sim.add(X, switch=True, key=M, node_guid=S1)
     world.sim.cable(S1, 7, X, 1)
     world.driver.sweep()
@@ -1516,46 +1548,45 @@ def test_a_tenant_claiming_a_confirmed_switchs_guid_is_never_sent_m_key(world):
     assert world.driver.fabric_calls[-1][2] == {S1, S2}
 
 
-def test_a_first_confirmation_on_a_fresh_fabric_doesnt_arm(world):
+def test_a_first_confirmation_on_a_fresh_fabric_arms(world):
     # OpenSM is running; no check has folded its cache yet.
     world.manager.start()
     confirmation = confirm(world)
     # The links the running OpenSM's cache lists are recorded,
     with world.sessionmaker() as session:
         assert (S1, 2) in port_keys.load(session)[1]
-    # the switches are pending, and that's why it isn't armed.
-    assert confirmation.switches == [S1, S2] and confirmation.pending == [S1, S2]
-    assert expected(world, pending=True) == {S1, S2} and expected(world) == set()
-    assert any("pending" in problem for problem in confirmation.problems)
-    assert world.state()["target"] is False
-    world.manager.reconcile()
-    assert world.applied().check_detail.startswith("No expected switches")
-    # Run again, once the list is checked: promoted, and armed
-    confirmation = confirm(world)
-    assert confirmation.pending == [] and confirmation.armed
+    # and the switches the prober finds, behind every level, are expected.
+    assert confirmation.switches == [S1, S2] and confirmation.armed
     assert expected(world) == {S1, S2}
+    assert world.state()["target"] is True
     world.manager.reconcile()
     assert world.applied().check_ok, world.applied().check_detail
 
 
-def test_confirm_fabric_follows_unconfirmed_switches(world):
+def test_checks_follow_a_new_switch_and_count_only_expected_ones(world):
     running_with_rows(world)
-    # A new switch, behind S2, that no one has confirmed yet
+    # A new switch, behind S2, that isn't expected yet
     world.sim.add(0x53, switch=True, ports=2, key=M)
     world.sim.cable(S2, 3, 0x53, 1)
+    world.sim.add(Z, key=M)
+    world.sim.cable(0x53, 2, Z, 1)
     world.driver.sweep()
     world.check()
-    assert 0x53 not in world.driver.fabric_calls[-1][2]
-    confirmation = confirm(world)
-    assert confirmation.switches == [S1, S2, 0x53] and confirmation.pending == [0x53]
-    # Pending: not routed through or counted, and not expected
+    # Followed, and the port behind it reached, once a check has found it
+    # to be a switch
     world.check()
-    assert world.driver.fabric_calls[-1][2] == {S1, S2}
+    assert 0x53 in world.driver.fabric_calls[-1][2]
+    assert world.rows()[Z].reachable
+    # The check counts the expected switches it found: it passes.
     assert world.applied().check_ok, world.applied().check_detail
-    # Found again by a later run: confirmed
-    assert confirm(world).pending == []
-    world.check()
-    assert world.driver.fabric_calls[-1][2] == {S1, S2, 0x53}
+    assert expected(world) == {S1, S2}
+    # A new switch never makes a fragment look complete.
+    world.sim.down |= {(S1, 2), (S2, 1)}
+    assert not world.check()
+    assert f"0x{S2:016x}" in world.applied().check_detail
+    world.sim.down -= {(S1, 2), (S2, 1)}
+    assert confirm(world).switches == [S1, S2, 0x53]
+    assert expected(world) == {S1, S2, 0x53}
 
 
 # A re-cabled port
@@ -1607,9 +1638,11 @@ def test_a_turn_on_start_that_fails_after_keying_is_part_way(world, caplog):
     world.driver.start_error = ReloadError("OpenSM didn't start within 1 seconds")
     world.manager.stop()
     world.new_manager().start()
-    assert not world.driver.is_running
+    # Left running on the target, without the success rule
+    assert world.driver.is_running and world.driver.per_port()
     assert any("part-way" in r.getMessage() for r in caplog.records)
-    assert world.state()["target"] is True
+    assert world.state()["target"] is True and not world.state()["confirmed"]
+    world.driver.stop()
     world.manager._check_opensm()
     assert world.driver.is_running and world.state()["confirmed"]
 
@@ -1659,7 +1692,7 @@ def test_a_set_back_needs_no_row_holding_a_derived_key(world, caplog):
     world.driver.after_sweep = None
     world.driver.stall = True
     world.new_manager().start()
-    assert not world.driver.is_running
+    assert world.driver.is_running and world.driver.per_port()
     assert world.state()["target"] is True
     assert any("part-way" in r.getMessage() for r in caplog.records)
 
@@ -1775,33 +1808,34 @@ def _cli_confirm(world, monkeypatch, capsys):
     return capsys.readouterr().out.splitlines()
 
 
-def test_confirm_fabric_marks_switches_not_confirmed_before(world, monkeypatch, capsys):
+def test_confirm_fabric_prints_the_switches_and_arms(world, monkeypatch, capsys):
     running_with_rows(world)
     world.sim.add(0x53, switch=True, ports=2, key=M)
     world.sim.cable(S2, 3, 0x53, 1)
     world.driver.sweep()
     world.check()
-    with pytest.raises(SystemExit) as raised:
-        _cli_confirm(world, monkeypatch, capsys)
-    lines = capsys.readouterr().out.splitlines()
-    # The switches are printed, and recorded, before it exits non-zero.
-    assert lines[:3] == [
-        f"0x{S1:016x}",
-        f"0x{S2:016x}",
-        "0x0000000000000053 (new: not trusted until you confirm the fabric "
-        "again; check that it's a switch)",
-    ]
-    assert lines[3].startswith("1 switches are new, and pending")
-    message = str(raised.value.code)
-    assert message.startswith("alternative-fabric-manager: ")
-    assert "pending" in message and "0x0000000000000053" in message
-    assert world.state()["target"] is False
-    # Nothing new: the switches, one per line, and that it's armed
+    # The switches, one per line, new ones too, and that it's armed
     assert _cli_confirm(world, monkeypatch, capsys) == [
         *(f"0x{guid:016x}" for guid in (S1, S2, 0x53)),
-        "Per-port M_Keys are armed: the next restart of the manager turns them on",
+        "Per-port M_Keys are armed: the running manager restarts OpenSM to "
+        "turn them on at its next passing check with no open job, or its next "
+        "restart does",
     ]
     assert world.state()["target"] is True
+
+
+def test_confirm_fabric_exits_non_zero_when_it_doesnt_arm(world, monkeypatch, capsys):
+    running_with_rows(world)
+    world.sim.ports[HV].key = derived(HV)
+    with pytest.raises(SystemExit) as raised:
+        _cli_confirm(world, monkeypatch, capsys)
+    # The switches are printed, and recorded, before it exits non-zero.
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [f"0x{S1:016x}", f"0x{S2:016x}"]
+    message = str(raised.value.code)
+    assert message.startswith("alternative-fabric-manager: ")
+    assert f"0x{HV:016x}" in message
+    assert world.state()["target"] is False
 
 
 def test_confirm_fabric_with_ibswitches_prints_guids_only(world, monkeypatch, capsys):
@@ -1833,9 +1867,6 @@ def test_confirm_fabric_with_another_driver_confirms_as_before(
 def test_a_turn_on_driven_by_confirm_fabric_alone(world, monkeypatch, capsys):
     world.manager.start()
     world.manager.reconcile()
-    with pytest.raises(SystemExit, match="pending"):
-        _cli_confirm(world, monkeypatch, capsys)
-    capsys.readouterr()
     assert _cli_confirm(world, monkeypatch, capsys)[-1].startswith(
         "Per-port M_Keys are armed"
     )
@@ -1848,44 +1879,35 @@ def test_a_turn_on_driven_by_confirm_fabric_alone(world, monkeypatch, capsys):
     assert not tenants_given_m_key(world.sim, history, {TN, HV, T3, T4})
 
 
-# Pending switches
+# New switches, and adapters that answer as one
 
 
-def test_an_adapter_answering_as_a_switch_stays_pending_and_untrusted(
-    world, monkeypatch, capsys
-):
+def test_an_adapter_answering_as_a_switch_is_sent_only_what_opensm_sends(world):
     turned_on(world)
-    # A tenant adapter answers NodeInfo as a switch, with a confirmed
-    # switch's node GUID, behind which another port appears.
-    # Unprotected as it comes, so OpenSM reaches it, and keys it.
+    # A tenant adapter answers NodeInfo as a switch, with an expected
+    # switch's node GUID, behind which another port appears. Unprotected as
+    # it comes, so OpenSM reaches it, and keys it.
     world.sim.add(X, switch=True, key=0, protect=0, node_guid=S1, ports=2)
     world.sim.cable(S1, 7, X, 1)
     world.sim.add(Z, key=0, protect=0)
     world.sim.cable(X, 2, Z, 1)
     world.driver.sweep()
     assert world.sim.ports[X].key == derived(X)
-    world.check()
-    # The operator confirms the fabric, as after adding a real switch: with
-    # the target on, it only confirms.
-    lines = _cli_confirm(world, monkeypatch, capsys)
-    assert f"0x{X:016x} (new: not trusted" in lines[2]
-    assert expected(world) == {S1, S2} and expected(world, pending=True) == {X}
     history = len(world.sim.history)
     for _ in range(3):
         world.check()
         world.check(due=False)
-        assert world.driver.fabric_calls[-1][2] == {S1, S2}
+    # Followed, as OpenSM follows it, and sent only the derived keys OpenSM
+    # gave it and the port behind it: never the stored M_Key
     sent = [(guid, key) for _, guid, key, _ in world.sim.history[history:]]
-    assert (X, M) not in sent
-    assert not [guid for guid, _ in sent if guid == Z]  # never routed through
-    # A second confirmation is the operator's decision to trust it.
-    confirm(world)
-    assert X in expected(world)
-    world.check()
-    assert world.driver.fabric_calls[-1][2] == {S1, S2, X}
+    assert (X, M) not in sent and (Z, M) not in sent
+    assert (Z, derived(Z)) in sent
+    # It isn't expected, so the check counts S1 and S2 as before.
+    assert expected(world) == {S1, S2}
+    assert world.applied().check_ok, world.applied().check_detail
 
 
-def test_a_new_real_switch_is_pending_then_confirmed(world):
+def test_a_new_real_switch_is_followed_at_once(world):
     turned_on(world)
     # As they come, unprotected: OpenSM reaches them, and keys them.
     world.sim.add(0x53, switch=True, ports=2, key=0, protect=0)
@@ -1894,36 +1916,17 @@ def test_a_new_real_switch_is_pending_then_confirmed(world):
     world.sim.cable(0x53, 2, Z, 1)
     world.driver.sweep()
     assert world.sim.ports[Z].key == derived(Z)
+    # The first check learns that it's a switch; the next reaches behind it.
     world.check()
-    assert confirm(world).pending == [0x53]
-    # The fabric check still passes on the confirmed switches; the port
-    # behind the pending one isn't reached, so the lost-port rule holds the
-    # fabric, as for any port not reached.
-    assert not world.check()
-    assert f"0x{Z:016x}" in world.applied().check_detail
-    assert "Missing" not in world.applied().check_detail
-    assert confirm(world).pending == []
     assert world.check(), world.applied().check_detail
+    assert world.rows()[Z].holds == DERIVED
 
 
-def test_a_pending_switch_not_found_again_is_dropped(world):
-    running_with_rows(world)
-    world.sim.add(0x53, switch=True, ports=2, key=M)
-    world.sim.cable(S2, 3, 0x53, 1)
-    world.driver.sweep()
-    world.check()
-    assert confirm(world).pending == [0x53]
-    world.sim.down |= {(S2, 3), (0x53, 1)}
-    confirmation = confirm(world)
-    assert confirmation.switches == [S1, S2] and confirmation.pending == []
-    assert expected(world) == {S1, S2} and expected(world, pending=True) == set()
-
-
-def test_ibswitches_confirms_nothing_as_pending(world):
+def test_ibswitches_records_every_switch(world):
     world.config.hardening = "all"
     world.manager.start()
     confirmation = confirm(world)
-    assert confirmation.pending == []
+    assert confirmation.switches == [S1 + 0x1000, S2 + 0x1000]
     assert expected(world) == {S1 + 0x1000, S2 + 0x1000}
 
 
@@ -1932,10 +1935,9 @@ def test_a_discovery_cut_short_confirms_nothing(world, monkeypatch, capsys):
     keeper = world.keeper()
     real = keeper._verify
 
-    def verify(*args, follow_unconfirmed=False, **kwargs):
-        if follow_unconfirmed:
-            kwargs["bound"] = 1e-9
-        return real(*args, follow_unconfirmed=follow_unconfirmed, **kwargs)
+    def verify(*args, **kwargs):
+        kwargs["bound"] = 1e-9
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(keeper, "_verify", verify)
     with pytest.raises(ReloadError, match="ran out of time"):

@@ -277,6 +277,56 @@ def test_a_server_database_at_0004_gains_the_known_sm_ports():
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")
 
 
+def test_an_old_expected_switches_table_gains_its_node_guid_column(tmp_path):
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE expected_switches (
+            guid VARCHAR(16) NOT NULL PRIMARY KEY,
+            pending BOOLEAN NOT NULL DEFAULT 0
+        );
+        INSERT INTO expected_switches VALUES ('0000000000000051', 0);
+        """
+    )
+    connection.commit()
+    connection.close()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000051").node_guid is None
+        session.add(db.ExpectedSwitch(guid="0000000000000052", node_guid="1" * 16))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000052").node_guid == "1" * 16
+
+
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0006_gains_the_node_guid_column():
+    # 0007 adds expected_switches.node_guid, and runs again if it stopped
+    # midway.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0006")
+    db.upgrade(rendered)
+    command.stamp(alembic, "0006")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        session.add(db.ExpectedSwitch(guid="0" * 16, node_guid="1" * 16))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0" * 16).node_guid == "1" * 16
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
 def test_known_sm_ports_round_trip(config):
     sessionmaker = db.make_sessionmaker(config.database_url)
     with sessionmaker() as session:
