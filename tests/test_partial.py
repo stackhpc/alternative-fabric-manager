@@ -1114,6 +1114,80 @@ def test_only_missing_expected_or_down_switches_excuse_a_port(world):  # noqa: F
     assert not excused(0xB4, unknown, {S1, S2})
 
 
+# Round 4: the counts start again with OpenSM, the prober's excuse needs a
+# missing switch, and learning is behind the leader fence
+
+
+def _conflict_on_own(manager, fabric):
+    """OWN learnt for hv1, then seen for hv2: learnt for no host"""
+    _learn_hv1(manager, fabric)
+    manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID, host="hv2"))
+    _settle(manager)
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+
+
+def test_a_new_opensm_counts_the_sightings_afresh(manager, fabric):
+    _conflict_on_own(manager, fabric)
+    # A new OpenSM, as when this node leads again: one stale reading after
+    # it mustn't relearn the port.
+    manager._start_opensm()
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+
+
+def test_a_check_between_that_doesnt_pass_counts_the_sightings_afresh(manager, fabric):
+    _conflict_on_own(manager, fabric)
+    fabric.switches = {LEAF_A}
+    assert not manager.check_fabric()
+    fabric.switches = {LEAF_A, LEAF_B}
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+    # Nor one that passes without a dump it could read
+    fabric.virtualization_dump = None
+    manager.check_fabric()
+    del fabric.virtualization_dump
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": ""}
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+
+
+def test_a_new_opensm_counts_the_missed_scans_afresh(manager, fabric):
+    _learn_hv1(manager, fabric)
+    del fabric.ports[OWN]
+    _passing_scan(manager)
+    _passing_scan(manager)
+    manager._start_opensm()
+    _passing_scan(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+
+
+def test_a_deposed_leader_learns_nothing(manager, fabric):
+    from alternative_fabric_manager import manager as manager_mod
+
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    _settled(manager, manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID)))
+    manager.reconcile()
+    # Term 4's leader has raised the fence; this one, of term 3, hasn't
+    # recorded a sweep since.
+    manager.config.ha = True
+    manager.term = 3
+    with manager.sessionmaker.begin() as session:
+        session.get(db.Applied, 1).term = 3
+        session.add(db.State(name=manager_mod.LEADER_FENCE, value=4, text="x"))
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    # The check's other fenced reads and writes would fail it first; the
+    # learning must be fenced on its own, whatever the check's path.
+    manager._keep_expected = lambda *args: None
+    manager.port_keeper.check = lambda: None
+    manager.check_fabric()
+    assert _host_ports(manager) == {}
+
+
 def test_a_port_behind_a_down_link_still_fails_a_whole_fabric(world):  # noqa: F811
     from tests.test_port_keeper import expect
 

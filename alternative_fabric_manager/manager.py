@@ -255,8 +255,9 @@ class Manager:
         self._scanned_once = False
         # How many passing scans in a row haven't found each learnt
         # physical port, and the host each was seen for at the last passing
-        # check, kept in memory: a takeover counts afresh, which only
-        # delays pruning and relearning
+        # check that read a dump, kept in memory and counted afresh at each
+        # start of OpenSM (_start_opensm), which only delays pruning and
+        # relearning
         self._unfound = {}
         self._sightings = {}
         # Why the last _judge failed only on missing switches, if it did
@@ -1301,9 +1302,12 @@ class Manager:
         """
         self._allowed_list = None
         self._seen_checks = {}
-        # A scan of an earlier OpenSM, or term, places nothing for this one.
+        # A scan of an earlier OpenSM, or term, places nothing for this one,
+        # and its counts of the hosts' physical ports start again.
         self._last_scan = None
         self._resweeps = set()
+        self._unfound = {}
+        self._sightings = {}
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
         self.class_keys.reset()
@@ -2153,16 +2157,17 @@ class Manager:
             applied.missing = self._missing_fabric
             if ok:
                 self._reset_held_if_fresh(session, applied)
-                if adapters is not None:
-                    self._keep_host_ports(
-                        session, applied, adapters, outcome is not None
-                    )
-                if dump:
-                    self._learn_host_ports(session, dump)
+                if adapters is not None and outcome is None:
+                    self._keep_adapter_links(applied, adapters)
             session.flush()
             if missing:
                 summary = self.missing_summary(session)
             session.commit()
+        if not (ok and dump):
+            # Relearning needs two passing checks in a row that read a dump.
+            self._sightings = {}
+        if ok and (adapters is not None or dump):
+            self._keep_host_ports(adapters, dump)
         if summary:
             # The alarm: what the missing switches hold
             LOG.error("%s", summary)
@@ -2388,18 +2393,35 @@ class Manager:
                 ", ".join(f"0x{pkey:04x}" for pkey in sorted(untainted)),
             )
 
-    def _keep_host_ports(self, session, applied, adapters, prober):
-        """At a passing check whose scan found the whole fabric's adapters:
-        add their links to those kept, where the check runs ibswitches, so
-        that an adapter whose link was down at this scan keeps its last
-        link until a scan finds it elsewhere; and drop a learnt physical
-        port once PRUNE_AFTER scans in a row haven't found it, so that one
-        scan made while its link flapped doesn't (specs/ha.md, Where a port
+    @staticmethod
+    def _keep_adapter_links(applied, adapters):
+        """Where the check runs ibswitches, at a passing check whose scan
+        found the whole fabric's adapters: add their links to those kept,
+        so that an adapter whose link was down at this scan keeps its last
+        link until a scan finds it elsewhere (specs/ha.md, Where a port
         is)"""
-        if not prober:
-            kept = json.loads(applied.adapter_links or "{}")
-            kept.update(adapters)
-            applied.adapter_links = json.dumps(kept, sort_keys=True)
+        kept = json.loads(applied.adapter_links or "{}")
+        kept.update(adapters)
+        applied.adapter_links = json.dumps(kept, sort_keys=True)
+
+    def _keep_host_ports(self, adapters, dump):
+        """At a passing check: prune and learn the hosts' physical ports, in
+        a leader write behind the leader fence, so that a deposed leader's
+        late check can't change them; one that can't write leaves them"""
+        try:
+            with self.fenced_session() as session:
+                if adapters is not None:
+                    self._prune_host_ports(session, adapters)
+                if dump:
+                    self._learn_host_ports(session, dump)
+                session.commit()
+        except StaleLeader as e:
+            LOG.error("Not learning the hosts' physical ports: %s", e)
+
+    def _prune_host_ports(self, session, adapters):
+        """Drop a learnt physical port once PRUNE_AFTER passing scans in a
+        row haven't found it, so that one scan made while its link flapped
+        doesn't (specs/ha.md, Where a port is)"""
         for row in list(session.scalars(sa.select(db.HostPort))):
             if row.guid in adapters:
                 self._unfound.pop(row.guid, None)
