@@ -102,9 +102,7 @@ how many checks in a row have seen each switch: `[opensm] confirm_checks`,
   change.
 - **A missing switch** fails the check, as today, though grants that
   don't depend on it still complete (specs/ha.md, While a switch is
-  missing).
-  With rows, it's dropped
-  once the prober shows every recorded link to it down, from the switch
+  missing). With rows, it's dropped once the prober shows every recorded link to it down, from the switch
   ports and adapters at its other ends: the same evidence of a link down
   that a job's port gives (Lost ports and jobs). That can happen for a
   spine; a leaf whose adapters are reached only through it never shows it
