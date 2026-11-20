@@ -23,11 +23,19 @@ class Container:
     def reload(self):
         pass
 
+    def start(self):
+        self.status = "running"
+
     def kill(self, **_kwargs):
         self.killed = True
 
-    def remove(self, force=False):
+    def remove(self, force=False, v=False):
         self.removed = True
+
+
+class Image:
+    # OpenSM's image declares these, as the real one does.
+    attrs = {"Config": {"Volumes": {"/var/cache/opensm/": {}, "/var/log/": {}}}}
 
 
 class Images:
@@ -37,6 +45,7 @@ class Images:
     def get(self, _name):
         if not self.present:
             raise ha_docker.docker.errors.ImageNotFound("no image")
+        return Image()
 
     def pull(self, *_args, **_kwargs):
         raise AssertionError("the reach probe mustn't pull")
@@ -46,7 +55,9 @@ class Client:
     def __init__(self, probe=b""):
         self.containers = self
         self.existing = None
+        # The reach probe's containers, and OpenSM's
         self.runs = []
+        self.created = []
         self.probe = probe
         self.images = Images()
         self.api = self.images
@@ -58,9 +69,12 @@ class Client:
 
     def run(self, **kwargs):
         self.runs.append(kwargs)
-        if kwargs.get("remove"):
-            return self.probe
-        self.existing = Container()
+        assert kwargs.get("remove")
+        return self.probe
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        self.existing = Container(status="created")
         return self.existing
 
 
@@ -81,7 +95,8 @@ def test_opensm_runs_under_the_watchdog_with_a_start_request(driver, config):
     driver.prepare("u", 3, 1e12)
     driver.write_lease("u", 3, 1e12)
     driver.start()
-    run = driver.client.runs[-1]
+    (run,) = driver.client.created
+    assert driver.client.existing.status == "running"
     assert run["entrypoint"][:2] == ["python3", f"{config.ha_state_dir}/watchdog.py"]
     assert run["command"][0] == "/start.sh"
     assert f"{config.ha_state_dir}:{config.ha_state_dir}" in run["volumes"]
@@ -139,7 +154,10 @@ def test_reach_counts_switches_from_a_port_that_is_up(driver):
     driver.m_key = lambda: "0x1"
     driver.client.probe = IBSTAT_UP + b"===\n" + SWITCHES
     assert driver.reach() == 1
-    assert "-y 0x1" in " ".join(driver.client.runs[-1]["command"])
+    run = driver.client.runs[-1]
+    # The key in the environment, never on the command
+    assert '-y "$AFM_M_KEY"' in " ".join(run["command"])
+    assert run["environment"] == {"AFM_M_KEY": "0x1"}
 
 
 def test_reach_is_none_when_the_port_is_down(driver):
@@ -254,5 +272,35 @@ def test_start_fails_rather_than_pull_a_missing_image(driver):
     with pytest.raises(ha_docker.docker_driver.ReloadError, match="isn't on this node"):
         driver.start()
     assert len(driver.client.runs) == probes
+    assert driver.client.created == []
     # Not eligible again on the reach cached before the image went
     assert driver.reach() is None
+
+
+def test_reach_leaves_no_anonymous_volumes(driver):
+    # run()'s remove leaves the image's anonymous volumes, one set per
+    # probe, every few seconds: they filled a host's Docker disk.
+    driver.reach()
+    run = driver.client.runs[-1]
+    assert run["tmpfs"] == {"/var/cache/opensm": "", "/var/log": ""}
+
+
+def test_a_failed_reach_probe_never_logs_the_m_key(driver, caplog):
+    # A command that exits non-zero raises ContainerError, whose message is
+    # the whole command: with the key on it, every failed probe logged it.
+    key = "0x5ec12e7000c0ffee"
+    driver.m_key = lambda: key
+
+    def run(**kwargs):
+        driver.client.runs.append(kwargs)
+        raise ha_docker.docker.errors.ContainerError(
+            "probe", 1, kwargs["command"], kwargs["image"], b"ibwarn: timeout"
+        )
+
+    driver.client.run = run
+    assert driver.reach() is None
+    (kwargs,) = driver.client.runs
+    assert key not in " ".join(kwargs["command"])
+    assert kwargs["environment"] == {"AFM_M_KEY": key}
+    assert "exit status 1" in caplog.text
+    assert "c0ffee" not in caplog.text

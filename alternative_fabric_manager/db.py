@@ -200,6 +200,14 @@ class ExpectedSwitch(Base):
     __tablename__ = "expected_switches"
 
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    # Found by the prober for the first time by the last --confirm-fabric:
+    # not expected, trusted or routed through until a later run finds it
+    # again, since anything can answer as a switch. With a server default,
+    # so that a version without it can still add rows during a rolling
+    # upgrade.
+    pending: orm.Mapped[bool] = orm.mapped_column(
+        default=False, server_default=sa.false()
+    )
 
 
 class Lease(Base):
@@ -281,12 +289,74 @@ class Secret(Base):
 
 
 class State(Base):
-    """Counters kept across restarts"""
+    """Counters and settings kept across restarts"""
 
     __tablename__ = "state"
 
     name: orm.Mapped[str] = orm.mapped_column(sa.String(64), primary_key=True)
     value: orm.Mapped[int] = orm.mapped_column(Counter, default=0)
+    # For a setting that isn't a number, such as the per-port M_Key base's
+    # fingerprint. Nullable, so that the previous version, which doesn't
+    # write it, can share the database during a rolling upgrade.
+    text: orm.Mapped[str | None] = orm.mapped_column(sa.String(255), nullable=True)
+
+
+class FabricPort(Base):
+    """A port OpenSM's cache listed, and which M_Key it holds: never the key
+    itself (see specs/secured-profile.md, Per-port M_Keys)"""
+
+    __tablename__ = "fabric_ports"
+
+    # The port GUID, as 16 lower-case hex digits, as Port.guid
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    # Its node's GUID; a switch's ports share its port 0's GUID
+    node_guid: orm.Mapped[str | None] = orm.mapped_column(sa.String(16), nullable=True)
+    # As its NodeInfo said: None until it answers one
+    switch: orm.Mapped[bool | None] = orm.mapped_column(nullable=True)
+    # m_key, derived or unknown
+    holds: orm.Mapped[str] = orm.mapped_column(sa.String(16), default="unknown")
+    # Its ProtectBits were 0 at the last Get, so it answers any key
+    lapsed: orm.Mapped[bool] = orm.mapped_column(default=False)
+    reachable: orm.Mapped[bool] = orm.mapped_column(default=False)
+    # An operator released it (--release-port), until it next answers its key
+    released: orm.Mapped[bool] = orm.mapped_column(default=False)
+    last_seen: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+
+
+class FabricLink(Base):
+    """A link as OpenSM's neighbors file has it, from its local (GUID, port)
+    to its peer's; each direction is a row of its own"""
+
+    __tablename__ = "fabric_links"
+
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    port: orm.Mapped[int] = orm.mapped_column(primary_key=True, autoincrement=False)
+    peer_guid: orm.Mapped[str] = orm.mapped_column(sa.String(16))
+    peer_port: orm.Mapped[int] = orm.mapped_column()
+    last_seen: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+
+
+class KnownSMPort(Base):
+    """A port whose SM may hold the fabric's keys, so that OpenSM ignoring an
+    SM there contests the fabric (specs/secured-profile.md, Allowed SM
+    GUIDs, The fabric check). Kept when it's no longer this host's: its
+    old host's files still hold the keys."""
+
+    __tablename__ = "known_sm_ports"
+
+    # The port GUID, as 16 lower-case hex digits
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    # This host's physical port, as the last start's probe found it, which
+    # can't be dropped; otherwise an operator recorded it, or a probe no
+    # longer finds it
+    own: orm.Mapped[bool] = orm.mapped_column(default=False, server_default=sa.false())
+    recorded: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
 
 
 # Columns added to existing tables since the first release, until the
@@ -306,6 +376,12 @@ _ADDED_COLUMNS = {
         "generation": "INTEGER NOT NULL DEFAULT 0",
         "effect": "TEXT NOT NULL DEFAULT '{}'",
         "deadline": "DATETIME",
+    },
+    "state": {
+        "text": "VARCHAR(255)",
+    },
+    "expected_switches": {
+        "pending": "BOOLEAN NOT NULL DEFAULT 0",
     },
 }
 

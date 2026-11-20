@@ -1167,7 +1167,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 - [ ] Freeze: `--drain`, and `--for`, without which a frozen leader's held
       watchdog lease has no deadline.
 - [ ] `--confirm-fenced <node>`, with `fence_manual` (see Manual fencing).
-- [x] A CLI to confirm the expected switches, `--confirm-switches`, which
+- [x] A CLI to confirm the expected switches, `--confirm-fabric`, which
       also drops one that died.
 - [ ] A CLI to force a step-down.
 - [ ] With the managed-SM fabric check and configuration epochs, a

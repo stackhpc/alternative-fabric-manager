@@ -24,13 +24,26 @@ CONTAINER_CONFIG_DIR = "/etc/opensm"
 # Keys that every OpenSM of the fabric must share. The manager generates them
 # once and keeps them in its database.
 #
-# No group writes key_mgr_seed yet. OpenSM derives the class keys (VS, CC,
-# N2N) from it, and with leases of 0 a lost seed leaves ports keyed with keys
-# no SM can reproduce. So the manager stores it, if it's missing, whenever it
-# starts OpenSM (in HA mode, at a takeover), a release before any group can
-# key a port with it, and every backup of the database holds it by then (see
+# OpenSM derives the class keys (VS, CC, N2N) from key_mgr_seed, which only
+# the experimental class_keys group writes. With leases of 0 a lost seed
+# leaves ports keyed with keys no SM can reproduce. So the manager stores it,
+# if it's missing, whenever it starts OpenSM (in HA mode, at a takeover),
+# whatever the groups, and a start that stored it doesn't render class_keys:
+# every backup taken since holds it before a port is keyed with it (see
 # specs/secured-profile.md, The seed).
-KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed")
+#
+# Per-port M_Keys derive from m_key_base, not from m_key, which every port
+# holds today and tenants may have read: deriving from m_key would hand such a
+# tenant every port's key. It is stored, if it's missing, whatever the groups,
+# as the seed is, so that every backup holds it a release before any port is
+# keyed from it (see specs/secured-profile.md, Per-port M_Keys). It's written
+# into opensm.conf only as the m_key line, and only while per-port keys are
+# on (render's port_keys): OpenSM derives each port's key from that line.
+KEYS = ("m_key", "sm_key", "sa_key", "key_mgr_seed", "m_key_base")
+
+# A hardened option whose value the manager works out at each start, such as
+# allowed_sm_guids from this host's ports: render's generated gives it.
+GENERATED = object()
 
 # The hardened options, in groups that [opensm] hardening names. A group's
 # key, if it has one, is generated once and kept in the database.
@@ -70,6 +83,42 @@ HARDENING = {
     },
     # Ports that flood the SM with traps are disabled.
     "babbling_ports": {"babbling_port_policy": "TRUE"},
+    # Each port gets its own M_Key, derived from the base and its GUID, so
+    # that a key read from one port opens only that port. OpenSM forces
+    # lookup and level 2 with the option; they're written so that they show.
+    # Written only while per-port keys are on (render's port_keys), since
+    # naming the group only permits them (specs/secured-profile.md, Per-port
+    # M_Keys, The design).
+    "m_key_per_port": {
+        "m_key_per_port": "TRUE",
+        "m_key_lookup": "TRUE",
+        "m_key_protection_level": "2",
+    },
+    # OpenSM ignores every SM whose port isn't listed: this host's physical
+    # ports, which the manager reads before each start
+    # (specs/secured-profile.md, Allowed SM GUIDs). Experimental.
+    "allowed_sm": {"allowed_sm_guids": GENERATED},
+    # Every port's vendor-specific, congestion control and node-to-node
+    # classes keyed, from the stored seed, so that a host can't reconfigure a
+    # switch with VS or CC MADs (specs/secured-profile.md, Class keys).
+    # Experimental. Ports keep the keys: turning it off is a procedure.
+    "class_keys": {
+        "vs_key_enable": "2",
+        "vs_key_ci_protect_bits": "1",
+        "vs_key_lease_period": "0",
+        "cc_key_enable": "2",
+        "cc_key_protect_bit": "1",
+        "cc_key_lease_period": "0",
+        "n2n_key_enable": "2",
+        "n2n_key_protect_bit": "1",
+        "n2n_key_lease_period": "0",
+        "key_mgr_seed": None,
+    },
+    # At most this many SA requests per 100 ms from one port: OpenSM drops the
+    # rest, logging ERR 4C11. Experimental: hardware test 4 decides whether
+    # it counts per port GUID, and the value (specs/secured-profile.md, SA
+    # request rate).
+    "sa_rate": {"sa_rate_threshold": "1000"},
 }
 
 
@@ -87,29 +136,62 @@ def is_key_lease(name):
     return name.endswith("key_lease_period")
 
 
-def hardened_options(groups, keys, key_lease_period=0):
+def effective_groups(groups, port_keys=False):
+    """The groups whose options are written: m_key_per_port only permits
+    per-port keys, so it writes nothing unless they're on"""
+    groups = set(groups)
+    if not port_keys:
+        groups.discard("m_key_per_port")
+    return groups
+
+
+def hardened_options(groups, keys, key_lease_period=0, port_keys=False, generated=None):
     """Return the options of the hardening groups, with the fabric's keys,
-    and key_lease_period as every key lease"""
+    key_lease_period as every key lease, and generated's values for the
+    options the manager works out at each start
+
+    m_key_per_port's options are written only when port_keys is true, the
+    target being on, and then the m_key line is the per-port M_Key base,
+    which OpenSM derives each port's key from. Otherwise the group writes
+    nothing, and the base is never written.
+    """
+    groups = effective_groups(groups, port_keys)
     options = {}
     for group in sorted(groups):
         for name, value in HARDENING[group].items():
             if value is None:
                 value = keys[name]
+            elif value is GENERATED:
+                # A KeyError rather than an option left out unseen
+                value = (generated or {})[name]
             elif is_key_lease(name):
                 value = str(key_lease_period)
             options[name] = value
+    if "m_key_per_port" in groups:
+        options["m_key"] = keys["m_key_base"]
     return options
 
 
-def render(overrides, hardening=(), keys=None, key_lease_period=0):
+def render(
+    overrides,
+    hardening=(),
+    keys=None,
+    key_lease_period=0,
+    port_keys=False,
+    generated=None,
+):
     """Return opensm.conf
 
     OpenSM uses its defaults for options that aren't set. hardening names
     the hardening groups, keys are the fabric's shared keys, and
     key_lease_period is the lease of every key they set on ports, 0 for
     permanent keys; overrides win over hardening, but not over the options
-    the manager depends on.
+    the manager depends on. port_keys says whether per-port M_Keys are on,
+    their target: while it's false, m_key_per_port renders as if it weren't
+    named. generated has the values the manager worked out for this start,
+    such as allowed_sm_guids, which an override replaces like any other.
     """
+    hardening = effective_groups(hardening, port_keys)
     lines = [
         "# Generated by alternative-fabric-manager; changes are overwritten.",
         "# OpenSM uses its defaults for options that aren't set here.",
@@ -121,7 +203,13 @@ def render(overrides, hardening=(), keys=None, key_lease_period=0):
     if "log_flags" not in overrides:
         # The levels whose messages the manager watches for
         lines.append("log_flags 0x07")
-    hardened = hardened_options(hardening, keys or {}, key_lease_period)
+    hardened = hardened_options(
+        hardening,
+        keys or {},
+        key_lease_period,
+        port_keys,
+        generated,
+    )
     hardened = {k: v for k, v in hardened.items() if k not in overrides}
     if hardened:
         lines += [

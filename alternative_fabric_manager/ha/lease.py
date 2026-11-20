@@ -375,8 +375,11 @@ class GaleraLease:
     def expected_switches(self):
         """How many switches a complete fabric has"""
         with self._session() as session:
+            # A pending switch isn't expected yet.
             count = session.scalar(
-                sa.select(sa.func.count()).select_from(db.ExpectedSwitch)
+                sa.select(sa.func.count())
+                .select_from(db.ExpectedSwitch)
+                .where(db.ExpectedSwitch.pending.is_(False))
             )
             session.commit()
             return count or 0

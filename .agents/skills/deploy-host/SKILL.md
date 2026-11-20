@@ -33,6 +33,52 @@ Find out before changing anything:
 AFM's database holds the fabric's OpenSM keys. Never drop or recreate it,
 and never print the keys or the database's passwords.
 
+## Per-port M_Keys
+
+If `[opensm] hardening` names `m_key_per_port`, or the database records
+ports (`--port-key-states` lists any), the deploy differs (see
+`docs/opensm-hardening.md`, Per-port M_Keys):
+
+- **Backups:** the database holds `m_key_base`, which every port's key
+  derives from. Keep a backup taken after the start that stored the base
+  (the first start of a release with the group) and after any turn-on;
+  an older one can lose the ports.
+- **`--confirm-fabric` can turn them on.** On a deployment that names
+  `m_key_per_port` with per-port M_Keys off, `--confirm-fabric` arms the
+  turn-on when every precondition holds (the base stored by an earlier
+  start, links recorded, no switch confirmed for the first time by that
+  run, and every recorded port behind an up link answering the stored
+  `m_key`), and the manager's next restart then re-keys every port. So
+  there it needs the fabric owner's agreement, and is never a routine
+  step of a redeploy: skip step 5 on such a deployment unless that is the
+  agreed change. If a precondition fails it still confirms the switches,
+  prints "the switches are confirmed, but per-port M_Keys aren't armed:"
+  and why, and exits non-zero. With the group not named, or the keys
+  already on, it only confirms.
+- **Never begin or end them in a routine redeploy:** don't name the group,
+  don't remove it, and don't run `--confirm-fabric` to arm them, as part
+  of a deploy. Each re-keys every port and needs the fabric owner's
+  agreement.
+- **Check the states before and after**:
+  ```sh
+  sudo docker exec alternative-fabric-manager alternative-fabric-manager \
+    --config-file /etc/alternative-fabric-manager/afm.conf --port-key-states
+  ```
+  The first line (`target ..., OpenSM last started ...`) and each port's
+  key (`m_key`, `derived` or `unknown`) should be the same after the
+  deploy as before, once the start has settled.
+- **A release without the group** (an older one, or a branch from before
+  it) can't render OpenSM's cache: turn per-port M_Keys off first, and
+  wait until `--port-key-states` shows every port, HCAs included, holding
+  `m_key`. Restoring an older database is a downgrade too.
+- **Confirmed switches gate the prober:** with ports recorded,
+  `--confirm-fabric` runs the prober and records every port that
+  answers as a switch, by its port 0 GUID. Check the list it prints before
+  relying on it (an adapter can answer as a switch). If the check reports
+  "Missing switches" for a switch confirmed before ports were recorded,
+  confirm again: `ibswitches` gave its node GUID.
+- **HA mode refuses the group**; per-port M_Keys are single-node only.
+
 ## Wire networking-mlnx to AFM
 
 In DevStack's `local.conf`, as the networking-mlnx guide's SDN section
@@ -98,11 +144,13 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    HA mode also needs the watchdog's tmpfs and the host's processes:
    `-v /run/alternative-fabric-manager:/run/alternative-fabric-manager`
    and `-v /proc:/host/proc:ro`.
-5. **On a new database, record the fabric's switches**, or no job ever
-   completes ("No expected switches"):
+5. **On a new database, confirm the fabric**, or no job ever completes
+   ("No expected switches: confirm them with --confirm-fabric"). On a
+   deployment that names `m_key_per_port` with the keys off, this can arm
+   their turn-on: see Per-port M_Keys above first.
    ```sh
    sudo docker exec alternative-fabric-manager alternative-fabric-manager \
-     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
    ```
 
 ## Verify
@@ -119,6 +167,15 @@ Within a minute:
   (`sudo docker top opensm -o pid,args`), and the `lease` row's counter
   moves.
 
+With per-port M_Keys recorded, the fabric check runs the prober rather
+than `ibswitches`, and its `check_detail` names any lost port or switch
+port without a recorded neighbour. Use it and `--port-key-states` to
+verify, rather than `ibswitches -y`/`smpquery -y`, which reach only ports
+holding the key given. If you need an SMP tool, take that port's key with
+`KEY=$(... --port-m-key <guid>)`, never displayed. A start that fails
+with the group named is retried at every check ("Failed to start OpenSM,
+retrying at every check"), not ended: read that line.
+
 If no HA leader appears, the `nodes` row's `reach` tells whether the node
 sees its own port up. If OpenSM doesn't start, read the `opensm`
 container's log. Roll back while you diagnose: the fabric has no subnet
@@ -132,7 +189,13 @@ skill).
 - print the keys (`--show-keys` output, `opensm.conf`) or the database
   passwords;
 - run SMP tools on a protected fabric without `-y $KEY`, where `KEY` comes
-  from `--show-keys` into a variable, never to the screen;
+  from `--show-keys` (matching `$1 == "m_key"`, not `/^m_key/`, which also
+  matches `m_key_base`), or with per-port M_Keys from `--port-m-key
+  <guid>`, into a variable, never to the screen;
+- write OpenSM's cache volume (`/var/cache/opensm`) by hand, paste M_Key
+  lines from OpenSM's log, which holds keys, or `docker inspect` the
+  helper prober container (`<[opensm] container>-prober`), whose
+  configuration holds keys while it runs;
 - send SMP Sets, or disable switch ports, on a fabric others share;
 - connect to eswitchd's socket (tcp://127.0.0.1:60001) by hand: it exits on
   messages it can't decode.

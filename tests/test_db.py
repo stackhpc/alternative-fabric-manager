@@ -55,6 +55,126 @@ def test_an_old_database_is_upgraded_in_place(tmp_path):
     assert "ix_jobs_generation" in indexes
 
 
+def test_an_old_state_table_gains_its_text_column(tmp_path):
+    # The per-port M_Key base's fingerprint is text, which state.value, an
+    # integer, can't hold. The counters and the new tables survive.
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE state (
+            name VARCHAR(64) NOT NULL PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO state VALUES ('generation', 7);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.State, "generation").value == 7
+        assert session.get(db.State, "generation").text is None
+        session.add(db.State(name="fingerprint", value=0, text="ab" * 32))
+        session.add(db.FabricPort(guid="0" * 16))
+        session.commit()
+    # Upgrading again changes nothing.
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.State, "fingerprint").text == "ab" * 32
+        assert session.get(db.FabricPort, "0" * 16).holds == "unknown"
+
+
+def test_an_old_expected_switches_table_gains_its_pending_column(tmp_path):
+    # Switches confirmed before are confirmed, not pending; a row added
+    # without the column, as by an older version, isn't pending either.
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE expected_switches (guid VARCHAR(16) NOT NULL PRIMARY KEY);
+        INSERT INTO expected_switches VALUES ('0000000000000051');
+        """
+    )
+    connection.commit()
+    connection.close()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000051").pending is False
+        session.execute(
+            sa.text("INSERT INTO expected_switches (guid) VALUES ('0000000000000052')")
+        )
+        session.add(db.ExpectedSwitch(guid="0000000000000053", pending=True))
+        session.commit()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000052").pending is False
+        assert session.get(db.ExpectedSwitch, "0000000000000053").pending is True
+
+
+def test_fabric_ports_and_links_round_trip(config):
+    import datetime
+
+    when = datetime.datetime(2026, 11, 16, 12, 0, 0, 123456, datetime.timezone.utc)
+    sessionmaker = db.make_sessionmaker(config.database_url)
+    with sessionmaker() as session:
+        session.add(
+            db.FabricPort(
+                guid="ffffffffffff0001",
+                node_guid="ffffffffffff0000",
+                switch=True,
+                holds="derived",
+                lapsed=True,
+                reachable=True,
+                released=True,
+                last_seen=when,
+            )
+        )
+        session.add(db.FabricPort(guid="0000000000000002"))
+        # Both directions of a link, as neighbors has them
+        session.add(
+            db.FabricLink(
+                guid="ffffffffffff0001",
+                port=1,
+                peer_guid="0000000000000002",
+                peer_port=1,
+                last_seen=when,
+            )
+        )
+        session.add(
+            db.FabricLink(
+                guid="0000000000000002",
+                port=1,
+                peer_guid="ffffffffffff0001",
+                peer_port=1,
+            )
+        )
+        session.commit()
+    with sessionmaker() as session:
+        port = session.get(db.FabricPort, "ffffffffffff0001")
+        assert (port.node_guid, port.switch, port.holds) == (
+            "ffffffffffff0000",
+            True,
+            "derived",
+        )
+        assert (port.lapsed, port.reachable, port.released) == (True, True, True)
+        assert port.last_seen.replace(tzinfo=datetime.timezone.utc) == when
+        new = session.get(db.FabricPort, "0000000000000002")
+        # Not known until its NodeInfo answers
+        assert new.switch is None and new.node_guid is None
+        assert (new.holds, new.lapsed, new.reachable, new.released) == (
+            "unknown",
+            False,
+            False,
+            False,
+        )
+        assert new.last_seen is None
+        link = session.get(db.FabricLink, ("ffffffffffff0001", 1))
+        assert (link.peer_guid, link.peer_port) == ("0000000000000002", 1)
+        assert session.get(db.FabricLink, ("0000000000000002", 1)).last_seen is None
+
+
 @pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
 def test_a_server_database_needs_its_schema_upgraded():
     import sqlalchemy as sa
@@ -74,6 +194,98 @@ def test_a_server_database_needs_its_schema_upgraded():
         session.commit()
     with root.begin() as connection:
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0003_gains_the_port_key_tables():
+    # A deployed database is at 0003. 0004 adds state.text and the per-port
+    # M_Key tables, and runs again from the start if it stopped midway,
+    # since MariaDB commits each DDL statement.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0003")
+    engine = sa.create_engine(rendered)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO state (name, value) VALUES ('generation', 7)"
+        )
+    db.upgrade(rendered)
+    # As if it had stopped after its first step
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE fabric_links")
+    command.stamp(alembic, "0003")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        assert session.get(db.State, "generation").value == 7
+        session.add(db.State(name="fingerprint", value=0, text="ab" * 32))
+        session.add(db.FabricPort(guid="0" * 16))
+        session.add(
+            db.FabricLink(guid="0" * 16, port=1, peer_guid="1" * 16, peer_port=2)
+        )
+        session.commit()
+    # A row an older version adds, without the pending column, isn't pending.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO expected_switches (guid) VALUES ('0000000000000051')"
+        )
+    with sessionmaker() as session:
+        assert session.get(db.ExpectedSwitch, "0000000000000051").pending is False
+    engine.dispose()
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0004_gains_the_known_sm_ports():
+    # 0005 adds known_sm_ports, and runs again if it stopped midway.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0004")
+    db.upgrade(rendered)
+    command.stamp(alembic, "0004")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        session.add(db.KnownSMPort(guid="0" * 16, own=True))
+        session.commit()
+    engine = sa.create_engine(rendered)
+    # A row added without own, as by hand, isn't this host's.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO known_sm_ports (guid) VALUES ('0000000000000051')"
+        )
+    with sessionmaker() as session:
+        assert session.get(db.KnownSMPort, "0000000000000051").own is False
+        assert session.get(db.KnownSMPort, "0" * 16).own is True
+    engine.dispose()
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+def test_known_sm_ports_round_trip(config):
+    sessionmaker = db.make_sessionmaker(config.database_url)
+    with sessionmaker() as session:
+        session.add(db.KnownSMPort(guid="0002c903000e0b72", own=True))
+        session.add(db.KnownSMPort(guid="0002c90300005678"))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.KnownSMPort, "0002c903000e0b72").own is True
+        assert session.get(db.KnownSMPort, "0002c90300005678").own is False
 
 
 class _GaleraSession:

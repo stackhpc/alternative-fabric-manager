@@ -47,7 +47,9 @@ deployed, see [infiniband-networks.md](infiniband-networks.md).
 - **M_Key and SM_Key protection.** HA mode refuses to start without the
   `m_key` and `sm_key` hardening groups. Read
   [opensm-hardening.md](opensm-hardening.md) before enabling them on a
-  fabric shared with hosts outside OpenStack.
+  fabric shared with hosts outside OpenStack. HA mode refuses the
+  experimental `m_key_per_port` group (per-port M_Keys), so this
+  deployment can't use it yet.
 
 ## Virtualised and bare metal
 
@@ -440,6 +442,7 @@ image = {{ afm_opensm_image }}
 manager_container = {{ afm_container_name }}
 config_dir = /etc/opensm
 host_config_dir = /etc/opensm
+# Not m_key_per_port, which HA mode refuses (see opensm-hardening.md)
 hardening = m_key, sm_key, enforcement
 # HA mode: a job must outlast a takeover (see specs/ha.md, Timeouts)
 job_timeout = 300
@@ -793,7 +796,7 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 
    ```sh
    ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
-     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-switches
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
    ```
 
 3. Run the networking-mlnx tempest plugin against the deployment.
@@ -859,7 +862,12 @@ ln -s ../../../ansible/deployment/check-alternative-fabric-manager.yml \
 - **Diagnostic tools** on the M_Key-protected fabric need the key:
   `KEY=$(${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager
   --config-file /etc/alternative-fabric-manager/afm.conf --show-keys | awk
-  '/^m_key/{print $2}')`, then `ibswitches -y $KEY`. Never print the keys.
+  '$1 == "m_key" {print $2}')`, then `ibswitches -y $KEY`. Never print the
+  keys. Match `m_key` exactly: `--show-keys` also prints `m_key_base`. A
+  single-node deployment with per-port M_Keys gives each port its own key,
+  from `--port-m-key <guid>` in the same way, which opens only that port
+  (see [opensm-hardening.md](opensm-hardening.md), Per-port M_Keys); HA
+  mode refuses them.
 
 ## Known limitations
 

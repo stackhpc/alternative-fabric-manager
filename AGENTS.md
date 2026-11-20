@@ -13,6 +13,9 @@ anything under `alternative_fabric_manager/ha/`.
 | `alternative_fabric_manager/manager.py` | Requests, jobs, rendering, sweeping, fabric checks, job completion |
 | `alternative_fabric_manager/partitions.py` | Rendering, validating and attributing partitions.conf |
 | `alternative_fabric_manager/effects.py` | What each job needs to hold in a swept file |
+| `alternative_fabric_manager/port_keys.py` | Per-port M_Keys: pure rules on which key each port holds, the records, and OpenSM's cache files |
+| `alternative_fabric_manager/prober.py` | Per-port M_Keys: directed-route `smpquery` Gets along recorded links, in OpenSM's image |
+| `alternative_fabric_manager/port_keeper.py` | Per-port M_Keys in the single-node manager: before each start, at each check, per job, and the operator's commands |
 | `alternative_fabric_manager/drivers/` | Running OpenSM: `managed` (spawns its container), `docker`, `none` |
 | `alternative_fabric_manager/db.py`, `migrations/` | SQLAlchemy models; Alembic for server databases |
 | `alternative_fabric_manager/ha/` | HA: `lease.py` (Galera driver), `watchdog.py`, `coordinator.py`, `operator.py` |
@@ -92,15 +95,30 @@ Development usually happens on a DevStack host set up as networking-mlnx's
 DevStack guide describes, whose InfiniBand fabric others may share. AFM
 there manages the fabric's OpenSM, so:
 
-- **Never print OpenSM's keys** (M_Key, SM_Key, SA_Key, and the
-  `key_mgr_seed` the class keys derive from). `--show-keys` prints them;
-  use it only to feed a diagnostic tool, as in
-  `KEY=$(... --show-keys | awk '/^m_key/{print $2}')`, never to display.
+- **Never print OpenSM's keys** (M_Key, SM_Key, SA_Key, the
+  `key_mgr_seed` the class keys derive from, and the `m_key_base` that
+  per-port M_Keys derive from). `--show-keys` prints them, and
+  `--port-m-key <guid>` prints a port's key; use them only to feed a
+  diagnostic tool, as in
+  `KEY=$(... --show-keys | awk '$1 == "m_key" {print $2}')` or
+  `KEY=$(... --port-m-key <guid>)`, never to display. With per-port
+  M_Keys, an SMP tool needs the port's own key, which opens only it.
+- **OpenSM's log holds keys** (its startup options, and with per-port
+  M_Keys the key in each Bad M_Key trap): never paste its M_Key lines, and
+  keep it as secret as `opensm.conf`. Never write OpenSM's cache volume
+  (`/var/cache/opensm`) by hand: the manager renders it. Never inspect the
+  helper `<container>-prober` container: its configuration holds keys.
 - **Agree the hardening with whoever shares the fabric** before anything
   that changes what OpenSM enforces: changing `[opensm] hardening` or
   `[opensm] key_lease_period`, setting hardening options by hand in
   `[opensm_conf]` (the experimental ones in docs/opensm-hardening.md), or
-  deploying a release that adds a group to `all`. A deployment with
+  deploying a release that adds a group to `all`. Naming
+  `m_key_per_port` and removing it are such changes, and so is
+  **`--confirm-fabric` where the group is named and the keys are off: it
+  arms the turn-on** once its preconditions hold (base stored by an
+  earlier start, links recorded, no switch new to that run, every port on
+  `m_key`), and the next restart re-keys every port. Never run it there
+  as a routine step. A deployment with
   `all` (or only removals) gains each group its release notes name; one
   with an explicit list of groups gains none. With M_Key protection on,
   SMP tools (`ibswitches`, `smpquery`, `ibportstate`) need `-y $KEY`.

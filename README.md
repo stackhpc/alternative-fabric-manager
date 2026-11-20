@@ -85,9 +85,11 @@ Before you start it:
 - **On a new database, record the fabric's switches** once OpenSM has
   swept, with `docker exec alternative-fabric-manager
   alternative-fabric-manager --config-file
-  /etc/alternative-fabric-manager/afm.conf --confirm-switches`: until then
+  /etc/alternative-fabric-manager/afm.conf --confirm-fabric`: until then
   no job completes ("No expected switches"). Run it again whenever
-  switches are added or removed.
+  switches are added or removed. With the experimental `m_key_per_port`
+  group named, it also arms the turn-on of per-port M_Keys: see
+  docs/opensm-hardening.md, Per-port M_Keys, before running it there.
 
 `--status` shows who holds the lease in HA mode, its term, and any freeze,
 including an unfreeze still pending and the manager to check.
@@ -132,6 +134,33 @@ default, hardens everything; `hardening = -sa_trust` everything but one
 group; `hardening = m_key, enforcement` only those. The keys set on
 ports are permanent by default; `[opensm] key_lease_period` gives them all
 a lease in one line instead (see docs/opensm-hardening.md, Permanent keys).
+
+An experimental group, untested on hardware, `m_key_per_port`, chosen as
+`hardening = all, m_key_per_port` in single-node mode with the managed
+driver, gives each
+port an M_Key of its own, so that a key read from one port no longer opens
+every switch. It leaves keys on ports, and is turned on and off by an
+operator's procedure: see docs/opensm-hardening.md, Per-port M_Keys. With
+it, a diagnostic tool's `-y` needs the port's own key, from
+`alternative-fabric-manager --port-m-key <guid>` into a variable, rather
+than `m_key` from `--show-keys`.
+
+Another experimental group, untested on hardware, `allowed_sm`, chosen as
+`hardening = all, allowed_sm` in single-node mode, makes OpenSM ignore
+every subnet manager outside this host's physical ports, so that a tenant's
+can't win the election. An ignored one on a port whose host may hold the
+fabric's keys (`--record-sm-port`) fails the fabric check. See
+docs/opensm-hardening.md, Allowed subnet managers, and its Before enabling
+checklist.
+
+A third experimental group, untested on hardware, `class_keys`, chosen as
+`hardening = all, class_keys` in single-node mode, keys every port's
+vendor-specific, congestion control and node-to-node classes from the
+stored seed. It leaves keys on ports, and is turned off by disabling
+first: see docs/opensm-hardening.md, Class keys, and its Before enabling
+checklist. A fourth, `sa_rate`, also experimental and untested on
+hardware, limits each port's SA requests (`hardening = all, sa_rate`; see
+SA request rate).
 
 ### The partitions template
 

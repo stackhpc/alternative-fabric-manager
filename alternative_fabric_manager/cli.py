@@ -16,11 +16,15 @@ import sys
 
 import uvicorn
 
-from alternative_fabric_manager import api, db, drivers
+from alternative_fabric_manager import allowed_sm, api, db, drivers, port_keeper
 from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
 
 DEFAULT_CONFIG = "/etc/alternative-fabric-manager/afm.conf"
+# How --confirm-fabric marks a switch it found for the first time
+PENDING_MARK = (
+    " (new: not trusted until you confirm the fabric again; check that it's a switch)"
+)
 
 
 def main(argv=None):
@@ -32,15 +36,20 @@ def main(argv=None):
     parser.add_argument(
         "--show-keys",
         action="store_true",
-        help="Print the fabric's OpenSM keys and class key seed, which are "
-        "secrets, for diagnostic tools such as "
-        "smpquery -y <m_key>, and exit",
+        help="Print the fabric's OpenSM keys, class key seed and per-port "
+        "M_Key base, which are secrets, for diagnostic tools such as "
+        "smpquery -y <m_key>, and exit. With per-port M_Keys, a port holds "
+        "its own key: take -y's from --port-m-key instead",
     )
     parser.add_argument(
-        "--confirm-switches",
+        "--confirm-fabric",
         action="store_true",
         help="Record the switches OpenSM sees now as the fabric's expected "
-        "ones, which every fabric check must find, and exit",
+        "ones, which every fabric check must find, and, with per-port M_Keys, "
+        "the links its cache lists, and exit. With the m_key_per_port "
+        "hardening group named, it also arms the turn-on of per-port M_Keys, "
+        "which the manager's next start begins, once every port is found "
+        "ready; otherwise it says why not and exits non-zero",
     )
     enforcement = parser.add_mutually_exclusive_group()
     enforcement.add_argument(
@@ -92,6 +101,81 @@ def main(argv=None):
         "revisions go back and deleted IDs return: forget every deleted "
         "object and recorded revision, so that no current request is "
         "refused as late, and exit",
+    )
+    ports = parser.add_argument_group(
+        "per-port M_Keys",
+        "With the m_key_per_port hardening group (docs/opensm-hardening.md). "
+        "Each runs beside the running manager, and exits. GUIDs are hex, "
+        "with or without 0x",
+    )
+    commands = ports.add_mutually_exclusive_group()
+    commands.add_argument(
+        "--port-key-states",
+        action="store_true",
+        help="List each recorded port's GUID, which key it holds (m_key, "
+        "derived or unknown), and whether it lapsed, is reachable or was "
+        "released, never a key; and the target",
+    )
+    commands.add_argument(
+        "--port-m-key",
+        metavar="GUID",
+        help="Print the M_Key the port holds now, a secret, only to feed a "
+        "diagnostic tool's -y, as in KEY=$(... --port-m-key GUID)",
+    )
+    commands.add_argument(
+        "--add-link",
+        nargs=2,
+        metavar=("GUID:PORT", "PEER_GUID:PORT"),
+        help="Record a link that OpenSM hasn't, both directions, once you "
+        "know what's attached: a switch port with its link up and no "
+        "recorded neighbour fails every fabric check",
+    )
+    commands.add_argument(
+        "--release-port",
+        metavar="GUID",
+        help="Complete a lost port's held jobs as they are, and exempt it from "
+        "the fabric check's rule on lost ports, until it answers its key "
+        "again. It changes nothing on the port",
+    )
+    commands.add_argument(
+        "--forget-port-keys",
+        action="store_true",
+        help="Drop every recorded port and link, once per-port M_Keys are off "
+        "and every port holds the stored M_Key",
+    )
+    commands.add_argument(
+        "--forget-port",
+        metavar="GUID",
+        help="Drop a removed port and its links; refused for a port seen in "
+        "the last day",
+    )
+    sms = parser.add_argument_group(
+        "allowed SMs",
+        "With the allowed_sm hardening group, or [opensm_conf] "
+        "allowed_sm_guids (docs/opensm-hardening.md). OpenSM ignoring an SM on "
+        "a known SM port contests the fabric; on any other port, it's only "
+        "logged. Each runs beside the running manager, and exits",
+    )
+    sm_commands = sms.add_mutually_exclusive_group()
+    sm_commands.add_argument(
+        "--known-sm-ports",
+        action="store_true",
+        help="List the known SM ports: this host's physical ports, as the "
+        "last start found them, and those recorded with --record-sm-port",
+    )
+    sm_commands.add_argument(
+        "--record-sm-port",
+        metavar="GUID",
+        help="Record a port whose host may hold the fabric's keys, such as "
+        "another host that ran AFM's OpenSM, so that an SM there that OpenSM "
+        "ignores contests the fabric",
+    )
+    sm_commands.add_argument(
+        "--drop-sm-port",
+        metavar="GUID",
+        help="Forget a known SM port once its adapter is no longer in a host "
+        "with the fabric's keys, as when it's reused in a tenant's host; "
+        "refused for this host's own ports",
     )
     args = parser.parse_args(argv)
 
@@ -170,17 +254,47 @@ def main(argv=None):
             print(f"{name} {value}")
         return
 
-    if args.confirm_switches:
+    if args.confirm_fabric:
         manager = manager_mod.Manager(
             config,
             db.make_sessionmaker(config.database_url),
             drivers.make_driver(config),
         )
-        switches = manager.confirm_switches()
-        if not switches:
+        try:
+            confirmation = manager.confirm_fabric()
+        except drivers.ReloadError as e:
+            # The switches weren't recorded: the fabric couldn't be asked, as
+            # when this host's port answers no key the manager holds. The
+            # links OpenSM's cache lists may have been, as a check records
+            # them.
+            sys.exit(
+                f"alternative-fabric-manager: can't confirm the fabric: {e} "
+                "(no switch was confirmed)"
+            )
+        except port_keeper.PortKeysError as e:
+            # Such as the base not yet stored by a start
+            sys.exit(f"alternative-fabric-manager: can't confirm the fabric: {e}")
+        if not confirmation.switches:
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
-        for guid in switches:
-            print(f"0x{guid:016x}")
+        for guid in confirmation.switches:
+            mark = PENDING_MARK if guid in confirmation.pending else ""
+            print(f"0x{guid:016x}{mark}")
+        if confirmation.pending:
+            print(
+                f"{len(confirmation.pending)} switches are new, and pending: none "
+                "is expected or trusted until --confirm-fabric finds it again, "
+                "so check that each is a switch, not an adapter that answers as "
+                "one, and run it again"
+            )
+        if confirmation.note:
+            print(confirmation.note)
+        if confirmation.problems:
+            sys.stdout.flush()
+            sys.exit(
+                "alternative-fabric-manager: the switches are confirmed, but "
+                "per-port M_Keys aren't armed:\n"
+                + "\n".join(f"- {problem}" for problem in confirmation.problems)
+            )
         return
 
     if args.forget_revisions:
@@ -189,6 +303,31 @@ def main(argv=None):
         )
         count = manager.forget_revisions()
         print(f"Forgot {count} deleted objects and every recorded revision")
+        return
+
+    if (
+        args.port_key_states
+        or args.port_m_key is not None
+        or args.add_link is not None
+        or args.release_port is not None
+        or args.forget_port_keys
+        or args.forget_port is not None
+    ):
+        try:
+            _port_keys(config, args)
+        except port_keeper.PortKeysError as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
+        return
+
+    if (
+        args.known_sm_ports
+        or args.record_sm_port is not None
+        or args.drop_sm_port is not None
+    ):
+        try:
+            _allowed_sms(config, args)
+        except (allowed_sm.AllowedSMError, port_keeper.PortKeysError) as e:
+            sys.exit(f"alternative-fabric-manager: {e}")
         return
 
     if args.show_enforcement_errors or args.clear_enforcement_errors:
@@ -234,6 +373,55 @@ def main(argv=None):
         )
     finally:
         manager.stop()
+
+
+def _port_keys(config, args):
+    """The per-port M_Key commands, beside the running manager"""
+    if config.ha:
+        raise port_keeper.PortKeysError("per-port M_Keys aren't available in HA mode")
+    manager = manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
+    )
+    keeper = manager.port_keeper
+    if args.port_key_states:
+        print("\n".join(keeper.states()))
+    elif args.port_m_key is not None:
+        print(keeper.port_m_key(port_keeper.parse_guid(args.port_m_key)))
+    elif args.add_link is not None:
+        local, peer = (port_keeper.parse_endpoint(text) for text in args.add_link)
+        added = keeper.add_link(local, peer)
+        print(f"Recorded the link, and {added} new ports")
+    elif args.release_port is not None:
+        guid = port_keeper.parse_guid(args.release_port)
+        keeper.release_port(guid)
+        print(f"Released 0x{guid:016x} until it answers its key again")
+    elif args.forget_port_keys:
+        ports, links = keeper.forget_port_keys()
+        print(f"Forgot {ports} ports and {links} links")
+    else:
+        guid = port_keeper.parse_guid(args.forget_port)
+        links = keeper.forget_port(guid)
+        print(f"Forgot 0x{guid:016x} and {links} links")
+
+
+def _allowed_sms(config, args):
+    """The allowed SM commands, beside the running manager"""
+    manager = manager_mod.Manager(
+        config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
+    )
+    sms = manager.allowed_sms
+    if args.known_sm_ports:
+        print("\n".join(sms.known_ports()))
+    elif args.record_sm_port is not None:
+        guid = port_keeper.parse_guid(args.record_sm_port)
+        if sms.record(guid):
+            print(f"Recorded 0x{guid:016x} as a known SM port")
+        else:
+            print(f"0x{guid:016x} was a known SM port already")
+    else:
+        guid = port_keeper.parse_guid(args.drop_sm_port)
+        sms.drop(guid)
+        print(f"Dropped 0x{guid:016x} from the known SM ports")
 
 
 def _serve_ha(config, args):
