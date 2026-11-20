@@ -470,3 +470,75 @@ def test_sqlite_sessions_take_turns_across_threads(monkeypatch):
     thread.join(5)
     held.close()
     assert errors and "held the SQLite session" in errors[0]
+
+
+def test_old_ports_and_applied_tables_gain_the_partial_fabric_columns(tmp_path):
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE networks (id VARCHAR(36) PRIMARY KEY, pkey INTEGER,
+            name VARCHAR(255) NOT NULL);
+        CREATE TABLE ports (id VARCHAR(36) PRIMARY KEY,
+            network_id VARCHAR(36) NOT NULL, guid VARCHAR(16) NOT NULL,
+            host VARCHAR(255) NOT NULL);
+        INSERT INTO networks VALUES ('n', 100, '');
+        INSERT INTO ports VALUES ('p', 'n', '0000000000000001', 'h1');
+        CREATE TABLE applied (id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
+            body TEXT NOT NULL, attribution TEXT NOT NULL,
+            pkey_errors TEXT NOT NULL, enforcement_errors TEXT NOT NULL,
+            check_ok BOOLEAN NOT NULL, check_time DATETIME,
+            check_detail TEXT NOT NULL);
+        INSERT INTO applied VALUES (1, 3, '', '{}', '[]', '[]', 1, NULL, '');
+        """
+    )
+    connection.commit()
+    connection.close()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        # Recorded before vnic_type was: none, which gets the host rule
+        assert session.get(db.Port, "p").vnic_type is None
+        applied = session.get(db.Applied, 1)
+        assert not applied.check_partial
+        assert not applied.missing
+        assert applied.held is None
+        assert applied.held_term == 0
+
+
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0007_gains_the_partial_fabric_columns():
+    # 0008 adds ports.vnic_type and applied's columns for a partial check,
+    # and runs again if it stopped midway.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0007")
+    engine = sa.create_engine(rendered)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO applied (id, generation, term, contested, body, "
+            "attribution, pkey_errors, enforcement_errors, check_ok, "
+            "check_detail) VALUES (1, 1, 0, 0, '', '{}', '[]', '[]', 0, '')"
+        )
+    engine.dispose()
+    db.upgrade(rendered)
+    command.stamp(alembic, "0007")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        assert not applied.check_partial and not applied.missing
+        assert applied.held_term == 0
+        session.add(db.Network(id="n", pkey=100, name=""))
+        session.add(db.Port(id="p", network_id="n", guid="1" * 16, vnic_type="direct"))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.Port, "p").vnic_type == "direct"
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")
