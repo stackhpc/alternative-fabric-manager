@@ -542,3 +542,56 @@ def test_a_server_database_at_0007_gains_the_partial_fabric_columns():
         assert session.get(db.Port, "p").vnic_type == "direct"
     with root.begin() as connection:
         connection.exec_driver_sql("DROP DATABASE afm_schema_test")
+
+
+def test_host_ports_round_trip_and_an_old_applied_gains_adapter_links(tmp_path):
+    path = tmp_path / "afm.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE applied (id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
+            body TEXT NOT NULL, attribution TEXT NOT NULL,
+            pkey_errors TEXT NOT NULL, enforcement_errors TEXT NOT NULL,
+            check_ok BOOLEAN NOT NULL, check_time DATETIME,
+            check_detail TEXT NOT NULL);
+        INSERT INTO applied VALUES (1, 3, '', '{}', '[]', '[]', 1, NULL, '');
+        """
+    )
+    connection.commit()
+    connection.close()
+    sessionmaker = db.make_sessionmaker(str(path))
+    with sessionmaker() as session:
+        assert session.get(db.Applied, 1).adapter_links is None
+        session.add(db.HostPort(guid="0" * 16, host="hv1"))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.HostPort, "0" * 16).host == "hv1"
+
+
+@pytest.mark.skipif(not conftest.SERVER_URL, reason="needs AFM_TEST_DATABASE_URL")
+def test_a_server_database_at_0008_gains_host_ports():
+    # 0009 adds host_ports and applied.adapter_links, and runs again if it
+    # stopped midway.
+    from alembic import command
+
+    url = sa.engine.make_url(conftest.SERVER_URL).set(database="afm_schema_test")
+    root = sa.create_engine(url.set(database=""))
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE IF EXISTS afm_schema_test")
+        connection.exec_driver_sql("CREATE DATABASE afm_schema_test")
+    rendered = url.render_as_string(hide_password=False)
+    alembic = db._alembic_config(rendered)
+    command.upgrade(alembic, "0008")
+    db.upgrade(rendered)
+    command.stamp(alembic, "0008")
+    db.upgrade(rendered)
+    sessionmaker = db.make_sessionmaker(rendered)
+    with sessionmaker() as session:
+        session.add(db.HostPort(guid="0" * 16, host="hv1"))
+        session.add(db.Applied(id=1, adapter_links="{}"))
+        session.commit()
+    with sessionmaker() as session:
+        assert session.get(db.HostPort, "0" * 16).host == "hv1"
+        assert session.get(db.Applied, 1).adapter_links == "{}"
+    with root.begin() as connection:
+        connection.exec_driver_sql("DROP DATABASE afm_schema_test")

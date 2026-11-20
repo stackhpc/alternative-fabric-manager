@@ -231,6 +231,10 @@ class Applied(Base):
     # The term of the leader that last wrote held, which every leader's
     # write of it compares and sets
     held_term: orm.Mapped[int] = orm.mapped_column(default=0, server_default="0")
+    # Where the check runs ibswitches: the adapter ports the last passing
+    # check's ibnetdiscover scan found, and the switch port each is cabled
+    # to, as JSON, for the virtual functions placed by their hosts' ports
+    adapter_links: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
 
 
 class ExpectedSwitch(Base):
@@ -391,6 +395,23 @@ class FabricLink(Base):
     )
 
 
+class HostPort(Base):
+    """A hypervisor's physical port, learnt at a passing check from OpenSM's
+    virtualization dump: a vport of it was a virtual function's port bound
+    to the host. A virtual function whose vport doesn't exist yet is placed
+    by them (specs/ha.md, Where a port is)."""
+
+    __tablename__ = "host_ports"
+
+    # The physical port's GUID, as 16 lower-case hex digits: one host's at a
+    # time, the last it was learnt for
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    host: orm.Mapped[str] = orm.mapped_column(sa.String(255), index=True)
+    learnt: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+
+
 class KnownSMPort(Base):
     """A port whose SM may hold the fabric's keys, so that OpenSM ignoring an
     SM there contests the fabric (specs/secured-profile.md, Allowed SM
@@ -423,6 +444,7 @@ _ADDED_COLUMNS = {
         "placements": "TEXT",
         "held": "TEXT",
         "held_term": "INTEGER NOT NULL DEFAULT 0",
+        "adapter_links": "TEXT",
     },
     "nodes": {
         "port_guids": "TEXT",
