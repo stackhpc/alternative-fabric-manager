@@ -532,10 +532,14 @@ missing: OpenSM is master, the check is contested by no SM, and it finds
 no enforcement error, no unanswered key, no failing apply, and nothing
 else that fails a check. Any other failure holds every job, as above. A
 partial check records, from OpenSM's SA after the sweep it follows, the
-GUIDs OpenSM **discovered** in that sweep: each port's GUID, and the alias
-GUIDs registered on it, which carry virtual functions' GUIDs. A port that
-OpenSM discovered isn't behind a missing switch, since OpenSM discovers
-nothing through a switch it can't reach.
+GUIDs OpenSM **discovered** in that sweep: the port GUID of each NodeRecord.
+OpenSM 5.17 runs ConnectX virtual functions as vports of their physical
+port (IB virtualization), and its SA lists each active vport as a node of
+its own, with its own LID, so a virtual function's GUID is discovered the
+same way; the SA answers NodeRecords without an SA_Key. A port that OpenSM
+discovered isn't behind a missing switch, since OpenSM discovers nothing
+through a switch it can't reach, and a vport is discovered only through
+its physical port.
 
 **Possibly held memberships.** `applied` keeps a map from pkey to the
 GUIDs, and keyword members, that some port may still hold:
@@ -1376,8 +1380,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       secured profile says. Their hardware runs in HA mode are still to
       come.
 - [ ] Complete jobs on a partial check (see While a switch is missing):
-      the discovered GUIDs, alias GUIDs included, from OpenSM's SA after
-      each sweep, the possibly held memberships, tainted pkeys, and a
+      the discovered GUIDs, vports included, from OpenSM's SA NodeRecords
+      after each sweep, the possibly held memberships, tainted pkeys, and a
       failover test with a leaf paused in the fake fabric.
 - [ ] Retry deadlocks and constraint races in the request path, as Galera's
       certification conflicts and two instances racing for a pkey or GUID
@@ -1462,14 +1466,18 @@ leader's OpenSM has swept its membership with the whole fabric in view.
   20 s for `T_self` and 300 s for the job timeout right?
 - Do the OpenSM nodes run the control plane, so they reach the database
   VIP, or are they separate hosts that need database access opened to them?
-- While a switch is missing: does OpenSM 5.17's SA list a virtual
-  function's GUID as an alias GUID (GUIDInfo records) of the port that
-  carries it, on our adapters and firmware, and can the manager read it
-  with the SA_Key the hardening sets? Without it, a virtual function's
-  GUID is never discovered, and its jobs wait for a whole fabric, as
-  today; bare metal ports and empty networks still complete. And does
-  OpenSM set any port's tables through a switch it hasn't discovered in
-  that sweep?
+- While a switch is missing: does OpenSM set any port's tables through a
+  switch it hasn't discovered in that sweep? Does the SA drop a lost
+  port's NodeRecord, and its vports', at the sweep that loses it, or keep
+  it until later? Is a vport that shares its physical port's LID
+  (`IsLidRequired` 0) in the SA's NodeRecords too? Does OpenSM name the
+  vport's GUID when it can't set a vport's pkey table? Seen on the
+  DevStack's ConnectX-5s, with OpenSM 5.17.2 and an instance booted on a
+  virtual function: Nova set the VF's GUID to the port's client ID's; the
+  SA listed it as a NodeRecord of its own, with its own LID, read without
+  an SA_Key; the physical port's GUIDInfo records held only its own GUID;
+  and OpenSM rewrote `/var/log/opensm-virtualization.dump` when the vport
+  appeared, mapping it to its physical port and index, ACTIVE.
 
 ## Future improvements
 
