@@ -104,11 +104,31 @@ how many checks in a row have seen each switch: `[opensm] confirm_checks`,
   that a job's port gives (Lost ports and jobs). That can happen for a
   spine; a leaf whose adapters are reached only through it never shows it
   (What stays manual). A switch whose links are up but which doesn't
-  answer stays, and holds jobs, since OpenSM can't program it.
+  answer stays, and holds jobs, since OpenSM can't program it. The
+  evidence is the check's own verify, never an older one, so a link that
+  came back up since isn't missed.
+- **A switch row that doesn't answer, behind a link that's up,** fails
+  the check, expected or not, until it answers or an operator runs
+  `--release-port` for it: it may forward with stale pkey tables, as a
+  hung expected switch may. So a spine dropped while its links were down
+  that comes back with its agent hung holds jobs again, rather than
+  letting them complete past it. An adapter answering as a switch that
+  then refuses its key holds the fabric the same way, as a lost
+  non-Neutron port does (Lost ports and jobs), and the alarm names it.
 
 Nothing is added, dropped or re-recorded while the check couldn't query
-the fabric, the last check was contested, or OpenSM isn't master. In HA
-mode these are leader writes, behind the leader fence.
+the fabric, which includes a verify that ran out of time (part of the
+switches would look like all of them, and a switch it didn't reach like
+one that's gone), the check was contested, or OpenSM isn't master; the
+counts start again. Contested is the check's own finding (another master,
+or an SM the SA records that may hold the keys), not the manager's
+lasting flag, which only a passing check clears: a fabric with no
+expected switches yet can't pass, so with the flag the list could never
+be recorded, and a check that sees no other SM is evidence enough for a
+list of switches, which no SM's sweep changes. A check that fails for
+the scoped verify of a job's ports running out of time fails as a check
+whose query failed. In HA mode these are leader writes, behind the
+leader fence.
 
 ## The per-port M_Key turn-on, and turn-off
 
@@ -129,8 +149,18 @@ that block it.
 **Applying.** At a check that passes with no open job, while the target
 differs from what OpenSM runs with, the manager restarts OpenSM so that
 its start applies it, at most once an hour (the last attempt kept in
-`state`), so that a start that keeps falling back isn't repeated every
-check. A busy cloud may have no quiet check: once a day has passed since
+`state`, written only when a restart is made), so that a start that keeps
+falling back isn't repeated every check. A deferred job isn't open here:
+it waits for another object, perhaps for days, and isn't applied until it
+stops waiting, so a restart can't affect it. A leader held by a freeze
+doesn't apply, since a freeze keeps OpenSM where it is; it applies once
+the freeze ends. A start that falls back to the target OpenSM ran on,
+because its verify failed, counts: its log rises from a warning to an
+error at the second in a row, and the third in a row on a turn-on is
+recorded as a failed turn-on, with the target set back to off, which
+OpenSM still runs with, so nothing moves and it stops restarting. A
+turn-off keeps retrying hourly: it's the safe direction, and the one a
+removed group needs. A busy cloud may have no quiet check: once a day has passed since
 the target changed, it applies at a passing check whatever the jobs, and
 logs that it does. The part-way turn-on's retries (Turning it on) come
 under the same hourly cap, with OpenSM left running on the target between
@@ -155,7 +185,9 @@ plain hash of a configuration with a key set by hand would let anyone who
 sees it test guesses of the key). The hash is never shown. While it's
 recorded, nothing arms again: a change of configuration, or
 `--confirm-fabric`, clears it. `--port-key-states` shows whether one is
-recorded, and the arming's blocking reason, beside the ports. So a fabric that can't be turned on isn't
+recorded, and what clears it, and the arming's blocking reason, beside
+the ports. `--confirm-fabric` arms in HA mode under the same epoch rule as
+the leader's checks. So a fabric that can't be turned on isn't
 re-keyed in a loop, across restarts and takeovers alike. The record is
 logged at every start, with what to check.
 
