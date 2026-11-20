@@ -200,6 +200,22 @@ def test_reach_counts_switches_from_a_port_that_is_up(driver):
     assert run["environment"] == {"AFM_M_KEY": "0x1"}
 
 
+def test_reach_counts_only_the_expected_switches_found(driver):
+    driver.m_key = lambda: "0x1"
+    driver.client.probe = (
+        IBSTAT_UP
+        + b"===\n"
+        + SWITCHES
+        + b'Switch\t: 0x0000000000000053 ports 8 "New" base port 0 lid 9\n'
+    )
+    driver.expected_switches = lambda: {0xEC0D9A0300B12560}
+    assert driver.reach() == 1
+    # Until any switch is expected, every switch counts.
+    driver._reach = (None, float("-inf"))
+    driver.expected_switches = set
+    assert driver.reach() == 2
+
+
 def test_with_per_port_rows_reach_counts_the_probers_switches(driver):
     # ibswitches -y with one key can't pass a re-keyed port.
     driver.m_key = lambda: "0x1"

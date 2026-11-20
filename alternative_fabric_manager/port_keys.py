@@ -574,9 +574,17 @@ def keys_to_try(holds, target_on, infrastructure, nothing_derived, own_port=Fals
     "m_key"
 
     This is what keeps the old key from tenants (specs/secured-profile.md,
-    The prober):
-    - infrastructure, this host's own port or a switch's port 0, which no
-      tenant controls, gets both;
+    The prober, as specs/zero-touch.md changes it):
+    - this host's own port (own_port), which nothing else can answer as,
+      gets both, whatever its row says;
+    - a switch's port 0 (infrastructure) gets both too, except that with
+      the target on and anything able to hold a derived key, it gets m_key
+      only if its row says m_key. A row is a switch's because its NodeInfo
+      said so, which an adapter with custom firmware could say too, and
+      OpenSM itself would send such a row only its derived key, since only
+      a guid2mkey entry, which a row holding m_key alone gets, names the
+      stored M_Key. So the prober sends nothing OpenSM wouldn't, and an
+      unknown switch row gets its derived key alone, as a tenant's does;
     - otherwise the derived key, whenever the target is on or the row says
       derived;
     - m_key only if the row says m_key, or the target is off (every port is
@@ -584,22 +592,15 @@ def keys_to_try(holds, target_on, infrastructure, nothing_derived, own_port=Fals
       nothing_derived (nothing can hold a derived key yet).
     The key the row records goes first, so that a port on m_key during a
     slow transition isn't sent a wrong key at every check; an unknown row
-    tries its derived key first. So with the target on, a tenant's port
-    recorded derived or unknown is never sent m_key once anything can hold
-    a derived key.
-
-    A switch is trusted by the GUID on its route, which an adapter that got
-    OpenSM to record a link under a confirmed switch's GUID can claim. So
-    with the target on and anything able to hold a derived key, a switch
-    recorded derived isn't sent m_key either: the real one never needs it
-    then. Only this host's own port (own_port), which nothing else can
-    answer as, keeps both keys whatever its row says.
+    tries its derived key first. So with the target on, a port recorded
+    derived or unknown, other than this host's own, is never sent m_key
+    once anything can hold a derived key.
     """
     if holds not in HOLDS:
         raise ValueError(f"holds must be one of {', '.join(HOLDS)}")
     if infrastructure:
         allowed = {DERIVED, M_KEY}
-        if not own_port and target_on and not nothing_derived and holds == DERIVED:
+        if not own_port and target_on and not nothing_derived and holds != M_KEY:
             allowed = {DERIVED}
     else:
         allowed = set()

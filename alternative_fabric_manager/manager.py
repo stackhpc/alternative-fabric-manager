@@ -1629,14 +1629,10 @@ class Manager:
         if fabric is None:
             return True, "No fabric to check"
         with self._lock, self.sessionmaker() as session:
-            # A pending switch isn't expected until it's confirmed again.
+            # pending, which an older version wrote, is ignored: nothing is
+            # pending any more (specs/zero-touch.md).
             expected = {
-                int(s.guid, 16)
-                for s in session.scalars(
-                    sa.select(db.ExpectedSwitch).where(
-                        db.ExpectedSwitch.pending.is_(False)
-                    )
-                )
+                int(s.guid, 16) for s in session.scalars(sa.select(db.ExpectedSwitch))
             }
             # HA: the other nodes' ports, whose SMs may hold the keys
             managed = {}
@@ -1694,28 +1690,20 @@ class Manager:
         # A cache that can't be read stops only the turn-on, not the
         # switches' confirmation.
         fold_problem = keeper.fold_running()
-        # The prober follows any row that answers as a switch, which an
-        # adapter can: one it finds that wasn't confirmed or pending before
-        # is recorded as pending, which nothing trusts, for the operator to
-        # check, and is confirmed only when a later run finds it again.
-        # ibswitches' switches are confirmed at once, as they always were.
-        prober = keeper.uses_prober()
-        known = keeper.recorded_switches() if prober else set()
+        # No switch is pending: whatever answers as one is recorded, since
+        # the list is only what a complete fabric has (specs/zero-touch.md).
         confirmation = port_keeper.Confirmation()
-        fabric = self._fabric(keeper.switches())
+        probed = keeper.switches()
+        fabric = self._fabric(None if probed is None else set(probed))
         if fabric is None:
             return confirmation
         found = sorted(fabric.switches)
-        pending = [guid for guid in found if guid not in known] if prober else []
         with self._lock, self.sessionmaker() as session:
             session.execute(sa.delete(db.ExpectedSwitch))
             for guid in found:
-                session.add(
-                    db.ExpectedSwitch(guid=f"{guid:016x}", pending=guid in pending)
-                )
+                session.add(db.ExpectedSwitch(guid=f"{guid:016x}", pending=False))
             session.commit()
         confirmation.switches = found
-        confirmation.pending = pending
         if confirmation.switches:
             keeper.arm(confirmation, fold_problem)
         return confirmation

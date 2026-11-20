@@ -21,10 +21,6 @@ from alternative_fabric_manager import config as config_mod
 from alternative_fabric_manager import manager as manager_mod
 
 DEFAULT_CONFIG = "/etc/alternative-fabric-manager/afm.conf"
-# How --confirm-fabric marks a switch it found for the first time
-PENDING_MARK = (
-    " (new: not trusted until you confirm the fabric again; check that it's a switch)"
-)
 
 
 def main(argv=None):
@@ -308,15 +304,7 @@ def main(argv=None):
         if not confirmation.switches:
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in confirmation.switches:
-            mark = PENDING_MARK if guid in confirmation.pending else ""
-            print(f"0x{guid:016x}{mark}")
-        if confirmation.pending:
-            print(
-                f"{len(confirmation.pending)} switches are new, and pending: none "
-                "is expected or trusted until --confirm-fabric finds it again, "
-                "so check that each is a switch, not an adapter that answers as "
-                "one, and run it again"
-            )
+            print(f"0x{guid:016x}")
         if confirmation.note:
             print(confirmation.note)
         if confirmation.problems:
@@ -496,6 +484,7 @@ def _serve_ha(config, args):
     driver.reach_switches = lambda: manager.port_keeper.reach_switches(
         ha_docker.REACH_TIMEOUT, driver.reach_name
     )
+    driver.expected_switches = manager.port_keeper.expected_switches
     coordinator = coordinator_mod.Coordinator(
         config,
         lease_mod.GaleraLease(sessionmaker),

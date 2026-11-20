@@ -149,6 +149,18 @@ def merge_verify(fresh, result):
     return changed
 
 
+def expected_guids(session):
+    """The expected switches' GUIDs as recorded, with the node GUIDs kept
+    beside them, so that a switch found by either source counts"""
+    guids = set()
+    for row in session.scalars(sa.select(db.ExpectedSwitch)):
+        guids.add(int(row.guid, 16))
+        node_guid = getattr(row, "node_guid", None)
+        if node_guid:
+            guids.add(int(node_guid, 16))
+    return guids
+
+
 def _diff(old, new):
     """What new changed or added, by key"""
     return {key: value for key, value in new.items() if old.get(key) != value}
@@ -185,13 +197,11 @@ class _Evidence:
 
 @dataclasses.dataclass
 class Confirmation:
-    """What --confirm-fabric did: the switches it found, those of them it
-    recorded as pending (found by the prober for the first time, so not
-    trusted until a later run finds them again), and, with the group named,
-    whether it armed the turn-on, a line to say, and why it didn't arm it"""
+    """What --confirm-fabric did: the switches it recorded as expected,
+    and, with the group named, whether it armed the turn-on, a line to say,
+    and why it didn't arm it"""
 
     switches: list = dataclasses.field(default_factory=list)
-    pending: list = dataclasses.field(default_factory=list)
     armed: bool = False
     note: str | None = None
     problems: list = dataclasses.field(default_factory=list)
@@ -200,10 +210,13 @@ class Confirmation:
 @dataclasses.dataclass
 class CheckOutcome:
     """What the per-port M_Key part of a fabric check found: the switches
-    the prober reached, for _judge, or None to ask ibswitches as before;
-    and why the check fails, if it does"""
+    the prober reached, for _judge, or None to ask ibswitches as before,
+    with each one's node GUID, by which the expected switches are
+    translated when their source changes; and why the check fails, if it
+    does"""
 
     switches: set | None = None
+    nodes: dict = dataclasses.field(default_factory=dict)
     problems: list = dataclasses.field(default_factory=list)
 
 
@@ -223,8 +236,6 @@ class PortKeeper:
         # The last full verify since OpenSM started: (result, monotonic
         # time it began)
         self._last_full = None
-        # The confirmed switches the last full verify followed
-        self._full_trusted = None
         self._evidence = {}
         self._held = set()
         self._changing = None
@@ -302,16 +313,6 @@ class PortKeeper:
         m_key = self.manager._key("m_key") or keys["m_key"]
         return port_keys.parse_key(m_key), port_keys.parse_key(keys["m_key_base"])
 
-    def _trusted(self, session):
-        """The switches an operator confirmed, which alone may be sent both
-        keys, and routed through: not the pending ones"""
-        return {
-            int(row.guid, 16)
-            for row in session.scalars(
-                sa.select(db.ExpectedSwitch).where(db.ExpectedSwitch.pending.is_(False))
-            )
-        }
-
     # Writing the rows: short transactions on fresh rows
 
     def _merge(self, result):
@@ -345,7 +346,6 @@ class PortKeeper:
         scope,
         helper,
         bound,
-        follow_unconfirmed=False,
         helper_name=None,
     ):
         """A verify within bound seconds, repeated while it learns that a
@@ -353,12 +353,10 @@ class PortKeeper:
         that OpenSM's cache has just listed, whose NodeInfo no Get has seen
         yet, are reached one level of switches at a time
 
-        Only the switches an operator confirmed are routed through, unless
-        follow_unconfirmed, which --confirm-fabric alone passes. helper_name
-        names the helper container, the prober's by default.
+        Every row that answers as a switch is routed through
+        (specs/zero-touch.md). helper_name names the helper container, the
+        prober's by default.
         """
-        with self._session() as session:
-            trusted = self._trusted(session)
         m_key, base = self._m_keys()
         named = {"name": helper_name} if helper_name else {}
         run = self.driver.prober(helper=helper, **named)
@@ -375,8 +373,6 @@ class PortKeeper:
                 scope=scope,
                 now=_now(),
                 deadline=deadline,
-                trusted_switches=trusted,
-                follow_unconfirmed=follow_unconfirmed,
             )
             # Only a switch that the next round would route through helps.
             learned = {
@@ -385,7 +381,6 @@ class PortKeeper:
                 if guid in ports
                 and ports[guid].switch is not True
                 and result.ports[guid].switch is True
-                and (follow_unconfirmed or guid in trusted)
             }
             if not learned or not result.complete:
                 break
@@ -873,7 +868,6 @@ class PortKeeper:
             applied = session.get(db.Applied, 1)
             generation = (applied.generation or 0) if applied is not None else 0
             jobs = self._job_guids(session, ports)
-            trusted = frozenset(self._trusted(session))
             neutron = {
                 guid.lower() for guid in session.scalars(sa.select(db.Port.guid))
             }
@@ -894,13 +888,8 @@ class PortKeeper:
 
         began = time.monotonic()
         results = []
-        # A full verify is due after an interval, and when the confirmed
-        # switches have changed, since it followed only those.
-        full = (
-            self._last_full is None
-            or began - self._last_full[1] >= interval
-            or self._full_trusted != trusted
-        )
+        # A full verify is due after an interval.
+        full = self._last_full is None or began - self._last_full[1] >= interval
         if full:
             try:
                 result = verify(prober.FULL, ports, links)
@@ -911,12 +900,11 @@ class PortKeeper:
                 full = False
             else:
                 self._last_full = (result, began)
-                self._full_trusted = trusted
                 LOG.info("Verified every port's M_Key: %s", result)
         if not full:
             # The switches, and the rows no Get has yet shown to be one or
-            # not, so that a switch confirmed since the last full verify is
-            # found and followed
+            # not, so that a switch new since the last full verify is found
+            # and followed
             result = verify(
                 {guid for guid, row in ports.items() if row.switch is not False},
                 ports,
@@ -949,7 +937,10 @@ class PortKeeper:
         with self._session() as session:
             ports, _links = port_keys.load(session)
         self._progress(ports, target)
-        outcome = CheckOutcome(switches=set(result.switches))
+        outcome = CheckOutcome(
+            switches=set(result.switches),
+            nodes={guid: result.ports[guid].node_guid for guid in result.switches},
+        )
         outcome.problems = self._problems(ports, neutron, results)
         return outcome
 
@@ -1037,38 +1028,12 @@ class PortKeeper:
             LOG.warning("Per-port M_Keys are %s on every reachable port", _on(target))
         self._changing = count
 
-    def uses_prober(self):
-        """Whether --confirm-fabric finds the switches with the prober,
-        which follows any row that answers as a switch, rather than with
-        ibswitches"""
-        if not self.active():
-            return False
-        with self._session() as session:
-            return self._has_rows(session)
-
-    def confirmed_switches(self):
-        """The switches an operator confirmed, pending ones aside"""
-        with self._session() as session:
-            return self._trusted(session)
-
-    def recorded_switches(self):
-        """The switches the last --confirm-fabric recorded, pending ones
-        included: one of these found again isn't pending any more"""
-        with self._session() as session:
-            return {
-                int(row.guid, 16)
-                for row in session.scalars(sa.select(db.ExpectedSwitch))
-            }
-
     def switches(self):
-        """The switches the prober reaches, for --confirm-fabric, or None
-        to ask ibswitches as before: beside the running OpenSM, writing no
-        rows
+        """The switches the prober reaches, for --confirm-fabric, with their
+        node GUIDs, or None to ask ibswitches as before: beside the running
+        OpenSM, writing no rows
 
-        It follows every row that answers as a switch, confirmed or not,
-        so that new switches can be confirmed, and a full verify, so that
-        rows not yet known to be switches are found; which keys each port
-        is sent still follows the confirmed switches.
+        A full verify, so that rows not yet known to be switches are found.
         """
         if not self.active():
             return None
@@ -1086,23 +1051,28 @@ class PortKeeper:
             scope=prober.FULL,
             helper=False,
             bound=self.config.port_verify_interval,
-            follow_unconfirmed=True,
         )
         if result.own_port_lost:
             raise ReloadError("this host's port answers neither M_Key")
         if not result.complete:
             # Part of the list would replace the whole of it.
             raise ReloadError("the prober's discovery of the switches ran out of time")
-        return set(result.switches)
+        return {guid: result.ports[guid].node_guid for guid in result.switches}
 
     def reach_switches(self, bound, helper_name=None):
-        """HA mode's reach probe: the switches this node's port reaches by
-        the prober along the recorded links, with each port's key, within
-        bound seconds; or None to ask ibswitches, as without rows
+        """HA mode's reach probe: the expected switches this node's port
+        reaches by the prober along the recorded links, with each port's
+        key, within bound seconds; or None to ask ibswitches, as without
+        rows
 
-        It writes no rows: a candidate isn't the leader. Rows a check
-        interval behind the leader's are sent both keys where a verify
-        would send them (specs/secured-profile.md, HA mode).
+        It follows every switch, but counts only the expected ones, so that
+        a new switch, or an adapter answering as one, never makes a
+        candidate reach more (specs/zero-touch.md). Until any is recorded,
+        as on a new deployment, it counts every switch, since otherwise no
+        candidate would reach any, and none would be eligible. It writes no
+        rows: a candidate isn't the leader. Rows a check interval behind
+        the leader's are sent both keys where a verify would send them
+        (specs/secured-profile.md, HA mode).
         """
         if self.config.driver != "managed":
             return None
@@ -1110,6 +1080,7 @@ class PortKeeper:
             ports, links = port_keys.load(session)
             target = port_keys.load_running(session)
             recorded = port_keys.load_fingerprint(session)
+            expected = expected_guids(session)
         if not ports:
             return None
         result = self._verify(
@@ -1124,7 +1095,20 @@ class PortKeeper:
         )
         if result.own_port_lost:
             return set()
-        return set(result.switches)
+        found = set(result.switches)
+        if not expected:
+            return found
+        return {
+            guid
+            for guid in found
+            if guid in expected or result.ports[guid].node_guid in expected
+        }
+
+    def expected_switches(self):
+        """The expected switches' GUIDs, node GUIDs included, for HA
+        mode's reach probe with ibswitches, which counts only these"""
+        with self.manager._lock, self.manager.sessionmaker() as session:
+            return expected_guids(session)
 
     # Sweeps and jobs, in the manager's session
 
@@ -1263,7 +1247,6 @@ class PortKeeper:
                 return
             ports, links = port_keys.load(session)
             recorded = port_keys.load_fingerprint(session)
-            confirmed = self._trusted(session)
         problems = confirmation.problems
         if fold_problem is not None:
             problems.append(fold_problem)
@@ -1279,23 +1262,13 @@ class PortKeeper:
                 "the stored per-port M_Key base isn't the one the ports were "
                 "keyed from (its fingerprint differs)"
             )
-        if confirmation.pending:
-            problems.append(
-                f"switches {_guids(confirmation.pending)} are pending: check the "
-                "list above, and run --confirm-fabric again"
-            )
         if not links:
             problems.append(
                 "no links are recorded: OpenSM's cache hasn't listed the fabric "
                 "yet, so OpenSM couldn't find the ports"
             )
-        elif not confirmed:
-            problems.append(
-                "no switches are confirmed, so the prober can't reach the ports "
-                "beyond this host's"
-            )
         else:
-            problems += self._turn_on_verify(ports, links, recorded, confirmed)
+            problems += self._turn_on_verify(ports, links, recorded)
         if problems:
             return
         with self._session() as session:
@@ -1307,7 +1280,7 @@ class PortKeeper:
             "Per-port M_Keys are armed: the next restart of the manager turns them on"
         )
 
-    def _turn_on_verify(self, ports, links, recorded, confirmed):
+    def _turn_on_verify(self, ports, links, recorded):
         """Why the prober, beside the running OpenSM, doesn't find every
         recorded port behind an up link holding the stored M_Key, if it
         doesn't"""
@@ -1341,16 +1314,6 @@ class PortKeeper:
                 "every recorded port behind an up link must answer the stored "
                 "M_Key, with protection level 2"
             )
-            unconfirmed = sorted(
-                guid
-                for guid, row in result.ports.items()
-                if row.switch is True and guid not in confirmed
-            )
-            if unconfirmed:
-                line += (
-                    f"; switches {_guids(unconfirmed)} aren't confirmed, so "
-                    "nothing beyond them was reached"
-                )
             problems.append(
                 line + ", and these don't: " + ", ".join(f"0x{g:016x}" for g in failing)
             )

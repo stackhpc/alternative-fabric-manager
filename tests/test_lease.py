@@ -352,10 +352,10 @@ def test_status_names_the_manager_to_check_while_an_unfreeze_is_pending(lease):
     assert any("forced" in line for line in lines)
 
 
-def test_a_pending_switch_isnt_expected(lease):
-    # Only a switch an operator has confirmed counts towards a node's reach.
+def test_a_pending_switch_is_expected(lease):
+    # pending, which an older version wrote, is ignored (specs/zero-touch.md).
     with lease.sessionmaker() as session:
         session.add(db.ExpectedSwitch(guid="0000000000000051"))
         session.add(db.ExpectedSwitch(guid="0000000000000052", pending=True))
         session.commit()
-    assert lease.expected_switches() == 1
+    assert lease.expected_switches() == 2
