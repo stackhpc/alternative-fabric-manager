@@ -60,8 +60,12 @@ Every change must keep these; the reviews and tests are built around them.
 - **A job completes only on evidence:** a sweep, started after a passing
   fabric check that followed any contested one, in which OpenSM had the
   job's effect (relative to its own object), followed by a passing check
-  taken after the sweep, with OpenSM still running. Fail closed: an error
-  that can't be traced to a port holds every job of the sweep.
+  taken after the sweep, with OpenSM still running. While expected
+  switches are missing, a check that fails only on them counts for a
+  grant whose ports that check placed, on pkeys no port may hold stale;
+  every other job waits (specs/ha.md, While a switch is missing). Fail
+  closed: an error that can't be traced to a port holds every job of the
+  sweep.
 - **A 400 is final for networking-mlnx.** Only answer 400 for requests that
   can never succeed. A request that may succeed later waits (`deferred`) or
   gets 503 (frozen). A DELETE always gets a job, never 404.
