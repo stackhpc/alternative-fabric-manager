@@ -1010,6 +1010,7 @@ class PortKeeper:
                 # yet: ibswitches as before.
                 return None
             target = port_keys.load_running(session)
+            expected = expected_guids(session)
             recorded = port_keys.load_fingerprint(session)
             applied = session.get(db.Applied, 1)
             generation = (applied.generation or 0) if applied is not None else 0
@@ -1098,7 +1099,7 @@ class PortKeeper:
             results=results,
             full=full,
         )
-        outcome.problems = self._problems(ports, neutron, results)
+        outcome.problems = self._problems(ports, neutron, results, expected)
         if not full and not outcome.complete:
             # A full verify's own rule says so below; the switches' or the
             # jobs' verify running out of time means ports it didn't reach
@@ -1313,7 +1314,17 @@ class PortKeeper:
                         guids.add(guid)
         return guids
 
-    def _problems(self, ports, neutron, results):
+    @staticmethod
+    def _excused(guid, result, expected):
+        """Whether a port the verify never sent a key to is behind only
+        expected switches that are missing, or switches whose links are
+        down"""
+        blocking = result.unrouted.get(guid)
+        return bool(blocking) and all(
+            switch in expected or switch in result.link_down for switch in blocking
+        )
+
+    def _problems(self, ports, neutron, results, expected=frozenset()):
         """Why the fabric check fails, as far as per-port keys go"""
         problems = []
         if any(result.own_port_lost for result in results):
@@ -1350,9 +1361,11 @@ class PortKeeper:
             for row in ports.values()
             if row.switch is not True
             and row.guid not in result.link_down
-            # Behind a switch that didn't answer, as a missing one, it was
-            # never sent a key: the missing switch fails the check instead.
-            and row.guid not in result.unrouted
+            # Behind an expected switch that's missing, or one whose link
+            # is down, it was never sent a key: the missing switch fails the
+            # check instead. Behind any other switch that didn't answer, it
+            # still counts.
+            and not self._excused(row.guid, result, expected)
             and port_keys.guid_text(row.guid) not in neutron
             and not row.released
             and row.guid not in result.keyed

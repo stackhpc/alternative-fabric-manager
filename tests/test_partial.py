@@ -941,3 +941,25 @@ def test_prober_mode_has_partial_checks_and_completes_grants(world):  # noqa: F8
     world.sim.ports[HV].key = 0x3333333333333333
     assert not world.check()
     assert not world.applied().check_partial
+
+
+def test_only_missing_expected_or_down_switches_excuse_a_port(world):  # noqa: F811
+    from alternative_fabric_manager import port_keeper, prober
+
+    turned_on(world)
+    world.sim.down |= {(S1, 2), (S2, 1)}
+    world.check()
+    result = world.keeper()._last_full[0]
+    # T3 is behind S2, which didn't answer.
+    assert result.unrouted[0xB3] == {S2}
+    excused = port_keeper.PortKeeper._excused
+    assert excused(0xB3, result, {S1, S2})
+    # Behind a switch that isn't expected, with its link state unknown, a
+    # port still counts as one that didn't answer its key.
+    unknown = prober.VerifyResult(ports={}, unrouted={0xB3: {S2}})
+    assert not excused(0xB3, unknown, {S1})
+    # Or with its link down
+    down = prober.VerifyResult(ports={}, unrouted={0xB3: {S2}}, link_down={S2})
+    assert excused(0xB3, down, {S1})
+    # A port that was routed isn't excused at all.
+    assert not excused(0xB4, unknown, {S1, S2})

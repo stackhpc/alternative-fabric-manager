@@ -341,8 +341,8 @@ class VerifyResult:
     own_link_up: bool | None = None
     unrecorded: list = dataclasses.field(default_factory=list)
     # Rows the recorded links reach only through switches that didn't
-    # answer, never sent a key
-    unrouted: set = dataclasses.field(default_factory=set)
+    # answer, never sent a key, each with those switches on its route
+    unrouted: dict = dataclasses.field(default_factory=dict)
     complete: bool = True
     gets: int = 0
     batches: int = 0
@@ -678,16 +678,24 @@ class _Verify:
 
     def _unrouted(self):
         """The rows the recorded links reach only through switches that
-        didn't answer: never sent a key, so not ports that refused one, as
-        those behind a missing switch are (specs/ha.md, While a switch is
-        missing)"""
+        didn't answer, with the switches that didn't answer on each one's
+        route: never sent a key, so not ports that refused one, as those
+        behind a missing switch are (specs/ha.md, While a switch is
+        missing). Which of those switches excuse it is the caller's."""
+        own = self.result.own_guid
         switches = {guid for guid, row in self.rows.items() if row.switch is True}
-        possible = port_keys.all_routes(
-            self.links, self.result.own_guid, switches | {self.result.own_guid}
-        )
-        self.result.unrouted = {
-            guid for guid in possible if guid in self.rows and guid not in self._routes
-        }
+        possible = port_keys.all_routes(self.links, own, switches | {own})
+        unrouted = {}
+        for guid, hop in possible.items():
+            if guid not in self.rows or guid in self._routes:
+                continue
+            blocking = set()
+            while hop is not None and hop.via not in (None, own):
+                if hop.via not in self.result.switches:
+                    blocking.add(hop.via)
+                hop = possible.get(hop.via)
+            unrouted[guid] = blocking
+        self.result.unrouted = unrouted
 
     def _linked(self, hops):
         """Probe the hops whose link is up, and return them"""
