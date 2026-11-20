@@ -30,8 +30,8 @@ echo "$*" >> "$dir/invocations"
 pid=$PPID
 i=0
 while [ "$i" -lt 6 ] && [ "$pid" -gt 1 ]; do
-    tr '\0' ' ' < "/proc/$pid/cmdline" >> "$dir/ancestors"
-    echo >> "$dir/ancestors"
+    tr '\0' ' ' < "/proc/$pid/cmdline" >> "$dir/ancestors.$$"
+    echo >> "$dir/ancestors.$$"
     pid=$(awk '{ print $4 }' "/proc/$pid/stat")
     i=$((i + 1))
 done
@@ -203,7 +203,13 @@ def test_keys_come_only_from_the_environment(fakes):
     result = run_script(fakes, gets)
     assert result.returncode == 0
     assert f"{KEY:016x}" not in prober.SCRIPT
-    ancestors = (fakes / "ancestors").read_text().splitlines()
+    # A file per fake smpquery: the Gets run in parallel, and lines appended
+    # to one file would interleave.
+    ancestors = [
+        line
+        for path in sorted(fakes.glob("ancestors.*"))
+        for line in path.read_text().splitlines()
+    ]
     assert ancestors
     # smpquery's own command line holds the key, as the spec accepts, and so
     # does timeout's, which runs it; nothing above them does: not the

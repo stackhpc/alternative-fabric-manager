@@ -78,6 +78,22 @@ def _fresh_server_database(url):
     return url
 
 
+@pytest.fixture(autouse=True)
+def _patient_server_engines(monkeypatch):
+    """Server engines with a 30 s read timeout rather than the production
+    call timeout of a few seconds: a shared CI runner's MariaDB can stall
+    a COMMIT for longer than that, and no unit test relies on the timeout
+    firing (test_db.py raises its errors itself)."""
+    if not SERVER_URL:
+        return
+    make = db._make_server_engine
+
+    def patient(url, call_timeout=db.CALL_TIMEOUT):
+        return make(url, max(call_timeout, 30))
+
+    monkeypatch.setattr(db, "_make_server_engine", patient)
+
+
 @pytest.fixture
 def config(tmp_path):
     return config_mod.Config(
