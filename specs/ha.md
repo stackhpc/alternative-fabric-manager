@@ -538,10 +538,12 @@ last set:
   new member, full or limited, could talk through the hung leaf's stale
   table and the spines. OpenSM applies a rendered grant at its sweep
   whether or not the job completes, so that leak exists today too; what
-  completion adds is Neutron and Nova treating the port as up, so a
-  completed revocation, or a completed grant of such a pkey, would let
-  the exposure run on unbounded, where a waiting job is bounded by its
-  timeout;
+  completion adds is Neutron and Nova treating the port as up: a
+  completed grant of such a pkey would let a new instance use the
+  exposure, where a waiting grant fails with its timeout, and Nova's
+  boot with it. A revocation's wait bounds nothing, since a timed-out
+  delete leaves the stale holder as it was, but completing it would tell
+  Neutron the port is gone;
 - a **grant** to such a port hasn't happened either, so completing it
   would say that a port works when it doesn't.
 
@@ -578,14 +580,18 @@ maps each vport GUID to its physical port, index and state. A vport is
 placed if the dump read with the scan lists its GUID exactly once, ACTIVE,
 on a placed physical port; ACTIVE is OpenSM's view, not proof that the
 guest's link works. A grant needs its GUID placed, the same way, by both
-the check its sweep started after and the check after the sweep, with no
-OpenSM sweep start logged from the first check's scan to the end of the
-second's: OpenSM then knew the port, in the same place, throughout the
-watched sweep, so the sweep set it or logged an error, and a port that
-appeared or moved meanwhile, such as a vport created after the sweep
-began, waits for the next one. The checks keep only the placements of
-open grants' GUIDs, so that their cost, and their writes, follow the
-jobs, not the fabric.
+the last scan before its sweep, in the current term, and the check after
+the sweep, with no OpenSM sweep start logged from the first scan to the
+end of the second other than the watched sweep's own: OpenSM then knew
+the port, in the same place, throughout the watched sweep, so the sweep
+set it or logged an error, and a port that appeared or moved meanwhile,
+such as a vport created after the sweep began, waits for the next one.
+For a vport, "the same way" means the same dump entry in both reads. The
+leader keeps its last scan's placements in memory, since a request's
+grant usually didn't exist when that scan ran, and records, with each
+sweep in `applied`, those of the GUIDs the sweep's grants involve; after
+a takeover, the last scan is the new leader's, never the old one's. So
+the records, and the writes, follow the jobs, not the fabric.
 
 **Possibly held memberships.** `applied` keeps a map from pkey to the
 (GUID, membership type, host) entries that some port may hold, the host
@@ -596,18 +602,22 @@ stale is never granted on a partial check:
   compare-and-set on its term, before it writes the body to OpenSM's
   file, so that a body OpenSM may have read is in the map even if the
   manager crashes before recording its sweep;
-- a pkey is **tainted** while the map holds an entry that the latest
-  body doesn't: a GUID removed from it, or moved from full to limited. A
-  host is tainted likewise while the map holds an entry of its that the
-  latest body doesn't. Taint isn't pruned while the fabric is incomplete,
+- a pkey is **tainted** while the map holds a (GUID, membership type)
+  for it that the latest body doesn't: a GUID removed from it, or moved
+  from full to limited. A live migration keeps the pair, so it doesn't
+  taint the pkey. A **host** is tainted while the map holds a (GUID,
+  host) for it that the latest body doesn't: a port that left it, by
+  deletion, migration or rebinding. Taint isn't pruned while the fabric
+  is incomplete,
   since telling that a stale holder has been cleared needs evidence the
   partial check doesn't have;
 - the map is reset only at a passing check after a fresh sweep (below)
   with no unattributed error, and only if no expected switch was removed
   since the map was last reset: to the memberships of the latest body,
   plus the entries of every GUID that had a pkey error in that sweep, so
-  that one failing adapter doesn't keep every pkey tainted. After `--confirm-fabric` removes a switch, which may be a
-  hung one still forwarding, its ports' stale pkeys stay tainted, and only
+  that one failing adapter doesn't keep every pkey tainted. After
+  `--confirm-fabric` removes a switch, which may be a hung one still
+  forwarding, its ports' stale pkeys stay tainted, and only
   `--confirm-fabric --reset-held` resets the map, which the command's
   message names along with the pkeys it untaints.
 
@@ -630,12 +640,15 @@ after the sweep, no older than `2 × check_interval`, and:
    above, with no pkey error in the sweep, and the sweep had no
    unattributed error;
 3. no pkey it grants a membership in is tainted;
-4. the port's host isn't tainted, and no revocation job is open for
-   another port bound to it: a bare metal node with ports on two leaves,
-   one of them missing, may still hold the last tenant's pkeys on the
-   port behind it, and the new tenant's own port being placed says
-   nothing about that one. On a hypervisor a stale virtual function is
-   another instance's, so this costs only a wait.
+4. for a bare metal port (`binding:vnic_type` `baremetal`), its host
+   isn't tainted, and no revocation job is open for another port bound to
+   it: a node with ports on two leaves, one of them missing, may still
+   hold the last tenant's pkeys on the port behind it, and the new
+   tenant's own port being placed says nothing about that one. A
+   hypervisor's ports are exempt: a stale virtual function there is
+   another instance's, which the new instance doesn't get, and taint that
+   isn't pruned while the switch is missing would soon hold every busy
+   hypervisor's grants.
 
 | Request | On a partial check |
 | --- | --- |
@@ -1437,7 +1450,8 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       the check runs `ibswitches`), at the checks either side of the
       sweep, vports through OpenSM's virtualization dump; the possibly
       held memberships with their hosts, extended before each write, and
-      tainted pkeys and hosts; `--confirm-fabric --reset-held`; the
+      tainted pkeys and hosts; each port's `binding:vnic_type`, recorded
+      from the port networking-mlnx sends; `--confirm-fabric --reset-held`; the
       fresh sweep after a partial period; and a failover test with a leaf
       paused in the fake fabric. Revocations stay for a whole fabric until
       the open question on the SA below is answered on a fabric with more
