@@ -396,6 +396,17 @@ def validate(
             )
 
 
+def memberships(content):
+    """A partitions file's explicit memberships, as {pkey: {GUID:
+    membership}}, never its keywords"""
+    found = {}
+    for pkey, members, _line in _parse(content or ""):
+        for member, membership in members.items():
+            if isinstance(member, int):
+                found.setdefault(pkey, {})[member] = membership
+    return found
+
+
 def attribute(content, networks, ports):
     """Return which networks and ports a partitions file's contents are for
 
