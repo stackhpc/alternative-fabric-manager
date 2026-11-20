@@ -92,9 +92,12 @@ how many checks in a row have seen each switch: `[opensm] confirm_checks`,
   without per-port M_Key rows, and by the prober's GUIDs with them, which
   can differ. The source the list was recorded from is kept in `state`.
   When the check's source differs, each recorded switch is translated by
-  the node GUID the prober's NodeInfo gives beside its GUID; one the new
-  source can't match stays as it is, expected, and fails the check as
-  missing, so that a switch already missing isn't dropped by the change.
+  its node GUID, which each `expected_switches` row keeps beside the GUID
+  it was recorded by (from the prober's NodeInfo, or `ibswitches`' own),
+  so that the translation works both ways, as after `--forget-port-keys`;
+  one the new source can't match stays as it is, expected, and fails the
+  check as missing, so that a switch already missing isn't dropped by the
+  change.
 - **A missing switch** fails the check, as today. With rows, it's dropped
   once the prober shows every recorded link to it down, from the switch
   ports and adapters at its other ends: the same evidence of a link down
@@ -131,7 +134,10 @@ check. A busy cloud may have no quiet check: once a day has passed since
 the target changed, it applies at a passing check whatever the jobs, and
 logs that it does. The part-way turn-on's retries (Turning it on) come
 under the same hourly cap, with OpenSM left running on the target between
-them:
+them: their trigger is the target on and its success rule not yet met,
+since the target then equals what OpenSM runs with. Jobs meanwhile
+complete only on the per-port evidence they already need (each port
+answering its key, or showing its link down, after the sweep):
 
 - **single node:** it stops OpenSM, and the applier's next iteration
   starts it again, as after OpenSM stops;
@@ -144,10 +150,12 @@ started OpenSM on the previous target.
 
 **A failed turn-on** is set back, as today, and recorded in `state`, with
 the base's fingerprint and the configuration hash it failed under (in
-single node, the same canonical hash, as a plain SHA-256). While it's
+single node, the same HMAC, keyed by a secret in the database, since a
+plain hash of a configuration with a key set by hand would let anyone who
+sees it test guesses of the key). The hash is never shown. While it's
 recorded, nothing arms again: a change of configuration, or
-`--confirm-fabric`, clears it. `--port-key-states` shows it, and the
-arming's blocking reason, beside the ports. So a fabric that can't be turned on isn't
+`--confirm-fabric`, clears it. `--port-key-states` shows whether one is
+recorded, and the arming's blocking reason, beside the ports. So a fabric that can't be turned on isn't
 re-keyed in a loop, across restarts and takeovers alike. The record is
 logged at every start, with what to check.
 
