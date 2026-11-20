@@ -1112,3 +1112,17 @@ def test_only_missing_expected_or_down_switches_excuse_a_port(world):  # noqa: F
     assert excused(0xB3, down, {S1})
     # A port that was routed isn't excused at all.
     assert not excused(0xB4, unknown, {S1, S2})
+
+
+def test_a_port_behind_a_down_link_still_fails_a_whole_fabric(world):  # noqa: F811
+    from tests.test_port_keeper import expect
+
+    turned_on(world)
+    # S2 isn't an expected switch, and its link is down: no expected switch
+    # is missing, so T3 behind it is a port that didn't answer its key, as
+    # before, and the check doesn't pass.
+    expect(world, S1)
+    world.sim.down |= {(S1, 2), (S2, 1)}
+    assert not world.check()
+    assert "didn't answer their M_Keys" in world.applied().check_detail
+    assert not world.applied().check_partial

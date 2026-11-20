@@ -1011,6 +1011,12 @@ class PortKeeper:
                 return None
             target = port_keys.load_running(session)
             expected = expected_guids(session)
+            # The expected switches as recorded, by which the full verify's
+            # switches say whether any is missing
+            expected_rows = {
+                int(row.guid, 16)
+                for row in session.scalars(sa.select(db.ExpectedSwitch))
+            }
             recorded = port_keys.load_fingerprint(session)
             applied = session.get(db.Applied, 1)
             generation = (applied.generation or 0) if applied is not None else 0
@@ -1099,7 +1105,9 @@ class PortKeeper:
             results=results,
             full=full,
         )
-        outcome.problems = self._problems(ports, neutron, results, expected)
+        outcome.problems = self._problems(
+            ports, neutron, results, expected, expected_rows
+        )
         if not full and not outcome.complete:
             # A full verify's own rule says so below; the switches' or the
             # jobs' verify running out of time means ports it didn't reach
@@ -1315,16 +1323,22 @@ class PortKeeper:
         return guids
 
     @staticmethod
-    def _excused(guid, result, expected):
+    def _excused(guid, result, expected, missing=True):
         """Whether a port the verify never sent a key to is behind only
         expected switches that are missing, or switches whose links are
-        down"""
+        down, on its route: only while some expected switch is missing, so
+        that this can make a check partial at most, never passing
+        (specs/ha.md, A partial check)"""
+        if not missing:
+            return False
         blocking = result.unrouted.get(guid)
         return bool(blocking) and all(
             switch in expected or switch in result.link_down for switch in blocking
         )
 
-    def _problems(self, ports, neutron, results, expected=frozenset()):
+    def _problems(
+        self, ports, neutron, results, expected=frozenset(), expected_rows=frozenset()
+    ):
         """Why the fabric check fails, as far as per-port keys go"""
         problems = []
         if any(result.own_port_lost for result in results):
@@ -1336,6 +1350,9 @@ class PortKeeper:
             problems.append("no full verify of the ports' M_Keys yet")
             return problems
         result, began = full
+        # Whether the full verify misses some expected switch, without which
+        # no port it couldn't reach is excused
+        missing = bool(set(expected_rows) - result.switches)
         if time.monotonic() - began > 2 * self.config.port_verify_interval:
             problems.append(
                 "the last full verify of the ports' M_Keys is older than two "
@@ -1365,7 +1382,7 @@ class PortKeeper:
             # is down, it was never sent a key: the missing switch fails the
             # check instead. Behind any other switch that didn't answer, it
             # still counts.
-            and not self._excused(row.guid, result, expected)
+            and not self._excused(row.guid, result, expected, missing)
             and port_keys.guid_text(row.guid) not in neutron
             and not row.released
             and row.guid not in result.keyed
