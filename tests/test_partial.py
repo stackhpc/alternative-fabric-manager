@@ -5,6 +5,7 @@ switch can't matter to them, and every other job waits for a whole fabric
 import json
 
 import pytest
+import sqlalchemy as sa
 
 from alternative_fabric_manager import db, partial, scan
 from alternative_fabric_manager.drivers import Fabric, ReloadError, SweepReport
@@ -597,6 +598,318 @@ def test_scan_place_is_what_the_manager_compares():
     # The places are JSON round-trippable, as the sweep records them.
     placed = scan.place({1: ["port", "00000000000000aa", 3]}, [])
     assert json.loads(json.dumps(placed[1])) == placed[1]
+
+
+# Round 2: virtual functions placed by their hosts, the complete map, the
+# prober, the re-sweep, the reset's body, and network updates
+
+VF2 = 0xFA163E000062A358
+VF2_CLIENT_ID = "20:fa:16:3e:00:00:62:a3:58"
+VF_PORT_2 = "b13bba05-eb07-45ba-ace2-765706b2d701"
+
+
+def _host_ports(manager):
+    with manager.sessionmaker() as session:
+        return {row.guid: row.host for row in session.scalars(sa.select(db.HostPort))}
+
+
+def _vf(port_id, client_id, host="hv1", **kwargs):
+    return _port(port_id, client_id, host=host, vnic_type="direct", **kwargs)
+
+
+def _learn_hv1(manager, fabric):
+    """A VM on hv1 runs, so the dump lists its VF on OWN, and a passing
+    check learns OWN for hv1; then the VM goes"""
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    _settled(manager, manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID)))
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+    fabric.vports = []
+    _settled(manager, manager.delete_port(THIRD_PORT))
+    manager.reconcile()
+
+
+def test_a_vf_without_a_vport_is_placed_by_its_hosts_physical_ports(manager, fabric):
+    _learn_hv1(manager, fabric)
+    _lose_leaf(manager, fabric)
+    # Nova keeps the guest paused until the job completes: no vport yet.
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    manager.reconcile()
+    assert _status(manager, job) == COMPLETED
+    placed = json.loads(_applied(manager).placements)["guids"]
+    assert placed[f"{VF2:016x}"][:2] == ["host", "hv1"]
+
+
+def test_a_vf_on_a_host_with_no_learnt_port_waits(manager, fabric):
+    _learn_hv1(manager, fabric)
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID, host="hv2"))
+    manager.reconcile()
+    manager.reconcile()
+    assert _status(manager, job) == PENDING
+
+
+def test_a_vf_whose_hosts_port_is_behind_the_missing_leaf_waits(manager, fabric):
+    _learn_hv1(manager, fabric)
+    fabric.ports[OWN] = (LEAF_B, 1)
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    manager.reconcile()
+    manager.reconcile()
+    assert _status(manager, job) == PENDING
+
+
+def _settle(manager, times=3):
+    for _ in range(times):
+        manager.reconcile()
+
+
+def test_host_ports_are_learnt_only_at_a_passing_check(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    _lose_leaf(manager, fabric)
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID))
+    _settle(manager)
+    assert _host_ports(manager) == {}
+    fabric.switches = {LEAF_A, LEAF_B}
+    _settle(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+    # A port learnt for another host leaves this one's.
+    manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID, host="hv2"))
+    _settle(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+    # Only a direct port's vport teaches anything.
+    manager.put_port(
+        THIRD_PORT, _port(THIRD_PORT, VF_CLIENT_ID, host="hv3", vnic_type="normal")
+    )
+    _settle(manager)
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv2"}
+    from alternative_fabric_manager import manager as manager_mod
+
+    with manager.sessionmaker() as session:
+        lines = manager_mod.fabric_status(session)
+    assert f"host hv2: physical ports 0x{OWN:016x}" in lines
+
+
+def test_learning_takes_only_a_settled_unambiguous_vport(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    # With its job open, as while it migrates, nothing is learnt.
+    job = manager.put_port(THIRD_PORT, _vf(THIRD_PORT, VF_CLIENT_ID))
+    manager.check_fabric()
+    assert _host_ports(manager) == {}
+    _settled(manager, job)
+    # Listed twice, nothing is learnt.
+    fabric.vports = [(VF, OWN, 7, "ACTIVE"), (VF, GUID, 3, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {}
+    # On a physical port that is a recorded port's GUID, as a bare metal
+    # port's, nothing is learnt.
+    _settled(manager, manager.put_port(PORT_ID, _port(PORT_ID, conftest.CLIENT_ID)))
+    fabric.vports = [(VF, GUID, 3, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {}
+    fabric.vports = [(VF, OWN, 7, "ACTIVE")]
+    manager.check_fabric()
+    assert _host_ports(manager) == {f"{OWN:016x}": "hv1"}
+
+
+def test_a_learnt_port_the_passing_scan_doesnt_find_is_dropped(manager, fabric):
+    _learn_hv1(manager, fabric)
+    del fabric.ports[OWN]
+    manager._checks_since_scan = manager.config.confirm_checks
+    manager.check_fabric()
+    assert _host_ports(manager) == {}
+
+
+def test_an_unattributed_adapter_behind_the_missing_leaf_holds_vf_grants(
+    manager, fabric
+):
+    _learn_hv1(manager, fabric)
+    # Another adapter port behind leaf B, which nobody is known to own: it
+    # may be hv1's other port, which a VF could land on.
+    fabric.ports[0xC0FFEE] = (LEAF_B, 7)
+    manager._checks_since_scan = manager.config.confirm_checks
+    assert manager.check_fabric()
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    _settle(manager)
+    assert _status(manager, job) == PENDING
+    # Once it is known to be another host's, the grant completes.
+    with manager.sessionmaker() as session:
+        session.add(db.HostPort(guid=f"{0xC0FFEE:016x}", host="hv7"))
+        session.commit()
+    _settle(manager)
+    assert _status(manager, job) == COMPLETED
+
+
+def test_a_vf_the_dump_lists_but_doesnt_place_waits(manager, fabric):
+    _learn_hv1(manager, fabric)
+    # Attached to a running guest, or migrated live: listed, not ACTIVE
+    fabric.vports = [(VF2, OWN, 8, "DOWN")]
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(VF_PORT_2, _vf(VF_PORT_2, VF2_CLIENT_ID))
+    _settle(manager)
+    assert _status(manager, job) == PENDING
+
+
+def test_a_term_between_leaves_the_map_incomplete(manager, fabric):
+    manager.term = 3
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    manager.reconcile()
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert held.complete
+    # Term 4 led, and may have written a body it never recorded; term 5
+    # writes next.
+    manager.term = 5
+    manager._written = None
+    with manager.sessionmaker() as session:
+        session.get(db.Applied, 1).term = 5
+        session.commit()
+    manager.sync()
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert not held.complete
+    # The next term after its own keeps it.
+    manager.check_fabric()
+    manager.term = 6
+    manager._written = None
+    with manager.sessionmaker() as session:
+        session.get(db.Applied, 1).term = 6
+        session.commit()
+    manager.sync()
+    manager.check_fabric()
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert held.complete
+
+
+@pytest.mark.parametrize("how", ["upgraded", "swept by another version"])
+def test_a_map_that_may_lack_memberships_completes_no_port_grant(manager, fabric, how):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    fabric.ports[GUID] = (LEAF_B, 2)
+    _settled(manager, manager.put_port(PORT_ID, _port(PORT_ID, conftest.CLIENT_ID)))
+    _lose_leaf(manager, fabric)
+    # Deleted while leaf B is missing: GUID may still hold pkey 100.
+    manager.delete_port(PORT_ID)
+    if how == "upgraded":
+        # As 0.6.0 left it: it swept the deletion, and never wrote the map.
+        manager.reconcile()
+        with manager.sessionmaker() as session:
+            session.get(db.Applied, 1).held = None
+            session.commit()
+    else:
+        # Another version's leader sweeps the deletion, unseen by the map.
+        content, generation, attribution = manager._render()
+        with manager.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            applied.body = content
+            applied.generation = generation
+            applied.attribution = json.dumps(attribution)
+            session.commit()
+        manager._written = None
+    job = manager.put_port(OTHER_PORT, _port(OTHER_PORT, OTHER_CLIENT_ID, host="h9"))
+    network = manager.put_network(OTHER_NETWORK, conftest.network(OTHER_NETWORK, 200))
+    manager.reconcile()
+    manager.reconcile()
+    assert _status(manager, job) == PENDING
+    # A network's creation grants nothing, so still completes.
+    assert _status(manager, network) == COMPLETED
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert not held.complete
+
+
+def test_a_grant_placed_only_after_its_sweep_is_swept_again(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    del fabric.ports[GUID]
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(PORT_ID, _port(PORT_ID, conftest.CLIENT_ID))
+    fabric.ports[GUID] = (LEAF_A, 2)
+    starts = fabric.starts
+    for _ in range(5):
+        manager.reconcile()
+    assert _status(manager, job) == COMPLETED
+    # Its own sweep, and one more once it was placed: bounded
+    assert fabric.starts - starts == 2
+
+
+def test_a_grant_whose_place_keeps_still_is_swept_again_once(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    _lose_leaf(manager, fabric)
+    job = manager.put_port(PORT_ID, _port(PORT_ID, conftest.CLIENT_ID))
+
+    def sweep_of_its_own():
+        fabric.starts += 1
+
+    # OpenSM sweeps by itself during every scan: never placed.
+    fabric.during_scan = sweep_of_its_own
+    starts = fabric.calls
+    for _ in range(5):
+        manager.reconcile()
+    assert _status(manager, job) == PENDING
+    assert fabric.calls - starts <= 2
+
+
+def test_a_reset_never_uses_a_body_opensm_didnt_sweep(manager, fabric, monkeypatch):
+    from alternative_fabric_manager import manager as manager_mod
+    from alternative_fabric_manager import port_keeper
+
+    _settled(
+        manager,
+        manager.put_network(NETWORK_ID, conftest.network()),
+        manager.put_port(OTHER_PORT, _port(OTHER_PORT, OTHER_CLIENT_ID, host="h2")),
+    )
+    manager.delete_port(OTHER_PORT)
+    written = manager_mod.partitions.write_atomically
+
+    def fails(path, content, *args):
+        if path == manager.config.partitions_file:
+            raise OSError("disk full")
+        return written(path, content, *args)
+
+    monkeypatch.setattr(manager_mod.partitions, "write_atomically", fails)
+    manager.sync()
+    # The map has the deletion's body, which OpenSM never read.
+    assert manager.check_fabric()
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert held.tainted_pkeys() == {100}
+    with pytest.raises(port_keeper.PortKeysError):
+        manager.reset_held()
+    monkeypatch.setattr(manager_mod.partitions, "write_atomically", written)
+    manager.reconcile()
+    manager.reconcile()
+    with manager.sessionmaker() as session:
+        held = partial.Held.loads(session.get(db.Applied, 1).held)
+    assert held.tainted_pkeys() == set()
+
+
+def test_a_network_update_that_keeps_its_pkey_is_a_grant(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    _lose_leaf(manager, fabric)
+    job = manager.put_network(NETWORK_ID, conftest.network(name="renamed"))
+    manager.reconcile()
+    assert _status(manager, job) == COMPLETED
+
+
+def test_ibnetdiscover_places_nothing_on_a_switch_the_check_didnt_find(manager, fabric):
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    stranger = 0xEC0D9A0300B12590
+    fabric.ports[GUID] = (stranger, 2)
+    fabric.switches = {LEAF_A}
+    original = fabric.scan
+
+    def listed_anyway(m_key=None):
+        found = original(m_key)
+        found[GUID] = ["port", f"{stranger:016x}", 2]
+        return found
+
+    fabric.scan = listed_anyway
+    manager.check_fabric()
+    assert f"{GUID:016x}" not in manager._last_scan["placed"]
 
 
 # Prober mode

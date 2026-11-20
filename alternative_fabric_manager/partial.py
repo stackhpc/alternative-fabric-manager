@@ -25,6 +25,7 @@ pkeys as decimal strings, GUIDs as 16 hex digits, host the port's
 binding:host_id, "" for a member that is no Neutron port's.
 """
 
+import hashlib
 import json
 
 from alternative_fabric_manager import partitions
@@ -60,16 +61,41 @@ def _dump_map(entries):
     }
 
 
-class Held:
-    """The possibly held memberships, the latest body's, and whether an
-    expected switch was removed since the map was last reset"""
+def body_hash(content):
+    """A body's fingerprint, by which the map knows whether it saw the body
+    applied records as swept"""
+    return hashlib.sha256((content or "").encode()).hexdigest()
 
-    def __init__(self, held=None, latest=None, blocked=False, known=True):
+
+# How many of the latest bodies' (generation, fingerprint) the map keeps, so
+# that a body written and then swept again later is still known as seen
+RECENT = 16
+
+
+class Held:
+    """The possibly held memberships, the latest body's, whether an expected
+    switch was removed since the map was last reset, and whether the map is
+    complete: made so by a reset, so that it covers every membership a port
+    may hold, and still so only while every body swept is one it saw"""
+
+    def __init__(
+        self,
+        held=None,
+        latest=None,
+        blocked=False,
+        known=True,
+        complete=False,
+        recent=None,
+    ):
         self.held = held or {}
         self.latest = latest or {}
         self.blocked = blocked
         # False until a body has been added, as before this was recorded
         self.known = known
+        self.complete = complete
+        # The (generation, fingerprint) of the latest bodies added, newest
+        # last
+        self.recent = list(recent or [])
 
     @classmethod
     def loads(cls, text):
@@ -80,6 +106,8 @@ class Held:
             _load_map(data.get("held")),
             _load_map(data.get("latest")),
             bool(data.get("blocked")),
+            complete=bool(data.get("complete")),
+            recent=[tuple(pair) for pair in data.get("recent", [])],
         )
 
     def dumps(self):
@@ -88,22 +116,36 @@ class Held:
                 "held": _dump_map(self.held),
                 "latest": _dump_map(self.latest),
                 "blocked": self.blocked,
+                "complete": self.complete,
+                "recent": [list(pair) for pair in self.recent],
             },
             sort_keys=True,
         )
 
-    def add(self, entries):
+    def saw(self, generation, content):
+        """Whether the map saw this body, as applied records it swept"""
+        return bool(content) and (generation, body_hash(content)) in self.recent
+
+    def latest_is(self, content):
+        """Whether the latest body added is this one"""
+        return bool(self.recent) and self.recent[-1][1] == body_hash(content)
+
+    def add(self, entries, generation=None, content=None):
         """Add a body's memberships, before it's written to OpenSM's file:
         it is the latest body from then on"""
         for pkey, values in entries.items():
             self.held.setdefault(pkey, set()).update(values)
         self.latest = {pkey: set(values) for pkey, values in entries.items()}
         self.known = True
+        if content is not None:
+            self.recent = [*self.recent, (generation, body_hash(content))][-RECENT:]
 
     def reset(self, error_guids=()):
-        """Reset to the latest body's memberships, plus the entries of every
-        GUID that had a pkey error in the sweep, which may still hold what
-        OpenSM couldn't take from them; return the pkeys this untaints"""
+        """Reset to the latest body's memberships, which the caller has
+        checked are the swept body's, plus the entries of every GUID that
+        had a pkey error in the sweep, which may still hold what OpenSM
+        couldn't take from them; the map is complete from then on. Return
+        the pkeys this untaints."""
         before = self.tainted_pkeys()
         errors = set(error_guids)
         held = {pkey: set(values) for pkey, values in self.latest.items()}
@@ -113,6 +155,7 @@ class Held:
                 held.setdefault(pkey, set()).update(kept)
         self.held = held
         self.blocked = False
+        self.complete = True
         return before - self.tainted_pkeys()
 
     def tainted_pkeys(self):
@@ -165,13 +208,15 @@ def judge_grant(
     tainted_hosts,
     open_revocations,
     vnic_type=None,
+    complete=True,
 ):
     """Why a job waits on a partial check, or None if it completes there,
     given that conditions 1, 2, 3 and the partial reading of 5 of Job
     completion hold (specs/ha.md, A grant completes on a partial check)
 
     placed is the GUIDs the check placed as the last scan before the sweep
-    had them; pkey_errors the sweep's; vnic_type the port row's, if live.
+    had them; pkey_errors the sweep's; vnic_type the port row's, if live;
+    complete whether the possibly held map is complete.
     """
     # Rule 1: only grants
     if not is_grant(effect):
@@ -183,6 +228,13 @@ def judge_grant(
         return None
     if kind != "port":
         return "only a port's or a network's grant completes on a partial check"
+    if not complete:
+        # It may lack memberships some port still holds, as after an
+        # upgrade, so taint can't be judged.
+        return (
+            "the possibly held memberships aren't complete until a sweep of "
+            "the whole fabric"
+        )
     guid = effect["guids"][0]
     # Rule 2
     if guid in pkey_errors:
@@ -194,10 +246,7 @@ def judge_grant(
         return f"pkey 0x{effect['pkey']:04x} is tainted: a port may hold it stale"
     # Rule 4: any port but a virtual function's, including one whose type
     # isn't recorded or isn't known
-    types = {effect.get("vnic_type")}
-    if vnic_type is not None:
-        types.add(vnic_type)
-    if types == {VIRTUAL_FUNCTION}:
+    if is_virtual_function(effect, vnic_type):
         return None
     host = effect.get("host")
     if not host:
@@ -210,3 +259,28 @@ def judge_grant(
         if hosts is None or host in hosts:
             return f"a revocation for another port on host {host} is open"
     return None
+
+
+def is_virtual_function(effect, vnic_type=None):
+    """Whether a port's grant is a virtual function's, by its request's
+    vnic_type and, if it is live, its row's"""
+    types = {effect.get("vnic_type")}
+    if vnic_type is not None:
+        types.add(vnic_type)
+    return types == {VIRTUAL_FUNCTION}
+
+
+def host_place(host, scanned, physical_ports):
+    """Where a virtual function whose vport the dump doesn't place is
+    placed: by its host's learnt physical ports, if it has any and the scan
+    placed every one, as ["host", host, [[physical port GUID, place], ...]];
+    None otherwise (specs/ha.md, Where a port is)"""
+    if not host or not physical_ports:
+        return None
+    places = []
+    for guid in sorted(physical_ports):
+        where = scanned.get(guid)
+        if where is None:
+            return None
+        places.append([guid, where])
+    return ["host", host, places]

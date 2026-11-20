@@ -8,7 +8,7 @@ import pytest
 import sqlalchemy as sa
 
 from alternative_fabric_manager import config as config_mod
-from alternative_fabric_manager import db, port_keeper, port_keys
+from alternative_fabric_manager import db, partial, port_keeper, port_keys
 from alternative_fabric_manager import manager as manager_mod
 from alternative_fabric_manager.drivers import Fabric
 from alternative_fabric_manager.ha import lease as lease_mod
@@ -192,6 +192,9 @@ def test_a_missing_switch_with_every_link_down_is_dropped(stable):
     world.sim.down |= {(S1, 6), (S2, 3), (0x53, 1), (0x53, 2)}
     assert world.check(), world.applied().check_detail
     assert expected(world) == {S1, S2}
+    # A switch with every link down can't forward: the possibly held
+    # memberships still reset by themselves (specs/ha.md).
+    assert not partial.Held.loads(world.applied().held).blocked
 
 
 def test_a_missing_switch_with_a_link_up_stays(stable):

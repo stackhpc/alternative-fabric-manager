@@ -325,8 +325,16 @@ def main(argv=None):
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in confirmation.switches:
             print(f"0x{guid:016x}")
-        if args.reset_held:
-            pkeys, hosts = manager.reset_held()
+        if args.reset_held and confirmation.problems:
+            print(
+                "Not resetting the memberships ports may hold stale while the "
+                "confirmation found problems: deal with them, then run it again"
+            )
+        elif args.reset_held:
+            try:
+                pkeys, hosts = manager.reset_held()
+            except port_keeper.PortKeysError as e:
+                sys.exit(f"alternative-fabric-manager: {e}")
             print(
                 "Reset the memberships ports may hold stale; this untainted "
                 + (

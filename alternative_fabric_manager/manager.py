@@ -243,6 +243,13 @@ class Manager:
         self._missing_fabric = False
         self._fresh_due = False
         self._last_scan = None
+        # The (GUID, place) pairs a sweep was made for, since a grant was
+        # placed only after its sweep: each is swept for once
+        self._resweeps = set()
+        # Checks since the last passing ibnetdiscover scan, which keeps the
+        # adapters' links at most once every confirm_checks checks
+        self._checks_since_scan = 0
+        self._scanned_once = False
         # Why the last _judge failed only on missing switches, if it did
         self._only_missing = False
         # A generation whose render or apply failed in a way that can't be
@@ -606,9 +613,10 @@ class Manager:
     def _network_effect(session, network_id, pkey):
         """A network request's effect, before it is set: creating the network
         is a grant, since its partition has only its ports as members, so it
-        grants nothing to any port; an update may move every port's
-        membership, so it is a revocation on its ports' hosts (specs/ha.md,
-        While a switch is missing)"""
+        grants nothing to any port, and so is an update that keeps its pkey;
+        one that changes it moves every port's membership, so it is a
+        revocation on its ports' hosts (specs/ha.md, While a switch is
+        missing)"""
         live = session.get(db.Network, network_id)
         hosts = []
         if live is not None:
@@ -618,7 +626,11 @@ class Manager:
                 )
             )
         return effects.network_present(
-            network_id, pkey, grant=live is None, hosts=hosts
+            network_id,
+            pkey,
+            # An update that keeps its pkey moves no membership.
+            grant=live is None or live.pkey == pkey,
+            hosts=hosts,
         )
 
     @staticmethod
@@ -1282,6 +1294,7 @@ class Manager:
         self._seen_checks = {}
         # A scan of an earlier OpenSM, or term, places nothing for this one.
         self._last_scan = None
+        self._resweeps = set()
         if self.allowed_sms.active():
             self._allowed_list = self.allowed_sms.prepare()
         self.class_keys.reset()
@@ -1302,11 +1315,11 @@ class Manager:
                     e,
                 )
                 with open(self.config.partitions_file) as f:
-                    self._extend_held(f.read())
+                    self._extend_held(f.read(), None)
                 self._driver_start()
                 return
             stamped = self._stamp(content)
-            self._extend_held(stamped)
+            self._extend_held(stamped, generation)
             partitions.write_atomically(self.config.partitions_file, stamped)
             try:
                 report = self._driver_start()
@@ -1319,7 +1332,7 @@ class Manager:
                 self._unattributable(str(e), generation)
                 LOG.error("Starting OpenSM with the last swept partitions")
                 restored = self._stamp(_body(body))
-                self._extend_held(restored)
+                self._extend_held(restored, self._last_swept_generation())
                 partitions.write_atomically(self.config.partitions_file, restored)
                 self._driver_start()
                 return
@@ -1516,11 +1529,16 @@ class Manager:
             )
         )
 
-    def _extend_held(self, content):
+    def _extend_held(self, content, generation):
         """Add a body's memberships to the possibly held map before it's
         written to OpenSM's file, in a compare-and-set on the term: raises
         StaleLeader, and the body isn't written, if a later term's leader
-        has written it"""
+        has written it
+
+        If applied records a sweep of a body the map never saw, as another
+        version's leader in a rolling upgrade may have made, the map may
+        lack what that body removed: it is no longer complete.
+        """
         with self._lock, self.sessionmaker() as session:
             applied = self._locked_applied(session)
             if self._stale(applied):
@@ -1531,18 +1549,51 @@ class Manager:
                 )
             hosts = dict(session.execute(sa.select(db.Port.guid, db.Port.host)).all())
             held = partial.Held.loads(applied.held)
-            if not held.held and applied.body:
-                # The first body since they were recorded: what OpenSM last
-                # swept may still be held too.
-                held.add(partial.body_entries(applied.body, hosts))
-            held.add(partial.body_entries(content, hosts))
+            if (
+                self.term
+                and held.complete
+                and (applied.held_term or 0) not in (self.term, self.term - 1)
+            ):
+                # Every takeover raises the term by one: another term led
+                # between, and may have written a body it never recorded,
+                # as an older version's leader that crashed would have.
+                LOG.warning(
+                    "The possibly held memberships were last written in term "
+                    "%s, before term %s: not complete until a sweep of the "
+                    "whole fabric",
+                    applied.held_term,
+                    self.term - 1,
+                )
+                held.complete = False
+            if applied.body and not held.saw(applied.generation, applied.body):
+                if held.complete:
+                    LOG.warning(
+                        "Generation %s was swept without the possibly held "
+                        "memberships seeing it: no port's grant completes "
+                        "while a switch is missing until a sweep of the whole "
+                        "fabric",
+                        applied.generation,
+                    )
+                held.complete = False
+                # What OpenSM last swept may still be held too.
+                held.add(
+                    partial.body_entries(applied.body, hosts),
+                    applied.generation,
+                    applied.body,
+                )
+            held.add(partial.body_entries(content, hosts), generation, content)
             applied.held = held.dumps()
             applied.held_term = self.term
             session.commit()
 
+    def _last_swept_generation(self):
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            return applied.generation if applied else None
+
     def _block_held_reset(self, session):
-        """An expected switch was removed: it may be a hung one, still
-        forwarding, so the map isn't reset again until --confirm-fabric
+        """--confirm-fabric removed an expected switch: it may be a hung one,
+        still forwarding, so the map isn't reset again until --confirm-fabric
         --reset-held"""
         applied = self._locked_applied(session)
         held = partial.Held.loads(applied.held)
@@ -1556,12 +1607,24 @@ class Manager:
 
     def reset_held(self):
         """--confirm-fabric --reset-held: reset the possibly held map to the
-        latest body's memberships, plus those of the GUIDs with pkey errors
-        in the last sweep, and let it reset itself again; return the pkeys
-        and hosts it untaints"""
+        swept body's memberships, plus those of the GUIDs with pkey errors
+        in that sweep, and let it reset itself again; return the pkeys and
+        hosts it untaints. Raises PortKeysError if the latest body written
+        isn't the one swept, as while a write or its sweep is under way."""
         with self._lock, self.sessionmaker() as session:
             applied = self._locked_applied(session)
             held = partial.Held.loads(applied.held)
+            if not (
+                applied.body
+                and held.latest_is(applied.body)
+                and held.saw(applied.generation, applied.body)
+            ):
+                session.rollback()
+                raise port_keeper.PortKeysError(
+                    "the latest partitions written haven't been swept yet, so "
+                    "the memberships ports may hold weren't reset: run it again "
+                    "once the manager's sweep has finished"
+                )
             hosts = held.tainted_hosts()
             errors = set(json.loads(applied.pkey_errors or "[]")) - {UNATTRIBUTED}
             pkeys = held.reset(errors)
@@ -1569,29 +1632,109 @@ class Manager:
             session.commit()
         return sorted(pkeys), sorted(hosts - held.tainted_hosts())
 
+    @staticmethod
+    def _host_ports(session):
+        """Each host's learnt physical ports, {host: {GUID}}"""
+        found = {}
+        for row in session.scalars(sa.select(db.HostPort)):
+            found.setdefault(row.host, set()).add(row.guid)
+        return found
+
+    @staticmethod
+    def _open_grants(session, generation=None):
+        """The open grants applied by generation, if given, as (job, effect,
+        the live port's vnic_type) triples, oldest first"""
+        waiting = set(session.scalars(sa.select(db.Deferred.job_id)))
+        found = []
+        for job in session.scalars(
+            sa.select(db.Job).where(db.Job.status.in_(OPEN)).order_by(db.Job.id)
+        ):
+            effect = effects.loads(job.effect)
+            if job.id in waiting or not partial.is_grant(effect):
+                continue
+            if generation is not None and job.generation > generation:
+                continue
+            port = (
+                session.get(db.Port, effect["port"])
+                if effect.get("kind") == "port"
+                else None
+            )
+            found.append((job, effect, port.vnic_type if port is not None else None))
+        return found
+
+    @staticmethod
+    def _grant_place(effect, vnic_type, scan_, host_ports):
+        """Where a scan places a port grant's GUID: as the scan has it, or,
+        for a virtual function whose GUID the dump doesn't list at all, by
+        its host's learnt physical ports; None if it isn't placed"""
+        guids = effect.get("guids", [])
+        if effect.get("kind") != "port" or not guids:
+            return None
+        where = scan_["placed"].get(guids[0])
+        if (
+            where is not None
+            or guids[0] in scan_["listed"]
+            or not partial.is_virtual_function(effect, vnic_type)
+        ):
+            return where
+        host = effect.get("host")
+        return partial.host_place(host, scan_["placed"], host_ports.get(host))
+
     def _sweep_placements(self, session, generation):
         """What a sweep records of the last scan before it: the places of
         the GUIDs its open grants involve, and the scan's mark and term"""
         scan_ = self._last_scan
         if scan_ is None or scan_["term"] != self.term or scan_["mark"] is None:
             return None
-        guids = set()
-        waiting = set(session.scalars(sa.select(db.Deferred.job_id)))
-        for job in session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN))):
-            effect = effects.loads(job.effect)
-            if job.id in waiting or job.generation > generation:
-                continue
-            if partial.is_grant(effect):
-                guids.update(effect.get("guids", []))
+        host_ports = self._host_ports(session)
+        guids = {}
+        for _job, effect, vnic_type in self._open_grants(session, generation):
+            where = self._grant_place(effect, vnic_type, scan_, host_ports)
+            if where is not None:
+                guids[effect["guids"][0]] = where
         return {
             "mark": list(scan_["mark"]),
             "term": self.term,
-            "guids": {
-                guid: scan_["placed"][guid]
-                for guid in sorted(guids)
-                if guid in scan_["placed"]
-            },
+            "guids": dict(sorted(guids.items())),
         }
+
+    def _placement_moved(self):
+        """Whether an open grant's GUID, or for a virtual function its host's
+        physical ports, the last scan places where the last sweep's records
+        don't, so that a sweep now may complete it: once for each place it
+        is seen in, so that this is bounded (specs/ha.md, Where a port is)"""
+        scan_ = self._last_scan
+        if (
+            not self._missing_fabric
+            or scan_ is None
+            or scan_["term"] != self.term
+            or scan_["mark"] is None
+        ):
+            return False
+        with self._lock, self.sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            if applied is None:
+                return False
+            recorded = json.loads(applied.placements or "null") or {}
+            swept = (
+                recorded.get("guids", {}) if recorded.get("term") == self.term else {}
+            )
+            host_ports = self._host_ports(session)
+            for _job, effect, vnic_type in self._open_grants(
+                session, applied.generation
+            ):
+                where = self._grant_place(effect, vnic_type, scan_, host_ports)
+                if where is None:
+                    continue
+                guid = effect["guids"][0]
+                if swept.get(guid) == where:
+                    continue
+                seen = (guid, json.dumps(where, sort_keys=True))
+                if seen in self._resweeps:
+                    continue
+                self._resweeps.add(seen)
+                return True
+        return False
 
     def _record(self, content, generation, attribution, report):
         """Record what OpenSM swept"""
@@ -1690,6 +1833,8 @@ class Manager:
             # Only while a job waits on them, so that a port that keeps
             # failing doesn't have the shared fabric swept forever
             return "OpenSM couldn't set the pkey tables of ports with open jobs"
+        if self._placement_moved():
+            return "an open grant was placed only after its sweep"
         return None
 
     @staticmethod
@@ -1736,13 +1881,15 @@ class Manager:
                 return
             stamped = self._stamp(content)
             try:
+                # Until OpenSM confirms it, the file isn't what was applied,
+                # from before the map has it: a reset uses the latest body
+                # only once it has been swept.
+                self._written = None
                 # Before the file is written: a body OpenSM may have read is
                 # in the possibly held map, even if this crashes before the
                 # sweep is recorded.
-                self._extend_held(stamped)
+                self._extend_held(stamped, generation)
                 partitions.write_atomically(self.config.partitions_file, stamped)
-                # Until OpenSM confirms it, the file isn't what was applied.
-                self._written = None
                 report = self.driver.reload()
             except PartitionsRejected as e:
                 if not self._quarantine_line(e, attribution, generation):
@@ -1835,9 +1982,9 @@ class Manager:
         LOG.warning("Restoring the last swept partitions")
         try:
             restored = self._stamp(_body(body))
-            self._extend_held(restored)
-            partitions.write_atomically(self.config.partitions_file, restored)
             self._written = None
+            self._extend_held(restored, self._last_swept_generation())
+            partitions.write_atomically(self.config.partitions_file, restored)
             report = self.driver.reload()
         except (OSError, ReloadError) as e:
             LOG.error("Failed to restore the last partitions: %s", e)
@@ -1864,6 +2011,7 @@ class Manager:
         partial_ = False
         missing = set()
         scanned = None
+        outcome = fabric = None
         try:
             # With per-port M_Key rows, the prober finds the switches.
             outcome = self.port_keeper.check()
@@ -1922,7 +2070,7 @@ class Manager:
                 )
                 self._written = None
             if partial_:
-                scanned = self._scan(outcome)
+                scanned = self._scan(outcome, fabric.switches)
                 # A check that couldn't scan isn't partial: it fails as before.
                 partial_ = scanned is not None
         if missing:
@@ -1945,11 +2093,20 @@ class Manager:
         self._last_scan = (
             None
             if scanned is None
-            else {"placed": scanned, "mark": mark, "term": self.term}
+            else {
+                "placed": scanned["placed"],
+                "listed": scanned["listed"],
+                "mark": mark,
+                "term": self.term,
+            }
         )
         if not ok:
             LOG.error("Fabric check failed: %s", detail)
         summary = None
+        # Read outside the lock: the hosts' physical ports are learnt only
+        # at a passing check, never a partial one.
+        dump = self._dump() if ok else None
+        adapters = self._passing_scan(outcome, fabric) if ok else None
         with self._lock, self.sessionmaker() as session:
             applied = self._applied(session)
             if self.term and (applied.term or 0) > self.term:
@@ -1960,7 +2117,11 @@ class Manager:
             applied.contested = self._contested_fabric
             applied.check_partial = partial_
             applied.check_placed = json.dumps(
-                self._placed_since_sweep(applied, scanned, end) if partial_ else []
+                self._placed_since_sweep(
+                    session, applied, scanned, end, missing, outcome is not None
+                )
+                if partial_
+                else []
             )
             applied.missing_switches = json.dumps(
                 [f"{guid:016x}" for guid in sorted(missing)]
@@ -1968,6 +2129,12 @@ class Manager:
             applied.missing = self._missing_fabric
             if ok:
                 self._reset_held_if_fresh(session, applied)
+                if adapters is not None:
+                    self._keep_host_ports(
+                        session, applied, adapters, outcome is not None
+                    )
+                if dump:
+                    self._learn_host_ports(session, dump)
             session.flush()
             if missing:
                 summary = self.missing_summary(session)
@@ -1999,51 +2166,165 @@ class Manager:
             return None
         return None if mark is None else list(mark)
 
-    def _scan(self, outcome):
-        """Where this check's own scan places each port, {GUID as 16 hex
-        digits: place}, or None if it couldn't scan: in prober mode from
-        the recorded links of the ports its verifies reached, otherwise
-        from an ibnetdiscover scan; vports through the virtualization dump
-        read with it (specs/ha.md, Where a port is)"""
+    def _dump(self):
+        """OpenSM's virtualization dump, or "" if it can't be read"""
+        reader = getattr(self.driver, "virtualization_dump", None)
+        if reader is None:
+            return ""
         try:
-            if outcome is not None:
-                with self._lock, self.sessionmaker() as session:
-                    ports, links = port_keeper.port_keys.load(session)
-                physical = scan.from_verify(outcome.results, ports, links)
-            else:
-                scanner = getattr(self.driver, "scan", None)
-                if scanner is None:
-                    return None
-                physical = scanner(m_key=self._key("m_key"))
+            return reader()
+        except ReloadError as e:
+            LOG.warning("Can't read OpenSM's virtualization dump: %s", e)
+            return ""
+
+    def _scan(self, outcome, found=()):
+        """This check's own scan, or None if it couldn't scan: where it
+        places each port, {GUID as 16 hex digits: place}, in prober mode
+        from the recorded links of the ports its verifies reached,
+        otherwise from an ibnetdiscover scan, vports through the
+        virtualization dump read with it; and the GUIDs that dump lists at
+        all (specs/ha.md, Where a port is)"""
+        try:
+            physical = self._physical(outcome, found)
+            if physical is None:
+                return None
             reader = getattr(self.driver, "virtualization_dump", None)
             dump = reader() if reader is not None else ""
         except ReloadError as e:
             LOG.error("Can't scan the fabric to place its ports: %s", e)
             return None
-        placed = scan.place(physical, scan.parse_virtualization_dump(dump))
-        return {scan.guid_text(guid): where for guid, where in placed.items()}
+        entries = scan.parse_virtualization_dump(dump)
+        placed = scan.place(physical, entries)
+        return {
+            "placed": {scan.guid_text(guid): where for guid, where in placed.items()},
+            "listed": {scan.guid_text(entry[0]) for entry in entries if entry[0]},
+        }
 
-    def _placed_since_sweep(self, applied, scanned, end):
+    def _physical(self, outcome, found):
+        """The adapter ports a check's scan places, {GUID: place}, or None
+        if there's no scan; raises ReloadError if it fails"""
+        if outcome is not None:
+            with self._lock, self.sessionmaker() as session:
+                ports, links = port_keeper.port_keys.load(session)
+            return scan.from_verify(outcome.results, ports, links)
+        scanner = getattr(self.driver, "scan", None)
+        if scanner is None:
+            return None
+        physical = scanner(m_key=self._key("m_key"))
+        # Only through switches the check found: one ibnetdiscover lists
+        # that ibswitches didn't is no evidence of a place.
+        found = {scan.guid_text(guid) for guid in found}
+        return {guid: where for guid, where in physical.items() if where[1] in found}
+
+    def _passing_scan(self, outcome, fabric):
+        """At a passing check, the adapter ports its scan finds, {GUID as 16
+        hex digits: place}, or None if it has none: in prober mode a full
+        verify's, otherwise an ibnetdiscover scan at most once every
+        confirm_checks checks, the last one's links being kept for the
+        grants placed through hosts' physical ports (specs/ha.md, Where a
+        port is)"""
+        if fabric is None:
+            # No fabric to check, as with the none driver
+            return None
+        if outcome is not None:
+            if not outcome.full:
+                return None
+        else:
+            self._checks_since_scan += 1
+            if (
+                self._checks_since_scan < self.config.confirm_checks
+                and self._scanned_once
+            ):
+                return None
+        try:
+            physical = self._physical(outcome, fabric.switches)
+        except ReloadError as e:
+            LOG.warning("Can't scan the whole fabric's adapters: %s", e)
+            return None
+        if physical is None:
+            return None
+        self._checks_since_scan = 0
+        self._scanned_once = True
+        return {scan.guid_text(guid): where for guid, where in physical.items()}
+
+    def _unattributed(self, session, applied, missing, prober):
+        """The adapter ports the last passing scan found cabled to a switch
+        now missing that are neither a learnt physical port, a recorded
+        port's GUID nor a node row's port: each may be a physical port of a
+        host that a virtual function could land on, behind a hung leaf"""
+        missing = {scan.guid_text(guid) for guid in missing}
+        if prober:
+            ports, links = port_keeper.port_keys.load(session)
+            adapters = {
+                scan.guid_text(link.peer_guid)
+                for link in port_keeper.port_keys.paired(links)
+                if scan.guid_text(link.guid) in missing
+                and (
+                    ports.get(link.peer_guid) is None
+                    or not ports[link.peer_guid].switch
+                )
+            }
+        else:
+            if applied.adapter_links is None:
+                # No passing scan yet: nothing says what is behind it.
+                return {"no passing scan yet"}
+            adapters = {
+                guid
+                for guid, where in json.loads(applied.adapter_links).items()
+                if where[1] in missing
+            }
+        attributed = set(session.scalars(sa.select(db.HostPort.guid)))
+        attributed |= set(session.scalars(sa.select(db.Port.guid)))
+        for text in session.scalars(sa.select(db.Node.port_guids)):
+            attributed |= {g.lower() for g in json.loads(text or "[]")}
+        return adapters - attributed
+
+    def _placed_since_sweep(self, session, applied, scanned, end, missing, prober):
         """The open grants' GUIDs this check places where the last scan
         before the sweep had them, with no OpenSM sweep start logged from
-        that scan to the end of this one but the watched sweep's own"""
+        that scan to the end of this one but the watched sweep's own; a
+        virtual function placed by its host's physical ports needs the
+        same learnt set in the same places, its GUID listed by neither dump
+        read, and every adapter behind a missing switch attributed"""
         recorded = json.loads(applied.placements or "null")
         if not recorded or recorded.get("term") != self.term or end is None:
             return []
         start = recorded.get("mark")
         if not start or start[0] != end[0] or end[1] - start[1] != 1:
             return []
-        return sorted(
-            guid
-            for guid, where in recorded.get("guids", {}).items()
-            if scanned.get(guid) == where
-        )
+        host_ports = self._host_ports(session)
+        unattributed = None
+        placed = []
+        for guid, where in recorded.get("guids", {}).items():
+            if where and where[0] == "host":
+                if guid in scanned["listed"]:
+                    continue
+                if unattributed is None:
+                    unattributed = self._unattributed(session, applied, missing, prober)
+                    if unattributed:
+                        LOG.warning(
+                            "Adapter ports behind the missing switches aren't "
+                            "known to be any host's, so no virtual function is "
+                            "placed by its host's ports: %s",
+                            ", ".join(sorted(unattributed)[:5]),
+                        )
+                if unattributed:
+                    continue
+                now = partial.host_place(
+                    where[1], scanned["placed"], host_ports.get(where[1])
+                )
+            else:
+                now = scanned["placed"].get(guid)
+            if now == where:
+                placed.append(guid)
+        return sorted(placed)
 
     def _reset_held_if_fresh(self, session, applied):
-        """At a passing check after a fresh sweep with no unattributed error,
-        unless an expected switch was removed since the last reset: reset
-        the possibly held map to the latest body's memberships, plus the
-        entries of the GUIDs with pkey errors in that sweep"""
+        """At a passing check after a sweep that counts in full, with no
+        unattributed error, unless --confirm-fabric removed an expected
+        switch since the last reset: reset the possibly held map to the
+        swept body's memberships, plus the entries of the GUIDs with pkey
+        errors in that sweep. The map is complete from then on."""
         errors = set(json.loads(applied.pkey_errors or "[]"))
         if (
             self._written is None
@@ -2056,7 +2337,13 @@ class Manager:
         ):
             return
         held = partial.Held.loads(applied.held)
-        if held.blocked or not held.held:
+        if held.blocked or not held.known:
+            return
+        if not (
+            held.latest_is(applied.body) and held.saw(applied.generation, applied.body)
+        ):
+            # The latest body written isn't the one swept: its memberships
+            # aren't evidence of what OpenSM set; wait for its sweep.
             return
         before = held.dumps()
         untainted = held.reset(errors)
@@ -2070,6 +2357,72 @@ class Manager:
                 "memberships: pkeys %s are no longer tainted",
                 ", ".join(f"0x{pkey:04x}" for pkey in sorted(untainted)),
             )
+
+    def _keep_host_ports(self, session, applied, adapters, prober):
+        """At a passing check whose scan found the whole fabric's adapters:
+        keep their links, where the check runs ibswitches, and drop the
+        learnt physical ports it didn't find"""
+        if not prober:
+            applied.adapter_links = json.dumps(adapters, sort_keys=True)
+        for row in list(session.scalars(sa.select(db.HostPort))):
+            if row.guid not in adapters:
+                LOG.info(
+                    "Physical port 0x%s of host %s isn't on the fabric: forgot it",
+                    row.guid,
+                    row.host,
+                )
+                session.delete(row)
+
+    def _learn_host_ports(self, session, dump):
+        """At a passing check: record each host's physical ports from the
+        vports of its virtual functions, taking each from any other host
+        (specs/ha.md, Where a port is). Only a vport the dump lists once,
+        ACTIVE, at an index above 0, of a direct port bound to a host with
+        no open job, on a physical port that is no recorded port's GUID nor
+        a node row's port, as a migration or a bare metal port might be."""
+        ports = {
+            row.guid: row
+            for row in session.scalars(
+                sa.select(db.Port).where(db.Port.vnic_type == partial.VIRTUAL_FUNCTION)
+            )
+            if row.host
+        }
+        busy = {
+            effects.loads(job.effect).get("port")
+            for job in session.scalars(sa.select(db.Job).where(db.Job.status.in_(OPEN)))
+        }
+        recorded = set(session.scalars(sa.select(db.Port.guid)))
+        for text in session.scalars(sa.select(db.Node.port_guids)):
+            recorded |= {g.lower() for g in json.loads(text or "[]")}
+        entries = scan.parse_virtualization_dump(dump)
+        counts = {}
+        for entry in entries:
+            counts[entry[0]] = counts.get(entry[0], 0) + 1
+        for vport, physical, index, state in entries:
+            if None in (vport, physical) or not index or state != scan.ACTIVE:
+                continue
+            if counts[vport] != 1:
+                continue
+            port = ports.get(scan.guid_text(vport))
+            if port is None or port.id in busy:
+                continue
+            guid = scan.guid_text(physical)
+            if guid in recorded:
+                continue
+            row = session.get(db.HostPort, guid)
+            if row is not None and row.host == port.host:
+                continue
+            if row is None:
+                row = db.HostPort(guid=guid)
+                session.add(row)
+            LOG.info(
+                "Learnt physical port 0x%s for host %s, from its virtual function 0x%s",
+                guid,
+                port.host,
+                scan.guid_text(vport),
+            )
+            row.host = port.host
+            row.learnt = _now()
 
     @staticmethod
     def missing_summary(session):
@@ -2245,7 +2598,6 @@ class Manager:
             state = session.get(db.State, EXPECTED_SOURCE, with_for_update=True)
             recorded_source = state.text if state is not None else None
             expected = dict(rows)
-            dropped = False
             if expected and recorded_source != source:
                 expected = self._translate(expected, recorded_source, source, nodes)
             # Fill in a node GUID the row lacks, as one recorded before they
@@ -2275,15 +2627,12 @@ class Manager:
                     for guid in sorted(set(expected) - found):
                         if self.port_keeper.switch_gone(guid, links, outcome.verify):
                             del expected[guid]
-                            dropped = True
                             LOG.warning(
                                 "Expected switch 0x%016x is missing, and the "
                                 "prober shows every recorded link to it down: "
                                 "it's no longer expected",
                                 guid,
                             )
-            if dropped:
-                self._block_held_reset(session)
             if expected != rows:
                 session.execute(sa.delete(db.ExpectedSwitch))
                 for guid, node in sorted(expected.items()):
@@ -2484,6 +2833,8 @@ class Manager:
         held = partial.Held.loads(applied.held)
         if not held.known:
             return None
+        # Complete, and has seen every body swept since it was made so
+        complete = held.complete and held.saw(applied.generation, applied.body)
         placed = set(json.loads(applied.check_placed or "[]"))
         pkey_errors = set(json.loads(applied.pkey_errors or "[]"))
         tainted_pkeys = held.tainted_pkeys()
@@ -2509,6 +2860,7 @@ class Manager:
                 tainted_hosts=tainted_hosts,
                 open_revocations=revocations,
                 vnic_type=port.vnic_type if port is not None else None,
+                complete=complete,
             )
 
         return judge
@@ -2558,4 +2910,15 @@ def fabric_status(session):
     summary = Manager.missing_summary(session)
     if summary:
         lines.append(summary)
+    held = partial.Held.loads(applied.held)
+    if held.known and not held.complete:
+        lines.append(
+            "possibly held memberships: not complete until a sweep of the whole "
+            "fabric, so no port's grant completes while a switch is missing"
+        )
+    for host, guids in sorted(Manager._host_ports(session).items()):
+        lines.append(
+            f"host {host}: physical ports "
+            + ", ".join(f"0x{guid}" for guid in sorted(guids))
+        )
     return lines
