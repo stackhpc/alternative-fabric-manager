@@ -19,8 +19,10 @@ Three principles carry the safety argument:
 
 - **A job completes only on evidence that the fabric has its effect:** the
   current leader's OpenSM swept a body in which the job's effect holds, in
-  the leader's current term, while the leader saw the whole fabric and no
-  other subnet manager that could master or set ports.
+  the leader's current term, while the leader saw the whole fabric, or,
+  while expected switches are missing, every port the effect involves and
+  no port that may still hold its pkeys stale (see While a switch is
+  missing), and no other subnet manager that could master or set ports.
 - **A new leader starts OpenSM only once every OpenSM that may have run
   since the last verified stop is stopped:** it was released cleanly, its
   own node verified it stopped, or, unconfirmed, it was asked to stop, if
@@ -77,7 +79,7 @@ would stop itself. The deployment role checks this.
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), when leadership last moved, and the **freeze**: whether it is frozen, the frozen leader's node, instance UUID and term, who froze it, when, and when it expires (see Freeze) |
 | `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs, its physical functions' port GUIDs (see The secured profile), and whether its OpenSM is verified stopped (see Fencing, Rejoining) |
-| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, and the last fabric check's result and time |
+| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, the last fabric check's result and time, whether it failed only on missing switches, the GUIDs OpenSM discovered in the last sweep, and the memberships ports may still hold since the last check that saw every switch (see While a switch is missing) |
 | `known_sm_ports` | Port GUIDs whose SMs may hold the fabric's keys: every port GUID a node row has recorded, kept when the node is forgotten, and those an operator recorded |
 | `fabric_ports`, `fabric_links` | Per-port M_Keys' records: each port's key state, never a key, and the links OpenSM's cache listed (see specs/secured-profile.md, Per-port M_Keys) |
 | `quarantine` | Objects left out of rendering, and why |
@@ -496,7 +498,98 @@ The **fabric checks** run after every sweep and every `check_interval`:
     two-OpenSM hardware test.
 
 A failed check raises an alarm, and no job completes until a check passes
-again.
+again, except as While a switch is missing allows.
+
+### While a switch is missing
+
+A dead or unreachable switch fails the check, and holds every job, until
+it comes back or an operator removes it (`--confirm-fabric`, and with
+per-port M_Keys, specs/zero-touch.md). Most of those jobs don't depend on
+the switch. This section lets them complete, and keeps holding those that
+do.
+
+**What a missing switch can hide.** A port's partitions are enforced at
+two places: its own pkey table, and the enforcement table of the switch
+port it is cabled to. Links between switches don't enforce. So a missing
+switch threatens only the ports OpenSM reaches through it: a missing leaf
+the adapters cabled to it, a missing spine nothing, unless it splits the
+fabric, when the far side's switches are missing too. And a missing switch
+may be dead, or alive with its management agent hung, still forwarding
+with the tables it last had (specs/zero-touch.md, What stays manual). The
+ports behind it keep what OpenSM last set:
+
+- a **grant** to such a port hasn't happened, so completing it would say
+  that a port works when it doesn't;
+- a **revocation** from such a port hasn't happened either, so the port
+  can still use the pkey it lost. Completing it would break isolation,
+  and so would any later grant of that pkey to another port, as when the
+  pkey is reused for another tenant's network: the stale port and the new
+  member, a full and a limited member alike, could talk through the
+  missing leaf's stale table and the spines.
+
+**A partial check** is one that fails only because expected switches are
+missing: OpenSM is master, the check is contested by no SM, and it finds
+no enforcement error, no unanswered key, no failing apply, and nothing
+else that fails a check. Any other failure holds every job, as above. A
+partial check records, from OpenSM's SA after the sweep it follows, the
+GUIDs OpenSM **discovered** in that sweep: each port's GUID, and the alias
+GUIDs registered on it, which carry virtual functions' GUIDs. A port that
+OpenSM discovered isn't behind a missing switch, since OpenSM discovers
+nothing through a switch it can't reach.
+
+**Possibly held memberships.** `applied` keeps a map from pkey to the
+GUIDs, and keyword members, that some port may still hold:
+
+- each check that passes, seeing every expected switch, sets it to the
+  memberships of the body it followed;
+- each sweep while a check is partial adds the memberships of the body it
+  swept, since a switch that flaps back into OpenSM's view mid-sweep gets
+  that body. OpenSM only ever sets a port to the body it sweeps, so a port
+  holds no membership outside the map.
+
+A pkey is **tainted** while some member in the map, at the last sweep,
+isn't in that pkey in the swept body, and wasn't discovered in that sweep
+with no pkey error: a GUID that may hold the pkey stale, behind a missing
+switch. A removed keyword member, such as `ALL=full`, taints its pkey,
+since it covers every undiscovered port too. A pkey is untainted again
+once each such GUID is discovered with the pkey's removal swept, or once a
+check passes.
+
+**A job completes on a partial check** when conditions 1, 2, 3 and 5 of
+Job completion hold, with a partial check counting as passing in 5 (a
+contested check still invalidates the sweep), the partial check is
+recorded after the sweep, no older than `2 × check_interval`, and:
+
+1. every GUID its effect involves, granted or revoked, was discovered in
+   that sweep, with no pkey error;
+2. no pkey its effect grants a membership in is tainted, the network's
+   own partition included, so a port joins a reused pkey only once the
+   stale ports are seen to have left it;
+3. its effect involves no keyword member: a network partition with
+   `ALL`, `ALL_CAS` or `ALL_VCAS` reaches every port, including the
+   undiscovered ones.
+
+Effects in that light:
+
+| Request | On a partial check |
+| --- | --- |
+| Create a VLAN network, with no keyword member | Completes unless its pkey is tainted: it grants nothing to any port |
+| Delete a network | Completes once every GUID that was a member is discovered with its removal swept; a network with no ports, at once |
+| Update a VLAN network's pkey | As a revocation of the old pkey from every member and a grant of the new |
+| Create or update a port | Completes if its GUID is discovered, with its membership swept, and its pkey untainted |
+| Delete a port | Completes if its GUID is discovered with its membership gone; otherwise it waits, as today |
+| A flat network or a port on one | As above, with the flat partition's pkey, which is tainted while any port that left it is undiscovered |
+
+A virtual function's GUID that its host has dropped, as when its instance
+is deleted, is never discovered again, so its delete waits until the
+fabric is whole, its timeout fails it, or an operator acts. That fails
+closed, as today.
+
+The leader's other rules don't change: a partial check is still a failed
+check for stepping down (Stepping down: a live candidate that reaches
+more switches takes over), for the alarm, and for zero-touch's recording
+and dropping of switches. Every instance judges a job the same way, from
+`applied`.
 
 A job is **Failed** once its object is quarantined, or once the database's
 UTC time is past its stored deadline, and it isn't Completed. Otherwise it
@@ -1215,7 +1308,7 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 | The leader shut down cleanly | It fails `/healthz`, stops and verifies its OpenSM, and releases the lease | A candidate takes over at once, without waiting |
 | A takeover's winner dies before starting OpenSM | Its targets, and itself, stay in the target set. The next candidate waits for them all | Jobs wait longer |
 | A leader on a fragment of a split fabric | Its fabric checks fail: switches are missing. A live candidate that reaches more switches makes it step down, and takes over | Jobs wait through the takeover; alarm |
-| An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | No job completes until an operator runs `--confirm-fabric`, or, for a spine with per-port M_Key rows, the prober shows every link to it down; alarm (specs/zero-touch.md) |
+| An expected switch dies | Every node misses it, so nobody reaches more and leadership stays | Jobs whose ports OpenSM discovers, on pkeys no undiscovered port may still hold, complete (While a switch is missing); the rest wait until an operator runs `--confirm-fabric`, or, for a spine with per-port M_Key rows, the prober shows every link to it down; alarm (specs/zero-touch.md) |
 | A node lacks OpenSM's image, and can't pull it | Its reach is 0, so it isn't eligible; it stays in HAProxy's rotation, and logs an error every minute | Nothing, while another candidate has the image; alarm |
 | A cold start, every port in Init | Candidates need a link up and Init or above; Active isn't required | A candidate that reaches every switch takes the lease and starts OpenSM |
 | Any one Galera node lost, even a candidate's | Every node's commits block until the survivors evict it, after `evs.suspect_timeout`, 5 s by default, and a view change; the leader's renewals fail meanwhile, but its liveness thread keeps the watchdog's lease | Within `T_self`, nothing happens |
@@ -1282,6 +1375,10 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       fence, node port GUIDs, `--forget-node`, and each group as The
       secured profile says. Their hardware runs in HA mode are still to
       come.
+- [ ] Complete jobs on a partial check (see While a switch is missing):
+      the discovered GUIDs, alias GUIDs included, from OpenSM's SA after
+      each sweep, the possibly held memberships, tainted pkeys, and a
+      failover test with a leaf paused in the fake fabric.
 - [ ] Retry deadlocks and constraint races in the request path, as Galera's
       certification conflicts and two instances racing for a pkey or GUID
       raise them: today they are answered 500, which networking-mlnx
@@ -1365,6 +1462,14 @@ leader's OpenSM has swept its membership with the whole fabric in view.
   20 s for `T_self` and 300 s for the job timeout right?
 - Do the OpenSM nodes run the control plane, so they reach the database
   VIP, or are they separate hosts that need database access opened to them?
+- While a switch is missing: does OpenSM 5.17's SA list a virtual
+  function's GUID as an alias GUID (GUIDInfo records) of the port that
+  carries it, on our adapters and firmware, and can the manager read it
+  with the SA_Key the hardening sets? Without it, a virtual function's
+  GUID is never discovered, and its jobs wait for a whole fabric, as
+  today; bare metal ports and empty networks still complete. And does
+  OpenSM set any port's tables through a switch it hasn't discovered in
+  that sweep?
 
 ## Future improvements
 
