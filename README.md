@@ -136,8 +136,9 @@ needing the M_Key (`alternative-fabric-manager --show-keys`).
 `[opensm] hardening` chooses the groups of options in one line: `all`, the
 default, hardens everything; `hardening = -sa_trust` everything but one
 group; `hardening = m_key, enforcement` only those. The keys set on
-ports are permanent by default; `[opensm] key_lease_period` gives them all
-a lease in one line instead (see docs/opensm-hardening.md, Permanent keys).
+ports have an hour's lease by default, so that ports keyed with a lost key
+recover by waiting; `[opensm] key_lease_period = 0` makes them permanent
+instead (see docs/opensm-hardening.md, Permanent keys).
 
 An experimental group, untested on hardware, `m_key_per_port`, chosen as
 `hardening = all, m_key_per_port` in single-node mode with the managed

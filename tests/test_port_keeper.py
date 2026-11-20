@@ -405,7 +405,10 @@ def test_inert_without_the_group_or_rows(world):
     # opensm.conf is byte-identical to the render before per-port keys
     keys = world.manager.keys()
     expected = opensm_conf.render(
-        {}, hardening=world.config.hardening_groups, keys=keys
+        {},
+        hardening=world.config.hardening_groups,
+        keys=keys,
+        key_lease_period=world.config.key_lease_period,
     )
     with open(world.config.opensm_conf_file) as f:
         assert f.read() == expected

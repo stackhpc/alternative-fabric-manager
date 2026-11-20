@@ -23,7 +23,10 @@ Find out before changing anything:
   notes add a group to `all` and the deployment uses `all` or removals
   only: agree it, or opt out of the new group with `-group` in the same
   change (the older release refuses `-group` for a group it doesn't know,
-  so a rollback must remove it again).
+  so a rollback must remove it again). Likewise the first release with an
+  hour's `key_lease_period` by default, on a deployment that doesn't set
+  it: agree the lease, or set `key_lease_period = 0` to keep permanent
+  keys.
 - **The mode**: single-node (`[database] database`, an SQLite file in the
   `afm_data` volume) or HA (`[ha] ha = true`, with `[database] connection`
   to MariaDB or Galera).

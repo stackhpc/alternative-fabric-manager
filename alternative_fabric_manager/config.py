@@ -239,13 +239,14 @@ class Config:
     # [opensm_conf] overrides any single option.
     hardening: str = "all"
     # The lease, in seconds, of every key the manager sets on ports (the
-    # M_Key, and later the class keys). 0, the default, makes them permanent:
-    # a port never drops its protection. A positive lease lets ports keyed
-    # with a lost key be keyed again, but any outage with no SM longer than
-    # the lease lets a tenant read the fabric's M_Key, for good
+    # M_Key, and later the class keys). An hour by default, so that ports
+    # keyed with a lost key, such as with a lost database, can be keyed
+    # again by waiting, rather than by resetting every port; any outage
+    # with no SM longer than the lease lets a tenant read the fabric's
+    # M_Key. 0 opts in to permanent keys: a port never drops its protection
     # (docs/opensm-hardening.md, Permanent keys). [opensm_conf] can still
     # override a single lease. Fabric-affecting: the same on every HA node.
-    key_lease_period: int = 0
+    key_lease_period: int = 3600
 
     # [opensm_conf]: opensm.conf options, as key = value (managed)
     opensm_conf: dict = dataclasses.field(default_factory=dict)

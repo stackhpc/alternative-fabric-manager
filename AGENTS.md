@@ -129,7 +129,8 @@ there manages the fabric's OpenSM, so:
   helper `<container>-prober` container: its configuration holds keys.
 - **Agree the hardening with whoever shares the fabric** before anything
   that changes what OpenSM enforces: changing `[opensm] hardening` or
-  `[opensm] key_lease_period`, setting hardening options by hand in
+  `[opensm] key_lease_period` (an hour by default; 0 makes keys
+  permanent), setting hardening options by hand in
   `[opensm_conf]` (the experimental ones in docs/opensm-hardening.md), or
   deploying a release that adds a group to `all`. **Naming
   `m_key_per_port` turns per-port M_Keys on**, and removing it turns them
