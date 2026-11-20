@@ -670,6 +670,14 @@ class Coordinator:
         could do better and the cooldown has passed (see Stepping down)"""
         if self.held or self.role != Role.LEADER:
             return None
+        # The per-port M_Key target, which only a start applies: unlike the
+        # other triggers, it needs no other candidate, since this node may
+        # take the lease back, nor waits for the cooldown, since the manager
+        # asks at most once an hour (specs/zero-touch.md, Applying).
+        applying = getattr(self.manager, "apply_requested", None)
+        if applying:
+            self.manager.apply_requested = None
+            return applying
         if not self._config_allowed():
             # A configuration no longer allowed: hand over to a live
             # candidate whose configuration is, after the cooldown (see

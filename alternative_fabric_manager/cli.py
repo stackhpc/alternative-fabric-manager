@@ -40,12 +40,14 @@ def main(argv=None):
     parser.add_argument(
         "--confirm-fabric",
         action="store_true",
-        help="Record the switches OpenSM sees now as the fabric's expected "
-        "ones, which every fabric check must find, and, with per-port M_Keys, "
-        "the links its cache lists, and exit. With the m_key_per_port "
-        "hardening group named, it also arms the turn-on of per-port M_Keys, "
-        "which the manager's next start begins, once every port is found "
-        "ready; otherwise it says why not and exits non-zero",
+        help="Optional: the manager records the expected switches, and arms "
+        "per-port M_Keys, by itself. Record the switches OpenSM sees now as "
+        "the fabric's expected ones, which every fabric check must find, and, "
+        "with per-port M_Keys, the links its cache lists, and exit: needed "
+        "only to drop a removed or replaced switch. With the m_key_per_port "
+        "hardening group named, it also clears a failed turn-on and arms the "
+        "turn-on at once, which the running manager applies, once every port "
+        "is found ready; otherwise it says why not and exits non-zero",
     )
     enforcement = parser.add_mutually_exclusive_group()
     enforcement.add_argument(
@@ -133,7 +135,8 @@ def main(argv=None):
         action="store_true",
         help="List each recorded port's GUID, which key it holds (m_key, "
         "derived or unknown), and whether it lapsed, is reachable or was "
-        "released, never a key; and the target",
+        "released, never a key; the target, whether a failed turn-on is "
+        "recorded, and what keeps the manager from arming the turn-on",
     )
     commands.add_argument(
         "--port-m-key",

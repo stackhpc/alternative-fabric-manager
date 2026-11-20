@@ -28,6 +28,7 @@ import datetime
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -68,6 +69,9 @@ LEADER_FENCE = "leader_fence"
 EXPECTED_SOURCE = "expected_switches_source"
 IBSWITCHES = "ibswitches"
 PROBER = "prober"
+# The configuration hash's HMAC key, shared with HA mode's epochs (see
+# ha/lease.py, HASH_KEY)
+CONFIG_HASH_KEY = "config_hash_key"
 APPLY_PREFIX = "# Apply "
 RETRY_DELAY = 2.0
 # _needs_sync()'s reason for restoring the last swept file
@@ -216,6 +220,12 @@ class Manager:
         self.class_keys = class_keys.ClassKeys(self)
         # The SA request rate limit's drops, logged
         self.sa_rate = sa_rate.SARate(self)
+        # This configuration's hash, worked out once it's needed
+        self._config_hash = None
+        # In HA mode, why the leader should step down so that a takeover's
+        # start applies the per-port M_Key target, which the coordinator
+        # reads and clears (specs/zero-touch.md, Applying)
+        self.apply_requested = None
 
     # The leader fence
 
@@ -916,6 +926,48 @@ class Manager:
             row = session.get(db.State, BASE_KEPT)
             return bool(row is not None and row.value)
 
+    def config_hash(self):
+        """This configuration's hash, as HA mode's epochs use it: an HMAC
+        keyed by a secret in the database, generated once, so that a hash
+        that's recorded, as a failed per-port M_Key turn-on's is, doesn't let
+        anyone who sees it test guesses of a key set in [opensm_conf]. The
+        same in single node, so that a single-node database moved to HA mode
+        keeps its record's meaning."""
+        if self._config_hash is not None:
+            return self._config_hash
+        for attempt in range(2):
+            with self._lock, self.sessionmaker() as session:
+                row = session.get(db.Secret, CONFIG_HASH_KEY)
+                if row is None:
+                    row = db.Secret(name=CONFIG_HASH_KEY, value=secrets.token_hex(32))
+                    session.add(row)
+                    try:
+                        session.commit()
+                    except sa.exc.IntegrityError:
+                        # Another process stored one first: read it back.
+                        session.rollback()
+                        if attempt:
+                            raise
+                        continue
+                key = row.value
+            self._config_hash = config_mod.config_hash(self.config, key)
+            return self._config_hash
+
+    def request_apply(self, why):
+        """Restart OpenSM so that its start applies the per-port M_Key
+        target: in single node, stop it, and the applier's next iteration
+        starts it again, as after OpenSM stops; in HA mode, ask the
+        coordinator to step down and release the lease, so that a
+        takeover's start, possibly this node's own, applies it
+        (specs/zero-touch.md, Applying)"""
+        if self.config.ha:
+            self.apply_requested = why
+            return
+        LOG.warning("Restarting OpenSM: %s", why)
+        self.driver.stop()
+        self._written = None
+        self._wakeup.set()
+
     def _key(self, name):
         """The key OpenSM uses, if any: an override, or a hardened one"""
         if name in self.config.opensm_conf:
@@ -1028,6 +1080,7 @@ class Manager:
         self.failed_applies = 0
         self.missing_checks = 0
         self._seen_checks = {}
+        self.apply_requested = None
         # A new leader inherits a contested check: its first sweep then
         # doesn't count until a check passes (see Job completion).
         with self._lock, self.sessionmaker() as session:
@@ -1618,6 +1671,13 @@ class Manager:
             applied.check_time = _now()
             applied.contested = self._contested_fabric
             session.commit()
+        if ok:
+            # At a check that passes: arm the per-port M_Key turn-on, and
+            # apply the target (specs/zero-touch.md)
+            try:
+                self.port_keeper.after_check()
+            except (ReloadError, port_keeper.PortKeysError) as e:
+                LOG.error("Can't arm or apply per-port M_Keys: %s", e)
         return ok
 
     def _log_findings(self):

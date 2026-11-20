@@ -37,6 +37,10 @@ that reads the rows afresh and changes only what its operation changed:
 never a copy taken before a verify of many seconds, which would undo a link
 --add-link recorded, or a --release-port, meanwhile.
 
+specs/zero-touch.md makes the turn-on automatic: at a check that passes,
+the manager arms it once the ports are ready, and restarts OpenSM to apply
+the target (after_check). Every row that answers as a switch is followed.
+
 A key opens a port, and the base every port: nothing here logs a key, nor
 any of OpenSM's cache files, and no exception message holds one.
 """
@@ -66,6 +70,18 @@ FORGET_AFTER = datetime.timedelta(days=1)
 DISCOVERY_ROUNDS = 8
 # How many GUIDs a log line or a check's detail names before "and N more"
 SHOWN = 5
+# At most how often the manager restarts OpenSM to apply the target, and
+# after how long since the target changed it applies it whatever the jobs
+# (specs/zero-touch.md, Applying), in seconds
+APPLY_EVERY = 3600
+APPLY_ANYWAY = 86400
+# What the arming's blocking reason says about a failed turn-on
+FAILED_REASON = (
+    "a turn-on failed under this configuration and base, and is recorded: "
+    "change the configuration, or run --confirm-fabric, to arm it again"
+)
+# The state table's text column holds at most this many characters
+_TEXT = 255
 
 # What a job's port showed after its sweep (Lost ports and jobs)
 ANSWERED = "answered its key"
@@ -205,6 +221,8 @@ class Confirmation:
     armed: bool = False
     note: str | None = None
     problems: list = dataclasses.field(default_factory=list)
+    # Whether it cleared a recorded failed turn-on
+    cleared: bool = False
 
 
 @dataclasses.dataclass
@@ -229,6 +247,13 @@ class PortKeeper:
         # tell which keys the ports hold: the next start runs that prober
         # again before OpenSM starts on either target
         self._unsettled = None
+        # The arming's blocking reason last logged, to log it once per
+        # change; "" once nothing blocks it
+        self._arming_reason = None
+        # The next start is one after a part-way turn-on failed: OpenSM is
+        # started on the target, and left running, without the success
+        # rule, which the hourly retries hold it to
+        self._skip_rule = False
         self._reset_running()
 
     def _reset_running(self):
@@ -463,6 +488,7 @@ class PortKeeper:
         if the start can't go ahead, which the manager retries.
         """
         self._reset_running()
+        self._log_failed_turn_on()
         if self._unsettled is not None:
             # Not on either target until the prober can tell which keys
             # the ports hold: then on the target if some port moved, or
@@ -505,15 +531,20 @@ class PortKeeper:
         self.driver.stop()
         moved = self._settle(plan, problem)
         if moved:
-            message = (
-                f"Per-port M_Keys: a start that turns them on failed ({problem}), "
-                f"after OpenSM moved {len(moved)} ports ({_guids(moved)}) to "
-                "their derived keys: the fabric is part-way, so OpenSM is "
-                "started on the target again, from the verified rows, until it "
-                "succeeds"
+            LOG.error(
+                "Per-port M_Keys: a start that turns them on failed (%s), after "
+                "OpenSM moved %d ports (%s) to their derived keys: the fabric is "
+                "part-way, so OpenSM is started on the target, from the verified "
+                "rows, and left running, and the turn-on is retried at most once "
+                "an hour until it succeeds",
+                problem,
+                len(moved),
+                _guids(moved),
             )
-            LOG.error("%s", message)
-            raise ReloadError(message)
+            with self._session() as session:
+                port_keys.save_time(session, port_keys.LAST_APPLY, time.time())
+                session.commit()
+            self._skip_rule = True
         self._plan = None
         return start(prepare=self.prepare)
 
@@ -678,10 +709,11 @@ class PortKeeper:
             },
         )
         answered = result.answered if result is not None else set()
+        skip, self._skip_rule = self._skip_rule, False
         self._plan = _Plan(
             target_on=target,
             effective_on=effective,
-            confirm=effective and not confirmed,
+            confirm=effective and not confirmed and not skip,
             own_guid=result.own_guid if result is not None else None,
             switches=frozenset(
                 guid
@@ -818,20 +850,75 @@ class PortKeeper:
             LOG.error("%s", message)
             raise ReloadError(message)
         self._unsettled = None
+        record = self._failure_record()
         with self._session() as session:
             port_keys.save_target(session, False)
             port_keys.save_running(session, False)
             port_keys.save_confirmed(session, False)
+            port_keys.save_time(session, port_keys.TARGET_CHANGED, time.time())
+            # So that a fabric that can't be turned on isn't re-keyed in a
+            # loop, across restarts and takeovers alike
+            port_keys.save_text(session, port_keys.FAILED_TURN_ON, record)
             # The fingerprint stays: OpenSM ran with the option, and may have
             # keyed a port the prober can't see.
             session.commit()
         LOG.error(
             "Per-port M_Keys: %sno port left the key it held, so the target is "
-            "set back to off and OpenSM is started without them; run "
-            "--confirm-fabric again once the cause is fixed",
+            "set back to off and OpenSM is started without them. The failure is "
+            "recorded: nothing arms them again until the configuration changes, "
+            "or --confirm-fabric is run once the cause is fixed",
             f"a start that turns them on failed ({problem}); " if problem else "",
         )
         return set()
+
+    # A failed turn-on (specs/zero-touch.md)
+
+    def _failure_record(self):
+        """What a failed turn-on records under the running configuration
+        and base"""
+        _m_key, base = self._m_keys()
+        return port_keys.failure_record(base, self.manager.config_hash())
+
+    def _failed_turn_on(self, session, record):
+        """Whether a failed turn-on is recorded under this configuration and
+        base (record, _failure_record's, worked out before the session,
+        which holds the manager's lock that keys() takes); one recorded under
+        another is cleared, in the session's transaction, since a change of
+        configuration is what may have fixed its cause"""
+        recorded = port_keys.load_text(session, port_keys.FAILED_TURN_ON)
+        if recorded is None:
+            return False
+        if recorded == record:
+            return True
+        port_keys.save_text(session, port_keys.FAILED_TURN_ON, None)
+        LOG.warning(
+            "A failed per-port M_Key turn-on was recorded under another "
+            "configuration: cleared, so that the turn-on may be armed again"
+        )
+        return False
+
+    def _log_failed_turn_on(self):
+        """At every start, say that a failed turn-on is recorded, and what
+        to check"""
+        if not self.group_named or self.config.driver != "managed":
+            return
+        try:
+            record = self._failure_record()
+        except PortKeysError:
+            # No base stored yet: nothing can have failed.
+            return
+        with self._session() as session:
+            failed = self._failed_turn_on(session, record)
+            session.commit()
+        if failed:
+            LOG.error(
+                "A per-port M_Key turn-on failed under this configuration and "
+                "is recorded, so nothing arms it again. Check the log of the "
+                "start that failed: whether OpenSM gave this host's port and "
+                "every switch its derived key within [opensm] start_timeout, "
+                "and that no port was down or held by another SM. Then change "
+                "the configuration, or run --confirm-fabric, to arm it again"
+            )
 
     # At every check
 
@@ -943,6 +1030,138 @@ class PortKeeper:
         )
         outcome.problems = self._problems(ports, neutron, results)
         return outcome
+
+    # After a check that passes (specs/zero-touch.md)
+
+    def after_check(self):
+        """At a fabric check that passes: arm the per-port M_Key turn-on if
+        it's ready, and restart OpenSM to apply the target if it's due"""
+        if self.config.driver != "managed" or not self.active():
+            return
+        if not self.driver.running():
+            return
+        self._arm_automatically()
+        self._apply_if_due()
+
+    def _note_arming(self, reason):
+        """Log the arming's blocking reason once per change, and keep it for
+        --port-key-states; "" when nothing blocks it"""
+        if reason == self._arming_reason:
+            return
+        self._arming_reason = reason
+        if reason:
+            LOG.warning("Per-port M_Keys aren't armed: %s", reason)
+        with self._session() as session:
+            port_keys.save_text(session, port_keys.ARMING, reason[:_TEXT])
+            session.commit()
+
+    def _arm_automatically(self):
+        """Arm the turn-on while the group is named, the target is off, and
+        no failed turn-on is recorded, once the arming's checks pass on the
+        last full verify since OpenSM started (Arming)"""
+        if not self.group_named:
+            self._note_arming("")
+            return
+        record = self._failure_record()
+        with self._session() as session:
+            armed = port_keys.load_target(session)
+            failed = not armed and self._failed_turn_on(session, record)
+            ports, links = port_keys.load(session)
+            recorded = port_keys.load_fingerprint(session)
+            epoch = None
+            if self.config.ha:
+                from alternative_fabric_manager.ha import lease as lease_mod
+
+                epoch = lease_mod.read_epoch(session)
+            session.commit()
+        if armed:
+            self._note_arming("")
+            return
+        if failed:
+            self._note_arming(FAILED_REASON)
+            return
+        problems = []
+        # An epoch that also allows a configuration without the group would
+        # let leaders with and without it alternate, re-keying the fabric
+        # each time.
+        if self.config.ha and (
+            epoch is None or tuple(epoch[1]) != (self.manager.config_hash(),)
+        ):
+            problems.append(
+                "the configuration epoch doesn't allow exactly this "
+                "node's configuration (see --config-epoch)"
+            )
+        problems += self._readiness_problems(links, recorded)
+        if links:
+            full = self._last_full
+            if full is None:
+                problems.append("no full verify of the ports' M_Keys yet")
+            else:
+                problems += self._verify_problems(ports, full[0], shown=SHOWN)
+        if problems:
+            self._note_arming("; ".join(problems))
+            return
+        with self._session() as session:
+            port_keys.save_target(session, True)
+            port_keys.save_confirmed(session, False)
+            port_keys.save_time(session, port_keys.TARGET_CHANGED, time.time())
+            session.commit()
+        self._note_arming("")
+        LOG.warning(
+            "Per-port M_Keys are armed: every recorded port behind an up link "
+            "holds the stored M_Key, so OpenSM is restarted to turn them on "
+            "once a check passes with no open job"
+        )
+
+    def _apply_if_due(self):
+        """Restart OpenSM so that its start applies the target, when it
+        differs from what OpenSM runs with, or is on and its success rule
+        isn't met yet: at most once an hour, and with no open job until a
+        day has passed since the target changed (Applying)"""
+        with self._session() as session:
+            target = port_keys.load_target(session) and self.group_named
+            running = port_keys.load_running(session)
+            confirmed = port_keys.load_confirmed(session)
+            last = port_keys.load_time(session, port_keys.LAST_APPLY)
+            changed = port_keys.load_time(session, port_keys.TARGET_CHANGED)
+            jobs = session.scalar(
+                sa.select(sa.func.count())
+                .select_from(db.Job)
+                .where(db.Job.status.in_((db.JobStatus.PENDING, db.JobStatus.RUNNING)))
+            )
+            now = time.time()
+            if target == running and not (target and not confirmed):
+                return
+            if changed is None:
+                # Recorded by a release before it was kept: from now
+                port_keys.save_time(session, port_keys.TARGET_CHANGED, now)
+                changed = now
+            if last is not None and 0 <= now - last < APPLY_EVERY:
+                session.commit()
+                return
+            overdue = now - changed >= APPLY_ANYWAY
+            if jobs and not overdue:
+                session.commit()
+                return
+            port_keys.save_time(session, port_keys.LAST_APPLY, now)
+            session.commit()
+        if target != running:
+            why = (
+                f"the per-port M_Key target is {_on(target)}, and OpenSM runs "
+                f"with them {_on(running)}: a start applies it"
+            )
+        else:
+            why = (
+                "per-port M_Keys haven't met their turn-on's success rule yet: "
+                "a start retries it"
+            )
+        if jobs:
+            LOG.warning(
+                "A day has passed since the per-port M_Key target changed, so it "
+                "is applied although %d jobs are open",
+                jobs,
+            )
+        self.manager.request_apply(why)
 
     def switch_gone(self, guid, links):
         """Whether the last full verify, since OpenSM started, shows every
@@ -1275,16 +1494,44 @@ class PortKeeper:
                 return
             ports, links = port_keys.load(session)
             recorded = port_keys.load_fingerprint(session)
+            # The operator's word that the cause of a failed turn-on is
+            # fixed: the manager may arm it again too
+            if port_keys.load_text(session, port_keys.FAILED_TURN_ON) is not None:
+                port_keys.save_text(session, port_keys.FAILED_TURN_ON, None)
+                confirmation.cleared = True
+            session.commit()
         problems = confirmation.problems
         if fold_problem is not None:
             problems.append(fold_problem)
+        problems += self._readiness_problems(links, recorded)
+        if links:
+            problems += self._turn_on_verify(ports, links, recorded)
+        if problems:
+            return
+        with self._session() as session:
+            port_keys.save_target(session, True)
+            port_keys.save_confirmed(session, False)
+            port_keys.save_time(session, port_keys.TARGET_CHANGED, time.time())
+            session.commit()
+        confirmation.armed = True
+        confirmation.note = (
+            "Per-port M_Keys are armed: the running manager restarts OpenSM to "
+            "turn them on at its next passing check with no open job, or its "
+            "next restart does"
+        )
+
+    def _readiness_problems(self, links, recorded):
+        """Why the turn-on can't be armed, beyond what the ports hold: the
+        base stored by an earlier start, the ports keyed from it if any were,
+        and links recorded (Turning it on)"""
+        problems = []
         if not self.manager.base_kept():
             problems.append(
                 "the running manager's start stored the per-port M_Key base: "
                 "restart the manager after backing up the database, which then "
-                "holds it, and confirm the fabric again"
+                "holds it"
             )
-        m_key, base = self._m_keys()
+        _m_key, base = self._m_keys()
         if recorded is not None and recorded != port_keys.fingerprint(base):
             problems.append(
                 "the stored per-port M_Key base isn't the one the ports were "
@@ -1295,18 +1542,37 @@ class PortKeeper:
                 "no links are recorded: OpenSM's cache hasn't listed the fabric "
                 "yet, so OpenSM couldn't find the ports"
             )
-        else:
-            problems += self._turn_on_verify(ports, links, recorded)
-        if problems:
-            return
-        with self._session() as session:
-            port_keys.save_target(session, True)
-            port_keys.save_confirmed(session, False)
-            session.commit()
-        confirmation.armed = True
-        confirmation.note = (
-            "Per-port M_Keys are armed: the next restart of the manager turns them on"
+        return problems
+
+    @staticmethod
+    def _verify_problems(ports, result, shown=None):
+        """Why a verify doesn't show every recorded port behind an up link
+        holding the stored M_Key, if it doesn't: it must be complete, and
+        reach this host's port. shown limits how many GUIDs are named."""
+        if result.own_port_lost:
+            return ["this host's port answers neither M_Key"]
+        problems = []
+        if not result.complete:
+            problems.append("the verify of the ports' M_Keys ran out of time")
+        failing = sorted(
+            guid
+            for guid in ports
+            if guid not in result.link_down
+            and not (
+                guid in result.keyed and result.ports[guid].holds == port_keys.M_KEY
+            )
         )
+        if failing:
+            names = (
+                _guids(failing)
+                if shown is not None
+                else ", ".join(f"0x{g:016x}" for g in failing)
+            )
+            problems.append(
+                "every recorded port behind an up link must answer the stored "
+                f"M_Key, with protection level 2, and these don't: {names}"
+            )
+        return problems
 
     def _turn_on_verify(self, ports, links, recorded):
         """Why the prober, beside the running OpenSM, doesn't find every
@@ -1324,28 +1590,7 @@ class PortKeeper:
             )
         except ReloadError as e:
             return [f"can't verify the ports' M_Keys: {e}"]
-        if result.own_port_lost:
-            return ["this host's port answers neither M_Key"]
-        problems = []
-        if not result.complete:
-            problems.append("the verify of the ports' M_Keys ran out of time")
-        failing = sorted(
-            guid
-            for guid in ports
-            if guid not in result.link_down
-            and not (
-                guid in result.keyed and result.ports[guid].holds == port_keys.M_KEY
-            )
-        )
-        if failing:
-            line = (
-                "every recorded port behind an up link must answer the stored "
-                "M_Key, with protection level 2"
-            )
-            problems.append(
-                line + ", and these don't: " + ", ".join(f"0x{g:016x}" for g in failing)
-            )
-        return problems
+        return self._verify_problems(ports, result)
 
     def states(self):
         """--port-key-states: each recorded port, and the target; no key"""
@@ -1353,7 +1598,14 @@ class PortKeeper:
             ports, _links = port_keys.load(session)
             target = port_keys.load_target(session)
             running = port_keys.load_running(session)
-        lines = [f"target {_on(target)}, OpenSM last started {_on(running)}"]
+            failed = port_keys.load_text(session, port_keys.FAILED_TURN_ON)
+            arming = port_keys.load_text(session, port_keys.ARMING)
+        lines = [
+            f"target {_on(target)}, OpenSM last started {_on(running)}",
+            # Whether one is recorded, never its hash
+            f"failed turn-on recorded: {'yes' if failed is not None else 'no'}",
+            f"arming blocked by: {arming or '-'}",
+        ]
         for guid in sorted(ports):
             row = ports[guid]
             kind = {True: "switch", False: "hca", None: "-"}[row.switch]
@@ -1451,6 +1703,7 @@ class PortKeeper:
                 port_keys.save_confirmed,
             ):
                 save(session, False)
+            port_keys.save_text(session, port_keys.ARMING, None)
             session.commit()
         return len(ports), len(links)
 

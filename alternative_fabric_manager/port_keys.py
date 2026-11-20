@@ -50,6 +50,19 @@ RUNNING = "port_keys_running"
 # or adopted the target from ports that hold derived keys already (Restores):
 # until then, every start with the target on is held to it
 CONFIRMED = "port_keys_confirmed"
+# A turn-on whose start failed and was set back, as "<the base's
+# fingerprint>:<the configuration hash>", the hash an HMAC keyed by a secret
+# in the database: while it matches the running configuration and base,
+# nothing arms the turn-on again (specs/zero-touch.md). Never shown.
+FAILED_TURN_ON = "port_keys_failed_turn_on"
+# Why the manager's checks don't arm the turn-on, for --port-key-states:
+# empty when nothing blocks it, or it doesn't apply
+ARMING = "port_keys_arming"
+# When the manager last restarted OpenSM to apply the target, and when the
+# target last changed, as Unix times: the hourly cap, and the day after
+# which it applies whatever the jobs
+LAST_APPLY = "port_keys_last_apply"
+TARGET_CHANGED = "port_keys_target_changed"
 
 # What a port holds: the stored m_key, its key derived from the base, or
 # neither as far as the manager knows
@@ -894,6 +907,49 @@ def save_confirmed(session, on):
     """Record whether a start with the target on has met the success rule,
     in the session's transaction"""
     _save_flag(session, CONFIRMED, on)
+
+
+def load_text(session, name):
+    """A state row's text, or None with no row"""
+    row = session.get(db.State, name)
+    return None if row is None else row.text
+
+
+def save_text(session, name, text):
+    """Record a state row's text, None deleting the row, in the session's
+    transaction"""
+    row = session.get(db.State, name)
+    if text is None:
+        if row is not None:
+            session.delete(row)
+        return
+    if row is None:
+        session.add(db.State(name=name, value=0, text=text))
+    else:
+        row.text = text
+
+
+def load_time(session, name):
+    """A Unix time a state row records, or None with no row"""
+    row = session.get(db.State, name)
+    return None if row is None else row.value
+
+
+def save_time(session, name, when):
+    """Record a Unix time, as whole seconds, in the session's transaction"""
+    row = session.get(db.State, name)
+    if row is None:
+        session.add(db.State(name=name, value=int(when)))
+    else:
+        row.value = int(when)
+
+
+def failure_record(base, config_hash):
+    """What a failed turn-on records: the base's fingerprint and the
+    configuration hash, never the base or the configuration"""
+    if not re.fullmatch(r"[0-9a-f]{64}", config_hash or ""):
+        raise ValueError("not a configuration hash")
+    return f"{fingerprint(base)}:{config_hash}"
 
 
 def load_fingerprint(session):

@@ -40,6 +40,10 @@ NETWORK = conftest.NETWORK_ID
 OTHER_NETWORK = "d13bba05-eb07-45ba-ace2-765706b2d701"
 VF_PORT = "f13bba05-eb07-45ba-ace2-765706b2d701"
 STRANGER = 0x3333333333333333
+# The manager's own arming and applying (specs/zero-touch.md), which the
+# scenarios here leave out, so that they drive the turn-on by hand;
+# tests/test_zero_touch.py puts it back
+AFTER_CHECK = port_keeper.PortKeeper.after_check
 
 
 def derived(guid):
@@ -292,6 +296,7 @@ def world(config, monkeypatch, caplog):
     monkeypatch.setattr(port_keeper, "CONFIRM_POLL", 0.01)
     # The applier's loop isn't run: the tests drive reconcile themselves.
     monkeypatch.setattr(manager_mod.Manager, "_run", lambda self: None)
+    monkeypatch.setattr(port_keeper.PortKeeper, "after_check", lambda self: None)
     config.driver = "managed"
     config.hardening = "all, m_key_per_port"
     config.start_timeout = 1.0
@@ -752,16 +757,18 @@ def test_a_part_way_turn_on_is_retried_on_the_target(world, caplog):
     world.driver.after_sweep = mend
     world.manager.stop()
     world.new_manager()
-    # The start fails, with OpenSM stopped and the target kept on.
+    # The start fails part-way: OpenSM is left running on the target, which
+    # it hasn't met the success rule on yet (specs/zero-touch.md).
     world.manager.start()
-    assert not world.driver.is_running
+    assert world.driver.is_running and world.driver.per_port()
     assert any("part-way" in r.getMessage() for r in caplog.records)
     state = world.state()
     assert state["target"] and state["running"] and not state["confirmed"]
     assert world.rows()[TN].holds == DERIVED and world.rows()[S2].holds == M_KEY
-    # The applier's check starts it again, on the target, until it succeeds.
+    # The retry, which the hourly apply makes, starts it on the target held
+    # to the success rule, until it succeeds.
     world.driver.on_start = world.driver.after_sweep = None
-    world.manager.reconcile()
+    world.driver.stop()
     world.manager._check_opensm()
     assert world.driver.is_running and world.driver.per_port()
     assert world.state()["confirmed"]
@@ -1620,9 +1627,11 @@ def test_a_turn_on_start_that_fails_after_keying_is_part_way(world, caplog):
     world.driver.start_error = ReloadError("OpenSM didn't start within 1 seconds")
     world.manager.stop()
     world.new_manager().start()
-    assert not world.driver.is_running
+    # Left running on the target, without the success rule
+    assert world.driver.is_running and world.driver.per_port()
     assert any("part-way" in r.getMessage() for r in caplog.records)
-    assert world.state()["target"] is True
+    assert world.state()["target"] is True and not world.state()["confirmed"]
+    world.driver.stop()
     world.manager._check_opensm()
     assert world.driver.is_running and world.state()["confirmed"]
 
@@ -1672,7 +1681,7 @@ def test_a_set_back_needs_no_row_holding_a_derived_key(world, caplog):
     world.driver.after_sweep = None
     world.driver.stall = True
     world.new_manager().start()
-    assert not world.driver.is_running
+    assert world.driver.is_running and world.driver.per_port()
     assert world.state()["target"] is True
     assert any("part-way" in r.getMessage() for r in caplog.records)
 
@@ -1797,7 +1806,9 @@ def test_confirm_fabric_prints_the_switches_and_arms(world, monkeypatch, capsys)
     # The switches, one per line, new ones too, and that it's armed
     assert _cli_confirm(world, monkeypatch, capsys) == [
         *(f"0x{guid:016x}" for guid in (S1, S2, 0x53)),
-        "Per-port M_Keys are armed: the next restart of the manager turns them on",
+        "Per-port M_Keys are armed: the running manager restarts OpenSM to "
+        "turn them on at its next passing check with no open job, or its next "
+        "restart does",
     ]
     assert world.state()["target"] is True
 
