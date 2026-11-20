@@ -1115,10 +1115,11 @@ the OpenStack services do. SQLAlchemy makes the backend a
   included, as oslo.db does for OpenStack services.
 - **Retry constraint errors too.** Every request's transaction bumps the
   generation first, so requests through one Galera node run one at a
-  time, and their validation sees each other's commits. A pkey or GUID
-  clash that reaches a unique constraint, or a port whose network went
-  meanwhile, is a race with an instance writing through another Galera
-  node; Galera usually reports it as a deadlock instead. Either way the
+  time, and their validation sees each other's commits. Two requests
+  racing through different Galera nodes both change the generation row,
+  so certification aborts one as a deadlock; a pkey or GUID clash that
+  reaches a unique constraint, or a port whose network went meanwhile,
+  is only a backstop for that. Either way the
   whole request runs again, up to five times with a short random pause,
   and its validation then gives the answer: waiting for the pkey or GUID,
   or 400 for a network that is gone. Never 400 from the constraint

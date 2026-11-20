@@ -13,8 +13,13 @@ OTHER = "d13bba05-eb07-45ba-ace2-765706b2d701"
 
 
 @pytest.fixture(autouse=True)
-def _no_pause(monkeypatch):
-    monkeypatch.setattr(manager_mod.random, "uniform", lambda _a, _b: 0)
+def _no_pause(manager, monkeypatch):
+    def pause(_a, _b):
+        # Other requests may run while one waits to retry.
+        assert not manager._lock.locked()
+        return 0
+
+    monkeypatch.setattr(manager_mod.random, "uniform", pause)
 
 
 def _error(code, message):
@@ -27,9 +32,9 @@ def _jobs(manager):
 
 
 def test_a_pkey_race_at_the_constraint_waits_rather_than_failing(manager, monkeypatch):
-    # Another instance's network took the pkey, committed through another
-    # Galera node after this request's validation looked: the constraint
-    # catches it, and the retry's validation makes the request wait.
+    # The unique constraint's backstop: validation misses a network that
+    # took the pkey, which the generation bump's certification conflict
+    # normally catches first. The retry's validation makes the request wait.
     manager.put_network(OTHER, conftest.network(OTHER, segmentation_id=100))
     blocked = manager._network_blocked
     calls = []
