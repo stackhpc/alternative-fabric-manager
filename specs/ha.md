@@ -1123,8 +1123,20 @@ the OpenStack services do. SQLAlchemy makes the backend a
   of the same lease row, and Galera aborts one of them. A deadlock is a
   certain abort, unlike a lost connection, and each command's write is a
   compare-and-set, so retrying it is safe.
-- **Map constraint errors.** A pkey or GUID clash that reaches a unique
-  constraint, or a port whose network is gone, is a 400, not a 500.
+- **Retry constraint errors too.** Every request's transaction bumps the
+  generation first, so requests through one Galera node run one at a
+  time, and their validation sees each other's commits. Two requests
+  racing through different Galera nodes both change the generation row,
+  so certification aborts one as a deadlock; a pkey or GUID clash that
+  reaches a unique constraint, or a port whose network went meanwhile,
+  is only a backstop for that. Either way the
+  whole request runs again, up to five times with a short random pause,
+  and its validation then gives the answer: waiting for the pkey or GUID,
+  or 400 for a network that is gone. Never 400 from the constraint
+  itself, since such a request can succeed later. Both are certain
+  aborts, so a retry can't apply a request twice; a lost connection,
+  whose commit may have happened, isn't retried. A conflict that outlasts
+  the retries is answered 500, which networking-mlnx resends.
 - **Read what the cluster committed.** Every manager session sets
   `wsrep_sync_wait = 7`, so that every statement, reads, updates, deletes
   and inserts alike, waits until its Galera node has applied what the
@@ -1282,11 +1294,10 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       fence, node port GUIDs, `--forget-node`, and each group as The
       secured profile says. Their hardware runs in HA mode are still to
       come.
-- [ ] Retry deadlocks and constraint races in the request path, as Galera's
+- [x] Retry deadlocks and constraint races in the request path, as Galera's
       certification conflicts and two instances racing for a pkey or GUID
-      raise them: today they are answered 500, which networking-mlnx
-      resends, so nothing is lost, but they should be retried before
-      answering. Never as 400, since such a request can succeed later.
+      raise them, before answering. Never as 400, since such a request can
+      succeed later.
 - [x] The lease, with Galera: target-set entries of node, instance UUID and
       term; the verified-stop mark cleared on taking the lease; taking on a
       Primary component only, renewing, self-stop after `T_self`, releasing

@@ -25,9 +25,11 @@ partition before OpenSM has put it there.
 
 import contextlib
 import datetime
+import functools
 import json
 import logging
 import os
+import random
 import secrets
 import threading
 import time
@@ -130,6 +132,34 @@ def _increment(session, name):
             # Another instance created it first; increment it.
             continue
     raise RuntimeError(f"Can't increment {name}")
+
+
+# A request's attempts when it conflicts with another writer
+REQUEST_ATTEMPTS = 5
+
+
+def _retried(method):
+    """Run a request's whole transaction again, validation included, when it
+    conflicts with another writer, so that the retry's validation gives the
+    answer, not a 500 or a 400 from the constraint (see specs/ha.md, Galera
+    specifics). The lock is released between attempts."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        for attempt in range(1, REQUEST_ATTEMPTS + 1):
+            try:
+                return method(self, *args, **kwargs)
+            except sa.exc.DBAPIError as e:
+                if not db.is_conflict(e) or attempt == REQUEST_ATTEMPTS:
+                    raise
+                LOG.info(
+                    "%s conflicted with another writer, retrying: %s",
+                    method.__name__,
+                    e.orig,
+                )
+                time.sleep(random.uniform(0.05, 0.2) * attempt)  # noqa: S311 - jitter
+
+    return wrapper
 
 
 # Keys a start stores, a start before any port is keyed with them, so that
@@ -558,6 +588,7 @@ class Manager:
         )
         session.flush()
 
+    @_retried
     def put_network(self, network_id, data):
         """Create or update a network's partition"""
         partitions.check_id(network_id)
@@ -597,6 +628,7 @@ class Manager:
                 session, generation, "put_network", network_id, effect
             )
 
+    @_retried
     def delete_network(self, network_id, data=None):
         partitions.check_id(network_id)
         with self._lock, self.sessionmaker() as session:
@@ -653,6 +685,7 @@ class Manager:
                 ),
             )
 
+    @_retried
     def put_port(self, port_id, data):
         """Make a port's GUID a member of its network's partition"""
         partitions.check_id(port_id)
@@ -703,6 +736,7 @@ class Manager:
             self._set_port(session, port_id, values)
             return self._commit_job(session, generation, "put_port", port_id, effect)
 
+    @_retried
     def delete_port(self, port_id, data=None):
         partitions.check_id(port_id)
         with self._lock, self.sessionmaker() as session:
@@ -804,6 +838,7 @@ class Manager:
         session.flush()
         return True
 
+    @_retried
     def get_job(self, job_id):
         with self._lock, self.sessionmaker() as session:
             job = session.get(db.Job, job_id)

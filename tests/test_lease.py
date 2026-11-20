@@ -378,7 +378,7 @@ def test_operators_commands_retry_a_galera_certification_conflict(lease, monkeyp
         calls.append(1)
         if len(calls) == 1:
             raise sa.exc.OperationalError(
-                "UPDATE lease", {}, Exception(operator.DEADLOCK, "Deadlock found")
+                "UPDATE lease", {}, Exception(db.DEADLOCK, "Deadlock found")
             )
         return request_unfreeze()
 

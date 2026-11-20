@@ -38,6 +38,8 @@ CALL_TIMEOUT = 3
 SQLITE_SESSION_WAIT = 60
 # MariaDB's error for a variable the server doesn't have
 UNKNOWN_SYSTEM_VARIABLE = 1193
+# ER_LOCK_DEADLOCK, which Galera also answers a certification conflict with
+DEADLOCK = 1213
 
 
 class Base(orm.DeclarativeBase):
@@ -439,6 +441,18 @@ def _upgrade(engine):
                 )
                 .values(status=JobStatus.FAILED, error="Superseded by an upgrade")
             )
+
+
+def is_conflict(error):
+    """Whether a database error is a certain abort that racing with another
+    writer explains, so that running the transaction again is safe: a
+    deadlock, as Galera reports a certification conflict, or a constraint
+    violation (see specs/ha.md, Galera specifics)"""
+    if isinstance(error, sa.exc.IntegrityError):
+        return True
+    return isinstance(error, sa.exc.DBAPIError) and getattr(error.orig, "args", ())[
+        :1
+    ] == (DEADLOCK,)
 
 
 class NotServing(Exception):
