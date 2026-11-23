@@ -99,7 +99,8 @@ expected ones:
 - it never folds OpenSM's cache, which every check does already;
 - it never arms the per-port M_Key turn-on, nor clears a failed one.
 
-So it's safe to run on any deployment, whatever its hardening groups.
+So whatever the hardening groups, it never re-keys a port. It still
+drops every missing switch, a hung one included: check `--status` first.
 
 **A dropped switch may be a hung one still forwarding,** so the pkeys and
 hosts its ports may hold stay tainted (specs/ha.md, While a switch is
@@ -113,7 +114,7 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
 
 With rows, a dead leaf's ports need `--release-port` too, or their jobs
 wait (specs/secured-profile.md, Lost ports and jobs). One run takes every
-GUID:
+GUID, and releases none if any isn't recorded:
 
 ```sh
 docker exec alternative-fabric-manager alternative-fabric-manager \
@@ -189,8 +190,8 @@ It protects too little to cost an operator step:
 
 **What replaces trust:**
 
-- The prober follows every row that answers as a switch, as
-  `--confirm-fabric` already does (`follow_unconfirmed`).
+- The prober follows every row that answers as a switch, as OpenSM's own
+  sweeps do.
 - The expected switches are only the completeness list.
 - What a check, or HA mode's reach probe, counts is the expected switches
   found. A new switch, or a spoofer, never makes a fragment look complete,
@@ -443,16 +444,19 @@ what to check and the command that retries.
 
 #### No automatic retry
 
-The manager never clears a failed turn-on by itself. Under AGENTS.md's
-Usability test:
+The manager never clears a failed turn-on by itself. The first arming
+restarts OpenSM by itself too, so the restart isn't what sets a retry
+apart. A retry follows a known failure, whose cause is probably
+unchanged. Under AGENTS.md's Usability test:
 
 - **It isn't a real hole.** A retry can't put two OpenSMs in charge,
   strand a port with a key no SM holds, or hand a tenant a key: it's the
   same turn-on, under the same success rule and set-back.
-- **But it isn't a harmless delay either.** Each retry restarts OpenSM on
-  a fabric others share. A retry whose start fails in a way the prober
-  can't tell leaves OpenSM stopped until it can (specs/secured-profile.md,
-  Turning it on): an outage.
+- **But it isn't an edge case either.** Automated, it would bring
+  repeated, expected outages on a fabric others share: each retry
+  restarts OpenSM, and one whose start fails in a way the prober can't
+  tell leaves OpenSM stopped until it can (specs/secured-profile.md,
+  Turning it on). That isn't "a delay one command undoes".
 - **Causes that configuration fixes already clear it,** since the record is
   keyed by the configuration hash.
 

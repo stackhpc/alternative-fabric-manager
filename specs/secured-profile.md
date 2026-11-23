@@ -1477,7 +1477,7 @@ while the volume and the ports hold the base's derived keys.
 | `--port-key-states` | Lists each recorded port's GUID, `holds`, `lapsed` and `reachable`, never a key |
 | `--port-m-key <guid>` | Prints that port's current key, for feeding `-y` under AGENTS.md's rule, never for display |
 | `--add-link` | Records a link |
-| `--release-port <guid> ...` | Completes a lost port's held jobs, and exempts a non-Neutron port from the fabric check's rule on lost ports, until the port answers its key again. It takes several GUIDs, and stops at the first it refuses, naming those it released |
+| `--release-port <guid> ...` | Completes a lost port's held jobs, and exempts a non-Neutron port from the fabric check's rule on lost ports, until the port answers its key again. It takes several GUIDs, and releases none if any isn't recorded |
 | `--forget-port-keys` | Drops every row. Refused while the group is named or any row holds a derived key. It also drops a recorded fingerprint that isn't the stored base's, which would otherwise keep every later start on Restores' path |
 | `--forget-port <guid>` | Drops one port and its links, for removed hardware. Refused for a port seen in the last day |
 
@@ -1707,9 +1707,11 @@ As in single node: it leaves nothing on ports.
 - **The rows.** The leader keeps the rows as the single-node manager does,
   behind the leader fence.
 - **Commands.** Operators' commands work in HA mode from any node, as in
-  single node. `--confirm-fabric` only records the expected switches,
-  and `--retry-port-key-turn-on` only clears the failed turn-on's record:
-  the leader arms, behind the leader fence.
+  single node, except `--confirm-fabric`. It asks the fabric from the
+  running OpenSM's container, by `ibswitches` or the prober, so it runs
+  on the leader's node. It only records the expected switches, and
+  `--retry-port-key-turn-on` only clears the failed turn-on's record: the
+  leader arms, behind the leader fence.
 - **A takeover never reads its host's cache volume.** The files there
   are from an older term, or none: the rows are newer, and folding a
   stale file could put back a link or a key state the rows have since

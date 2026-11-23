@@ -338,7 +338,7 @@ def arm_at_check(world):
     """Arm the turn-on as the manager's passing check does
     (specs/zero-touch.md, Arming), from that check's full verify, without
     applying it; return whether the target is on"""
-    world.check()
+    assert world.check(), world.applied().check_detail
     world.keeper()._arm_automatically()
     return world.state()["target"]
 
@@ -602,10 +602,17 @@ def test_confirm_fabric_without_the_group_only_confirms(world):
     assert world.state()["target"] is False
 
 
-def _not_armed(world, match):
+def _not_armed(world, match, passes=True):
     """A check whose arming finds a problem: the target stays off, and the
-    blocking reason, as --port-key-states shows it, names it"""
-    assert not arm_at_check(world)
+    blocking reason, as --port-key-states shows it, names it
+
+    passes is whether the check itself passes. Where the problem also
+    fails the check (passes=False), production never reaches the arming
+    from it, since only a passing check arms: such a test exercises the
+    arming's rule directly, so that it holds whatever the check finds."""
+    assert world.check() is passes, world.applied().check_detail
+    world.keeper()._arm_automatically()
+    assert world.state()["target"] is False
     with world.sessionmaker() as session:
         reason = port_keys.load_text(session, port_keys.ARMING)
     assert match in reason, reason
@@ -624,14 +631,14 @@ def test_arming_waits_without_links(world):
     world.manager.start()
     # OpenSM's cache lists nothing yet: no rows.
     world.driver.volume = {}
-    _not_armed(world, "no links")
+    _not_armed(world, "no links", passes=False)
 
 
 def test_arming_names_the_ports_that_dont_hold_m_key(world):
     running_with_rows(world)
     world.sim.ports[HV].key = derived(HV)
     world.sim.ports[T3].protect = 0
-    reason = _not_armed(world, "must answer the stored M_Key")
+    reason = _not_armed(world, "must answer the stored M_Key", passes=False)
     assert f"0x{HV:016x}" in reason and f"0x{T3:016x}" in reason
     assert f"0x{TN:016x}" not in reason
     assert_no_key(reason, world.sim)
@@ -642,7 +649,7 @@ def test_arming_waits_for_an_unknown_row_behind_an_up_link(world):
     world.keeper().add_link((S1, 6), (Z, 1))
     world.sim.add(Z, key=STRANGER)
     world.sim.cable(S1, 6, Z, 1)
-    _not_armed(world, f"0x{Z:016x}")
+    _not_armed(world, f"0x{Z:016x}", passes=False)
 
 
 def test_arming_allows_an_unknown_row_behind_a_down_link(world):

@@ -14,6 +14,7 @@ import argparse
 import logging
 import sys
 
+import sqlalchemy as sa
 import uvicorn
 
 from alternative_fabric_manager import allowed_sm, api, db, drivers, port_keeper
@@ -176,8 +177,8 @@ def main(argv=None):
         metavar="GUID",
         help="Complete each lost port's held jobs as they are, and exempt it "
         "from the fabric check's rule on lost ports, until it answers its key "
-        "again. It changes nothing on the port. Several GUIDs are released in "
-        "turn, stopping at the first that's refused",
+        "again. It changes nothing on the port. Several GUIDs are released "
+        "together: if any isn't recorded, none is",
     )
     commands.add_argument(
         "--forget-port-keys",
@@ -229,6 +230,20 @@ def main(argv=None):
         config = config_mod.Config.load(args.config_file)
     except config_mod.ConfigError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+
+    if args.reset_held and not args.confirm_fabric:
+        combined = [
+            name
+            for name, value in vars(args).items()
+            if name not in ("config_file", "debug", "reset_held")
+            and value not in (None, False)
+        ]
+        if combined:
+            sys.exit(
+                "alternative-fabric-manager: --reset-held combines only with "
+                "--confirm-fabric, not with --"
+                + ", --".join(name.replace("_", "-") for name in combined)
+            )
 
     if args.db_upgrade:
         if not config.connection:
@@ -366,6 +381,8 @@ def main(argv=None):
             _port_keys(config, args)
         except port_keeper.PortKeysError as e:
             sys.exit(f"alternative-fabric-manager: {e}")
+        except sa.exc.OperationalError as e:
+            sys.exit(_database_refused(e))
         return
 
     if (
@@ -424,6 +441,20 @@ def main(argv=None):
         manager.stop()
 
 
+def _database_refused(error):
+    """What a command beside the running manager says when the database
+    refuses its write, as a Galera certification conflict with the
+    leader's write of the same row does: nothing was changed, and running
+    it again is safe. Only the driver's own message is shown, never the
+    statement, whose parameters may hold a record that must stay unseen."""
+    detail = error.orig if error.orig is not None else type(error).__name__
+    return (
+        f"alternative-fabric-manager: the database refused the change ({detail}), "
+        "as when another node writes the same record at once: nothing was "
+        "changed; run it again"
+    )
+
+
 def _reset_held(manager, confirmed=False):
     """--reset-held, after a confirmation in the same command or on its own
     (specs/ha.md, Possibly held memberships)"""
@@ -431,6 +462,8 @@ def _reset_held(manager, confirmed=False):
         reset = manager.reset_held(confirmed=confirmed)
     except port_keeper.PortKeysError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
+    except sa.exc.OperationalError as e:
+        sys.exit(_database_refused(e))
     if reset is None:
         print(
             "No confirmation has removed a switch since the last reset: "
@@ -466,24 +499,11 @@ def _port_keys(config, args):
         added = keeper.add_link(local, peer)
         print(f"Recorded the link, and {added} new ports")
     elif args.release_port is not None:
-        # Every GUID is parsed first, so that a typo releases none.
+        # All or none: a GUID that doesn't parse, or isn't recorded,
+        # releases none.
         guids = [port_keeper.parse_guid(text) for text in args.release_port]
-        released = []
+        keeper.release_ports(guids)
         for guid in guids:
-            try:
-                keeper.release_port(guid)
-            except port_keeper.PortKeysError as e:
-                if len(guids) == 1:
-                    raise
-                done = (
-                    "released " + ", ".join(f"0x{g:016x}" for g in released)
-                    if released
-                    else "released none"
-                )
-                raise port_keeper.PortKeysError(
-                    f"{e}; {done}, and stopped there"
-                ) from None
-            released.append(guid)
             print(f"Released 0x{guid:016x} until it answers its key again")
     elif args.forget_port_keys:
         ports, links = keeper.forget_port_keys()

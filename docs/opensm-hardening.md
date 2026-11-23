@@ -1563,8 +1563,8 @@ have seen each switch:
   so it is never dropped this way: a removed or replaced leaf, or any
   switch without ports recorded, needs `--confirm-fabric`, and, with
   ports recorded, `--release-port` for the dead leaf's ports, which
-  takes every GUID in one run, or their jobs wait. A switch whose links are up but that doesn't answer stays,
-  since it may still forward. The evidence is always the check's own
+  takes every GUID in one run, or their jobs wait. A switch whose links
+  are up but that doesn't answer stays, since it may still forward. The evidence is always the check's own
   verify;
 - with ports recorded, any port recorded as a switch, expected or not,
   that doesn't answer while a recorded link to it is up fails the check:
@@ -1666,10 +1666,16 @@ $AFM --reset-held
 
 It's refused while the latest partitions haven't been swept: the
 switches stay recorded, so run `--reset-held` on its own once the sweep
-has finished. On its own, it's also refused while the last check found an
-expected switch missing, and with no switch dropped since the last reset
-it says "No confirmation has removed a switch since the last reset:
-nothing to reset.", and changes nothing. A switch the manager drops
+has finished.
+
+On its own, it needs the evidence the confirmation gave: it's refused
+unless the last fabric check passed, is fresh, and was taken after the
+confirmation, and no fresh sweep is due after switches returned. The
+message says which, and to run it again once a check passes, or, if the
+missing switches are gone, to run `--confirm-fabric --reset-held`. With
+no switch dropped since the last reset it says "No confirmation has
+removed a switch since the last reset: nothing to reset.", and changes
+nothing. A switch the manager drops
 itself, with every recorded link down, can't forward, and doesn't keep
 the taint.
 
@@ -1678,7 +1684,8 @@ the taint.
 `--confirm-fabric` is optional now: a shortcut that records the switches
 the fabric check sees at once, replacing the list, and the way to drop a
 removed switch the manager can't. It does nothing else, whatever the
-hardening groups, so it's safe to run on any deployment.
+hardening groups: it never re-keys a port. It drops every missing switch,
+a hung one included, so check `--status` first.
 
 ```sh
 $AFM --confirm-fabric
@@ -1790,8 +1797,8 @@ so its jobs are held". Only that port's jobs wait: its own tenant can
 cause this, and it holds no one else's.
 
 If the port won't be reached again, for example on a node being retired,
-release it. One run takes several GUIDs, released in turn; it stops at
-the first it refuses, naming those it released:
+release it. One run takes several GUIDs; if any isn't recorded, it
+releases none:
 
 ```sh
 $AFM --release-port <guid> ...

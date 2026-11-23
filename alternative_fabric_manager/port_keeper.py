@@ -1793,11 +1793,24 @@ class PortKeeper:
     def release_port(self, guid):
         """--release-port: complete a lost port's jobs as they are, and exempt
         it from the lost-port rule, until it answers its key again"""
+        self.release_ports([guid])
+
+    def release_ports(self, guids):
+        """--release-port with one or more GUIDs, in one transaction: if any
+        isn't recorded, none is released"""
         with self._session() as session:
-            row = session.get(db.FabricPort, port_keys.guid_text(guid))
-            if row is None:
-                raise PortKeysError(f"no port 0x{guid:016x} is recorded")
-            row.released = True
+            rows = []
+            for guid in guids:
+                row = session.get(db.FabricPort, port_keys.guid_text(guid))
+                if row is None:
+                    session.rollback()
+                    raise PortKeysError(
+                        f"no port 0x{guid:016x} is recorded"
+                        + ("; none was released" if len(guids) > 1 else "")
+                    )
+                rows.append(row)
+            for row in rows:
+                row.released = True
             session.commit()
 
     def forget_port_keys(self):

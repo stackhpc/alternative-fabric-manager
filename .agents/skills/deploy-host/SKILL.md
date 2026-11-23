@@ -59,7 +59,8 @@ ports (`--port-key-states` lists any), the deploy differs (see
   don't remove it, and don't run `--retry-port-key-turn-on`, which lets a
   failed turn-on be armed again, as part of a deploy. Each re-keys every
   port and needs the fabric owner's agreement. `--confirm-fabric` only
-  records the expected switches, so it's safe on any deployment.
+  records the expected switches, so it never re-keys a port, whatever
+  the groups; it still drops every missing switch.
 - **Check the states before and after**:
   ```sh
   sudo docker exec alternative-fabric-manager alternative-fabric-manager \

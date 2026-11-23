@@ -558,6 +558,26 @@ def test_retrying_with_no_failed_turn_on_changes_nothing(auto, monkeypatch, caps
     assert world.state() == before and not _failed(world)
 
 
+def test_a_retry_the_database_refuses_says_to_run_it_again(auto, monkeypatch, capsys):
+    # A Galera certification conflict with the leader's write: no
+    # traceback, and nothing of the statement, whose parameters may hold
+    # the failure's record.
+    def conflict(self):
+        raise sa.exc.OperationalError(
+            "UPDATE state", {"text": "the record"}, Exception("Deadlock found")
+        )
+
+    monkeypatch.setattr(port_keeper.PortKeeper, "retry_turn_on", conflict)
+    with pytest.raises(SystemExit) as raised:
+        _cli(auto, monkeypatch, capsys, "--retry-port-key-turn-on")
+    message = str(raised.value.code)
+    assert message == (
+        "alternative-fabric-manager: the database refused the change (Deadlock "
+        "found), as when another node writes the same record at once: nothing "
+        "was changed; run it again"
+    )
+
+
 @pytest.mark.parametrize(
     "case, said",
     [
