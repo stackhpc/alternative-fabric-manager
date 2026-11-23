@@ -51,15 +51,15 @@ ports (`--port-key-states` lists any), the deploy differs (see
   by itself once every precondition holds (the base stored by an earlier
   start, links recorded, and every recorded port behind an up link
   answering the stored `m_key`), and then restarts OpenSM, which re-keys
-  every port, at a passing check with no open job. `--confirm-fabric`
-  arms it at once, and clears a recorded failed turn-on. So on such a
+  every port, at a passing check with no open job. So on such a
   deployment, every redeploy may be the one that turns them on: deploy
   it only with the fabric owner's agreement. `--port-key-states` shows
   the target and what blocks the arming.
 - **Never begin or end them in a routine redeploy:** don't name the group,
-  don't remove it, and don't run `--confirm-fabric` on a deployment that
-  names it, as part of a deploy. Each re-keys every port and needs the
-  fabric owner's agreement.
+  don't remove it, and don't run `--retry-port-key-turn-on`, which lets a
+  failed turn-on be armed again, as part of a deploy. Each re-keys every
+  port and needs the fabric owner's agreement. `--confirm-fabric` only
+  records the expected switches, so it's safe on any deployment.
 - **Check the states before and after**:
   ```sh
   sudo docker exec alternative-fabric-manager alternative-fabric-manager \
@@ -152,9 +152,7 @@ Changing a shared DevStack's configuration needs its owner's agreement.
    `[opensm] confirm_checks` checks in a row (a minute by default), and no
    job completes until then ("No expected switches yet: recording them
    once the fabric has been stable for N checks"). Confirming the fabric
-   is optional: it records them at once. On a deployment that names
-   `m_key_per_port` with the keys off, it also arms their turn-on: see
-   Per-port M_Keys above first.
+   is optional: it records them at once, and does nothing else.
    ```sh
    sudo docker exec alternative-fabric-manager alternative-fabric-manager \
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric

@@ -889,12 +889,7 @@ ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
 
 Later, run it only after removing or replacing a switch (see
 [Record a removed or replaced switch](#record-a-removed-or-replaced-switch)).
-
-> [!WARNING]
-> On a deployment that names `m_key_per_port`, `--confirm-fabric` also
-> arms the per-port M_Key turn-on at once, which re-keys every port. Don't
-> run it there as a routine step. See
-> [To enable experimental hardening groups](#to-enable-experimental-hardening-groups).
+It only records the switches, whatever the hardening groups.
 
 ### Step 12: Test it
 
@@ -1439,8 +1434,7 @@ node, and none is in `all`. Read
 > **Naming `m_key_per_port` turns per-port M_Keys on**, and removing it
 > turns them off. The leader arms the turn-on by itself once its
 > preconditions hold, and restarts OpenSM, re-keying every port. Never
-> name it as a routine step, nor run `--confirm-fabric` on a deployment
-> that names it, which arms the turn-on at once.
+> name it as a routine step.
 
 1. **Upgrade every node to a release with configuration epochs first**,
    with the configuration unchanged. A node naming an experimental group
@@ -1806,16 +1800,16 @@ missing switches, and the jobs, tainted pkeys and tainted hosts they hold.
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric --reset-held
    ```
 
-   If it says it didn't reset, deal with what it names, and run it
-   again. The waiting jobs then complete after the leader's next sweep,
-   unless they reached `job_timeout` meanwhile and failed. With per-port
-   M_Keys, the removed switch's adapter ports also need
-   `--release-port <guid>`, one GUID per run, or their jobs wait (see
-   [specs/zero-touch.md](../specs/zero-touch.md), What stays manual).
-
-On a deployment that names `m_key_per_port`, this also arms the per-port
-M_Key turn-on at once: agree it first (see
-[To enable experimental hardening groups](#to-enable-experimental-hardening-groups)).
+   It prints the switches it kept and those it dropped. It records
+   only the switches, whatever the hardening groups. If it says the
+   latest partitions haven't been swept yet, the switches are recorded:
+   run `--reset-held` on its own, on any controller, once the leader's
+   sweep has finished. The waiting jobs then complete after the leader's
+   next sweep, unless they reached `job_timeout` meanwhile and failed.
+   With per-port M_Keys, the removed switch's adapter ports also need
+   `--release-port <guid> ...`, which takes every GUID in one run, or
+   their jobs wait (see [specs/zero-touch.md](../specs/zero-touch.md),
+   What stays manual).
 
 ### Use diagnostic tools
 

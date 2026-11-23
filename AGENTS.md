@@ -141,8 +141,7 @@ there manages the fabric's OpenSM, so:
   off: the manager arms the turn-on by itself once its preconditions hold
   (base stored by an earlier start, links recorded, every port on
   `m_key`), and restarts OpenSM, re-keying every port
-  (specs/zero-touch.md). Never name it there as a routine step, nor run
-  `--confirm-fabric` on such a deployment, which arms it at once. A
+  (specs/zero-touch.md). Never name it there as a routine step. A
   deployment with
   `all` (or only removals) gains each group its release notes name; one
   with an explicit list of groups gains none. With M_Key protection on,
