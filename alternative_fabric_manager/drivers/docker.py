@@ -34,6 +34,7 @@ import requests.exceptions
 
 from alternative_fabric_manager import allowed_sm, opensm_conf
 from alternative_fabric_manager import prober as probes
+from alternative_fabric_manager import scan as scans
 from alternative_fabric_manager.config import OPENSM_CACHE_DIR, parse_volumes
 from alternative_fabric_manager.drivers import (
     UNATTRIBUTED,
@@ -335,6 +336,9 @@ class DockerReloader:
         self.container_name = container
         self.timeout = timeout
         self._client = client
+        # How far sweep_starts() has read OpenSM's log, and how many sweep
+        # starts it had counted there: ((container ID, timestamp), count)
+        self._sweep_mark = None
 
     @property
     def client(self):
@@ -412,6 +416,104 @@ class DockerReloader:
         # Unassigned virtual functions report placeholder GUIDs.
         own -= {0, 0xFFFFFFFFFFFFFFFF}
         return Fabric(switch_guids, sms, own)
+
+    def _running_container(self):
+        container = self.client.containers.get(self.container_name)
+        if container.status != "running":
+            raise ReloadError(f"OpenSM container {self.container_name} isn't running")
+        return container
+
+    def _log_since(self, mark):
+        """The running OpenSM's log lines since mark, (container ID, the
+        last line's timestamp in nanoseconds), or all of them for another
+        container: (container, messages, the new mark). Lines are taken by
+        the daemon's timestamps, so that each is read once; one without a
+        timestamp is read rather than skipped. Raises ReloadError if the
+        log can't be read."""
+        try:
+            container = self._running_container()
+            last = mark[1] if mark is not None and mark[0] == container.id else 0
+            kwargs = {"stdout": True, "stderr": True, "timestamps": True}
+            if last:
+                kwargs["since"] = last // 10**9
+            text = container.logs(**kwargs).decode(errors="replace")
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't read OpenSM's log: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't read OpenSM's log: {type(e).__name__}"
+            ) from e
+        messages = []
+        newest = last
+        for line in text.splitlines():
+            stamp, _, message = line.partition(" ")
+            when = _log_time(stamp)
+            if when is not None:
+                if when <= last:
+                    continue
+                newest = max(newest, when)
+            else:
+                message = line
+            messages.append(message)
+        return container, messages, (container.id, newest)
+
+    # While a switch is missing (specs/ha.md): the check's scan, the
+    # virtualization dump read with it, and the sweep starts between scans
+
+    def scan(self, m_key=None):
+        """Where an ibnetdiscover scan, from OpenSM's container, places each
+        adapter port, {port GUID: place} (scan.parse_ibnetdiscover). It only
+        Gets; with M_Key protection on it needs -y, given as ibswitches is.
+        Raises ReloadError if it fails."""
+        try:
+            container = self._running_container()
+            m_key_args = ["-y", m_key] if m_key else []
+            text = self._exec(container, ["ibnetdiscover", *m_key_args])
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: {e}") from e
+        return scans.parse_ibnetdiscover(text)
+
+    def virtualization_dump(self):
+        """OpenSM's virtualization dump, as text, "" if OpenSM hasn't written
+        one, as without virtualization; raises ReloadError if it can't be
+        read"""
+        try:
+            container = self._running_container()
+            try:
+                stream, _stat = container.get_archive(scans.VIRTUALIZATION_DUMP)
+            except docker.errors.NotFound:
+                return ""
+            data = b"".join(stream)
+        except docker.errors.DockerException as e:
+            raise ReloadError(f"Docker: can't read the virtualization dump: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise ReloadError(
+                f"Docker: can't read the virtualization dump: {type(e).__name__}"
+            ) from e
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+                member = tar.next()
+                if member is None or not member.isfile():
+                    raise ReloadError("The virtualization dump isn't a regular file")
+                return tar.extractfile(member).read().decode(errors="replace")
+        except tarfile.TarError as e:
+            raise ReloadError(f"Can't read the virtualization dump: {e}") from e
+
+    def sweep_starts(self):
+        """A mark of how many sweeps the running OpenSM has logged starting,
+        (container ID, count), by its log: two marks of one container a
+        count apart saw one sweep start between them. Raises ReloadError if
+        the log can't be read."""
+        mark = self._sweep_mark
+        container, messages, log_mark = self._log_since(
+            None if mark is None else mark[0]
+        )
+        count = mark[1] if mark is not None and mark[0][0] == container.id else 0
+        count += sum(
+            1 for line in messages if any(m in line for m in SWEEP_START_MARKERS)
+        )
+        self._sweep_mark = (log_mark, count)
+        return (container.id, count)
 
     @staticmethod
     def _exec(container, command):
@@ -852,39 +954,10 @@ class ManagedDocker(DockerReloader):
         Lines are taken by the daemon's timestamps, so that each is judged
         once. Raises ReloadError if the log can't be read.
         """
-        try:
-            container = self.client.containers.get(self.container_name)
-            if container.status != "running":
-                raise ReloadError(
-                    f"OpenSM container {self.container_name} isn't running"
-                )
-            mark = self._log_mark
-            last = mark[1] if mark is not None and mark[0] == container.id else 0
-            kwargs = {"stdout": True, "stderr": True, "timestamps": True}
-            if last:
-                kwargs["since"] = last // 10**9
-            text = container.logs(**kwargs).decode(errors="replace")
-        except docker.errors.DockerException as e:
-            raise ReloadError(f"Docker: can't read OpenSM's log: {e}") from e
-        except requests.exceptions.RequestException as e:
-            raise ReloadError(
-                f"Docker: can't read OpenSM's log: {type(e).__name__}"
-            ) from e
+        _container, messages, self._log_mark = self._log_since(self._log_mark)
         findings = LogFindings()
-        newest = last
-        for line in text.splitlines():
-            stamp, _, message = line.partition(" ")
-            when = _log_time(stamp)
-            if when is not None:
-                if when <= last:
-                    continue
-                newest = max(newest, when)
-            else:
-                # Judged rather than skipped: a line judged twice repeats an
-                # alarm or a contest, one skipped could hide an SM.
-                message = line
+        for message in messages:
             _note_finding(findings, message)
-        self._log_mark = (container.id, newest)
         return findings
 
     def query_sm_port(self, guid, m_key):

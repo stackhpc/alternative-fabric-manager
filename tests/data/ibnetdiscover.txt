@@ -1,0 +1,66 @@
+#
+# Topology file: generated on Fri Nov 20 18:36:43 2026
+#
+# Initiated from node 040973ffffc75168 port 040973ffffc75168
+
+vendid=0x2c9
+devid=0xcf08
+sysimgguid=0xec0d9a0300b12560
+switchguid=0xec0d9a0300b12560(ec0d9a0300b12560)
+Switch	37 "S-ec0d9a0300b12560"		# "SwitchIB Mellanox Technologies" base port 0 lid 5 lmc 0
+[1]	"H-b88303ffff6b9208"[1](b88303ffff6b9208) 		# "localhost mlx5_0" lid 2 4xEDR
+[2]	"H-b88303ffff6b03e8"[1](b88303ffff6b03e8) 		# "localhost mlx5_0" lid 7 4xEDR
+[5]	"H-b88303ffff96b9e0"[1](b88303ffff96b9e0) 		# "MT4119 ConnectX5   Mellanox Technologies" lid 6 4xEDR
+[6]	"H-040973ffffc75124"[1](40973ffffc75124) 		# "MT4119 ConnectX5   Mellanox Technologies" lid 3 4xEDR
+[7]	"H-040973ffffc7514c"[1](40973ffffc7514c) 		# "MT4119 ConnectX5   Mellanox Technologies" lid 4 4xEDR
+[8]	"H-040973ffffc75168"[1](40973ffffc75168) 		# "MT4119 ConnectX5   Mellanox Technologies" lid 1 4xEDR
+[37]	"H-ec0d9a0300b12568"[1](ec0d9a0300b12568) 		# "Mellanox Technologies Aggregation Node" lid 8 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0x40973ffffc7514c
+caguid=0x40973ffffc7514c
+Ca	1 "H-040973ffffc7514c"		# "MT4119 ConnectX5   Mellanox Technologies"
+[1](40973ffffc7514c) 	"S-ec0d9a0300b12560"[7]		# lid 4 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0xcf09
+sysimgguid=0xec0d9a0300b12560
+caguid=0xec0d9a0300b12568
+Ca	1 "H-ec0d9a0300b12568"		# "Mellanox Technologies Aggregation Node"
+[1](ec0d9a0300b12568) 	"S-ec0d9a0300b12560"[37]		# lid 8 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0x40973ffffc75124
+caguid=0x40973ffffc75124
+Ca	1 "H-040973ffffc75124"		# "MT4119 ConnectX5   Mellanox Technologies"
+[1](40973ffffc75124) 	"S-ec0d9a0300b12560"[6]		# lid 3 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0xb88303ffff96b9e0
+caguid=0xb88303ffff96b9e0
+Ca	1 "H-b88303ffff96b9e0"		# "MT4119 ConnectX5   Mellanox Technologies"
+[1](b88303ffff96b9e0) 	"S-ec0d9a0300b12560"[5]		# lid 6 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0xb88303ffff6b03e8
+caguid=0xb88303ffff6b03e8
+Ca	1 "H-b88303ffff6b03e8"		# "localhost mlx5_0"
+[1](b88303ffff6b03e8) 	"S-ec0d9a0300b12560"[2]		# lid 7 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0xb88303ffff6b9208
+caguid=0xb88303ffff6b9208
+Ca	1 "H-b88303ffff6b9208"		# "localhost mlx5_0"
+[1](b88303ffff6b9208) 	"S-ec0d9a0300b12560"[1]		# lid 2 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR
+
+vendid=0x2c9
+devid=0x1017
+sysimgguid=0x40973ffffc75168
+caguid=0x40973ffffc75168
+Ca	1 "H-040973ffffc75168"		# "MT4119 ConnectX5   Mellanox Technologies"
+[1](40973ffffc75168) 	"S-ec0d9a0300b12560"[8]		# lid 1 lmc 0 "SwitchIB Mellanox Technologies" lid 5 4xEDR

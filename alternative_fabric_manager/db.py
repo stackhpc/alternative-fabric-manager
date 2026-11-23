@@ -76,6 +76,12 @@ class Port(Base):
     guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), unique=True)
     host: orm.Mapped[str] = orm.mapped_column(sa.String(255), default="")
     revision: orm.Mapped[int | None] = orm.mapped_column(sa.BigInteger, nullable=True)
+    # Its binding:vnic_type as networking-mlnx sent it, such as direct for a
+    # virtual function, which a grant on a partial check is judged by (see
+    # specs/ha.md, While a switch is missing); None for a port recorded
+    # before it was kept. Nullable, so that the previous version, which
+    # doesn't write it, can share the database during a rolling upgrade.
+    vnic_type: orm.Mapped[str | None] = orm.mapped_column(sa.String(64), nullable=True)
 
 
 class JobStatus(str, enum.Enum):
@@ -197,6 +203,38 @@ class Applied(Base):
         Timestamp, nullable=True
     )
     check_detail: orm.Mapped[str] = orm.mapped_column(sa.Text, default="")
+    # While a switch is missing (specs/ha.md). Each is nullable or has a
+    # server default, so that the previous version, which doesn't write
+    # them, can share the database during a rolling upgrade.
+    # Whether the last check was partial: it failed only because expected
+    # switches are missing; and the open grants' GUIDs it placed where the
+    # last scan before the sweep had them, as a JSON list
+    check_partial: orm.Mapped[bool] = orm.mapped_column(
+        default=False, server_default=sa.false()
+    )
+    check_placed: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
+    # The expected switches the last check found missing, as a JSON list
+    missing_switches: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
+    # Whether a check found expected switches missing and no sweep has been
+    # made since a check passed after it: until one has, no job completes
+    # in full, and a takeover inherits it
+    missing: orm.Mapped[bool] = orm.mapped_column(
+        default=False, server_default=sa.false()
+    )
+    # Recorded with each sweep: where the last scan before it placed the
+    # GUIDs of the sweep's open grants, and that scan's mark in OpenSM's
+    # log of sweep starts, as JSON
+    placements: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
+    # The possibly held memberships, the latest body's, and whether an
+    # expected switch was removed since the map was last reset, as JSON
+    held: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
+    # The term of the leader that last wrote held, which every leader's
+    # write of it compares and sets
+    held_term: orm.Mapped[int] = orm.mapped_column(default=0, server_default="0")
+    # Where the check runs ibswitches: the adapter ports the last passing
+    # check's ibnetdiscover scan found, and the switch port each is cabled
+    # to, as JSON, for the virtual functions placed by their hosts' ports
+    adapter_links: orm.Mapped[str | None] = orm.mapped_column(sa.Text, nullable=True)
 
 
 class ExpectedSwitch(Base):
@@ -357,6 +395,23 @@ class FabricLink(Base):
     )
 
 
+class HostPort(Base):
+    """A hypervisor's physical port, learnt at a passing check from OpenSM's
+    virtualization dump: a vport of it was a virtual function's port bound
+    to the host. A virtual function whose vport doesn't exist yet is placed
+    by them (specs/ha.md, Where a port is)."""
+
+    __tablename__ = "host_ports"
+
+    # The physical port's GUID, as 16 lower-case hex digits: one host's at a
+    # time, the last it was learnt for
+    guid: orm.Mapped[str] = orm.mapped_column(sa.String(16), primary_key=True)
+    host: orm.Mapped[str] = orm.mapped_column(sa.String(255), index=True)
+    learnt: orm.Mapped[datetime.datetime | None] = orm.mapped_column(
+        Timestamp, nullable=True
+    )
+
+
 class KnownSMPort(Base):
     """A port whose SM may hold the fabric's keys, so that OpenSM ignoring an
     SM there contests the fabric (specs/secured-profile.md, Allowed SM
@@ -382,6 +437,14 @@ _ADDED_COLUMNS = {
     "applied": {
         "term": "INTEGER NOT NULL DEFAULT 0",
         "contested": "BOOLEAN NOT NULL DEFAULT 0",
+        "check_partial": "BOOLEAN NOT NULL DEFAULT 0",
+        "check_placed": "TEXT",
+        "missing_switches": "TEXT",
+        "missing": "BOOLEAN NOT NULL DEFAULT 0",
+        "placements": "TEXT",
+        "held": "TEXT",
+        "held_term": "INTEGER NOT NULL DEFAULT 0",
+        "adapter_links": "TEXT",
     },
     "nodes": {
         "port_guids": "TEXT",
@@ -391,6 +454,7 @@ _ADDED_COLUMNS = {
     },
     "ports": {
         "revision": "INTEGER",
+        "vnic_type": "VARCHAR(64)",
     },
     "jobs": {
         "generation": "INTEGER NOT NULL DEFAULT 0",

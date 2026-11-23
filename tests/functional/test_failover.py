@@ -24,6 +24,7 @@ import pytest
 import sqlalchemy as sa
 
 from alternative_fabric_manager import db
+from alternative_fabric_manager import manager as manager_mod
 from tests.functional import runner as runner_mod
 
 pytestmark = pytest.mark.skipif(
@@ -1214,7 +1215,8 @@ def test_a_hung_apply_loop_loses_the_lease(cluster):
 @pytest.mark.timings(step_down_cooldown=0.0)
 def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
     # Every node misses the switch, so nobody reaches more, leadership
-    # stays, and no job completes until an operator removes it.
+    # stays, and no revocation completes until an operator removes it (a
+    # grant may, on a partial check: see the test after this one).
     leader = cluster.wait_leader()
     _expect_switches(cluster, [runner_mod.SWITCH, 2])
     apply_change(cluster, leader, 1)
@@ -1236,7 +1238,9 @@ def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
         "the candidates' reach published",
     )
     _switches(cluster, [runner_mod.SWITCH], node=leader)
-    job = _send(cluster, leader, "/cloudx/Network", network(2, 102))
+    job = _delete(
+        cluster, leader, f"/cloudx/Network/{NETWORK.format(1)}", network(1, 101)
+    )
     end = time.monotonic() + 10 * cluster.timings["check_interval"]
     while time.monotonic() < end:
         _not_completed(cluster, leader, job)
@@ -1249,6 +1253,100 @@ def test_a_dead_switch_holds_jobs_until_an_operator_removes_it(cluster):
         session.commit()
     cluster.job_completes(leader, job, 60)
     assert lease.read().term == term
+
+
+def _delete(cluster, via, path, body):
+    """A DELETE, retried on 503, as networking-mlnx does"""
+
+    def sent():
+        status, job = cluster.request(via, "DELETE", path, body)
+        if status == 503:
+            return None
+        assert status == 202, status
+        return job
+
+    return wait_for(sent, 20, f"DELETE {path} accepted")
+
+
+def _place_ports(cluster, ports):
+    """Where the fake scan finds each port: {n of port(n): (switch, port)}"""
+    path = os.path.join(cluster.fabric, "ports")
+    with open(f"{path}.tmp", "w") as f:
+        json.dump(
+            {
+                f"{0x1234560000782100 + 0xB0 + n:x}": [f"{switch:x}", number]
+                for n, (switch, number) in ports.items()
+            },
+            f,
+        )
+    os.replace(f"{path}.tmp", path)
+
+
+@pytest.mark.timings(step_down_cooldown=0.0)
+def test_grants_complete_while_a_leaf_is_paused(cluster):
+    # A leaf stops answering on every node: a partial check. A new network,
+    # and a port placed on the live switch, complete; a port behind the
+    # leaf, and a deletion, wait, and complete once it is back, on the
+    # fresh sweep (specs/ha.md, While a switch is missing).
+    leaf = 2
+    leader = cluster.wait_leader()
+    _expect_switches(cluster, [runner_mod.SWITCH, leaf])
+    _place_ports(
+        cluster, {1: (runner_mod.SWITCH, 1), 2: (runner_mod.SWITCH, 2), 3: (leaf, 1)}
+    )
+    apply_change(cluster, leader, 1)
+    _config, lease, sessionmaker = _operator(cluster)
+    term = lease.read().term
+    # The candidates lose the leaf first, as in the test above, so that the
+    # leader never sees a candidate that reaches more.
+    for i in NODES:
+        if i != leader:
+            _switches(cluster, [runner_mod.SWITCH], node=i)
+    wait_for(
+        lambda: all(
+            reach == 1
+            for name, _uuid, _hb, reach, _stopped, _hash in lease.nodes()
+            if name != f"node-{leader}"
+        ),
+        30,
+        "the candidates' reach published",
+    )
+    _switches(cluster, [runner_mod.SWITCH], node=leader)
+
+    def partial():
+        with sessionmaker() as session:
+            applied = session.get(db.Applied, 1)
+            return applied is not None and applied.check_partial
+
+    wait_for(partial, 30, "a partial check")
+    created = _send(cluster, leader, "/cloudx/Network", network(2, 102))
+    cluster.job_completes(leader, created, 60)
+    # On another host than port 1, whose deletion below is a revocation
+    granted = _send(
+        cluster, leader, "/cloudx/Port", dict(port(2, 2), **{"binding:host_id": "h2"})
+    )
+    cluster.job_completes(leader, granted, 60)
+    behind = _send(
+        cluster, leader, "/cloudx/Port", dict(port(3, 2), **{"binding:host_id": "h3"})
+    )
+    revoked = _delete(cluster, leader, f"/cloudx/Port/{PORT.format(1)}", port(1, 1))
+    end = time.monotonic() + 10 * cluster.timings["check_interval"]
+    while time.monotonic() < end:
+        _not_completed(cluster, leader, behind)
+        _not_completed(cluster, leader, revoked)
+        time.sleep(0.5)
+    with sessionmaker() as session:
+        lines = "\n".join(manager_mod.fabric_status(session))
+    assert f"0x{leaf:016x}" in lines and "tainted hosts: compute-0" in lines
+    assert cluster.leader() == leader and lease.read().term == term
+    # The leaf is back.
+    for i in NODES:
+        _switches(cluster, [runner_mod.SWITCH, leaf], node=i)
+    cluster.job_completes(leader, behind, 60)
+    cluster.job_completes(leader, revoked, 60)
+    assert lease.read().term == term
+    with sessionmaker() as session:
+        assert not session.get(db.Applied, 1).missing
 
 
 @pytest.mark.timings(step_down_cooldown=0.0)

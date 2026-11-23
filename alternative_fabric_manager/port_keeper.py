@@ -245,6 +245,11 @@ class CheckOutcome:
     # the expected switches (specs/zero-touch.md)
     verify: object = None
     complete: bool = True
+    # Every verify of the check, from which a partial check places the ports
+    # they reached (specs/ha.md, Where a port is)
+    results: list = dataclasses.field(default_factory=list)
+    # Whether the check ran a full verify, which reached every port it could
+    full: bool = False
 
 
 class PortKeeper:
@@ -1005,6 +1010,16 @@ class PortKeeper:
                 # yet: ibswitches as before.
                 return None
             target = port_keys.load_running(session)
+            expected = expected_guids(session)
+            # The expected switches as recorded, each with its node GUID,
+            # by which this check's own verify says whether any is missing
+            expected_rows = [
+                (
+                    int(row.guid, 16),
+                    None if row.node_guid is None else int(row.node_guid, 16),
+                )
+                for row in session.scalars(sa.select(db.ExpectedSwitch))
+            ]
             recorded = port_keys.load_fingerprint(session)
             applied = session.get(db.Applied, 1)
             generation = (applied.generation or 0) if applied is not None else 0
@@ -1029,8 +1044,15 @@ class PortKeeper:
 
         began = time.monotonic()
         results = []
-        # A full verify is due after an interval.
-        full = self._last_full is None or began - self._last_full[1] >= interval
+        # A full verify is due after an interval, and at every check while
+        # expected switches are missing, so that the scan a partial check
+        # places ports from reaches every adapter port, not only the
+        # switches and the open jobs' ports (specs/ha.md, Where a port is).
+        full = (
+            self._last_full is None
+            or began - self._last_full[1] >= interval
+            or getattr(self.manager, "_missing_fabric", False)
+        )
         if full:
             try:
                 result = verify(prober.FULL, ports, links)
@@ -1083,8 +1105,16 @@ class PortKeeper:
             nodes={guid: result.ports[guid].node_guid for guid in result.switches},
             verify=result,
             complete=all(each.complete for each in results),
+            results=results,
+            full=full,
         )
-        outcome.problems = self._problems(ports, neutron, results)
+        outcome.problems = self._problems(
+            ports,
+            neutron,
+            results,
+            expected,
+            self._any_missing(expected_rows, result, outcome.nodes),
+        )
         if not full and not outcome.complete:
             # A full verify's own rule says so below; the switches' or the
             # jobs' verify running out of time means ports it didn't reach
@@ -1299,7 +1329,38 @@ class PortKeeper:
                         guids.add(guid)
         return guids
 
-    def _problems(self, ports, neutron, results):
+    @staticmethod
+    def _excused(guid, result, expected, missing=True):
+        """Whether a port the verify never sent a key to is behind only
+        expected switches that are missing, or switches whose links are
+        down, on its route: only while some expected switch is missing, so
+        that this can make a check partial at most, never passing
+        (specs/ha.md, A partial check)"""
+        if not missing:
+            return False
+        blocking = result.unrouted.get(guid)
+        return bool(blocking) and all(
+            switch in expected or switch in result.link_down for switch in blocking
+        )
+
+    @staticmethod
+    def _any_missing(expected_rows, result, nodes):
+        """Whether this check's own verify misses some expected switch,
+        each matched as the check matches it: by the GUID it was recorded
+        by, or its node GUID, against the switches the verify found and
+        their node GUIDs, so that a list recorded from ibswitches, before
+        it's translated, counts the same. Never an older full verify's: one
+        taken while a switch was missing would excuse ports after it's back
+        (specs/ha.md, A partial check)."""
+        found = set(result.switches) | {
+            node for node in nodes.values() if node is not None
+        }
+        return any(
+            guid not in found and (node is None or node not in found)
+            for guid, node in expected_rows
+        )
+
+    def _problems(self, ports, neutron, results, expected=frozenset(), missing=False):
         """Why the fabric check fails, as far as per-port keys go"""
         problems = []
         if any(result.own_port_lost for result in results):
@@ -1336,6 +1397,11 @@ class PortKeeper:
             for row in ports.values()
             if row.switch is not True
             and row.guid not in result.link_down
+            # Behind an expected switch that's missing, or one whose link
+            # is down, it was never sent a key: the missing switch fails the
+            # check instead. Behind any other switch that didn't answer, it
+            # still counts.
+            and not self._excused(row.guid, result, expected, missing)
             and port_keys.guid_text(row.guid) not in neutron
             and not row.released
             and row.guid not in result.keyed

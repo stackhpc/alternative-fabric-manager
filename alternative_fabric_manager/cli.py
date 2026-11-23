@@ -49,6 +49,16 @@ def main(argv=None):
         "turn-on at once, which the running manager applies, once every port "
         "is found ready; otherwise it says why not and exits non-zero",
     )
+    parser.add_argument(
+        "--reset-held",
+        action="store_true",
+        help="With --confirm-fabric: also reset the memberships some port may "
+        "hold stale to those the partitions now give, which untaints their "
+        "pkeys and hosts for grants while a switch is missing. Needed after "
+        "--confirm-fabric removes a switch, which may be a hung one still "
+        "forwarding with old partitions: run it once that switch is "
+        "unplugged or wiped",
+    )
     enforcement = parser.add_mutually_exclusive_group()
     enforcement.add_argument(
         "--show-enforcement-errors",
@@ -67,7 +77,9 @@ def main(argv=None):
     parser.add_argument(
         "--status",
         action="store_true",
-        help="HA: show the lease's holder, term and freeze, and exit",
+        help="Show the last fabric check, and while switches are missing, the "
+        "open jobs, tainted pkeys and tainted hosts they hold; in HA mode, the "
+        "lease's holder, term and freeze too; and exit",
     )
     parser.add_argument(
         "--db-upgrade",
@@ -224,19 +236,24 @@ def main(argv=None):
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
+    if args.reset_held and not args.confirm_fabric:
+        sys.exit("alternative-fabric-manager: --reset-held needs --confirm-fabric")
+
     if args.status:
         from alternative_fabric_manager.ha import lease as lease_mod
 
-        lease = lease_mod.GaleraLease(
-            db.make_sessionmaker(config.database_url, config.call_timeout)
-        )
-        from alternative_fabric_manager.ha import operator
+        sessionmaker = db.make_sessionmaker(config.database_url, config.call_timeout)
+        if config.ha:
+            lease = lease_mod.GaleraLease(sessionmaker)
+            from alternative_fabric_manager.ha import operator
 
-        try:
-            state = lease.read()
-        except lease_mod.NotPrimary as e:
-            sys.exit(f"alternative-fabric-manager: {e}")
-        print("\n".join(operator.status(state)))
+            try:
+                state = lease.read()
+            except lease_mod.NotPrimary as e:
+                sys.exit(f"alternative-fabric-manager: {e}")
+            print("\n".join(operator.status(state)))
+        with sessionmaker() as session:
+            print("\n".join(manager_mod.fabric_status(session)))
         return
 
     if (
@@ -308,6 +325,25 @@ def main(argv=None):
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in confirmation.switches:
             print(f"0x{guid:016x}")
+        if args.reset_held and confirmation.problems:
+            print(
+                "Not resetting the memberships ports may hold stale while the "
+                "confirmation found problems: deal with them, then run it again"
+            )
+        elif args.reset_held:
+            try:
+                pkeys, hosts = manager.reset_held()
+            except port_keeper.PortKeysError as e:
+                sys.exit(f"alternative-fabric-manager: {e}")
+            print(
+                "Reset the memberships ports may hold stale; this untainted "
+                + (
+                    "pkeys " + ", ".join(f"0x{pkey:04x}" for pkey in pkeys)
+                    if pkeys
+                    else "no pkey"
+                )
+                + (", and hosts " + ", ".join(hosts) if hosts else "")
+            )
         if confirmation.note:
             print(confirmation.note)
         if confirmation.problems:

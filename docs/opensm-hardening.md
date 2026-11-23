@@ -808,6 +808,55 @@ have seen each switch:
   down that comes back hung holds jobs again. Once it answers the check
   passes; for one that won't, `--release-port <guid>`.
 
+**While a switch is missing** (specs/ha.md, While a switch is missing),
+grants that it can't matter to still complete. A check that fails only
+because expected switches are missing (OpenSM is master, no SM contests
+it, it queried the fabric in full, and nothing else fails it) is
+*partial*. It places the ports from its own scan: with ports recorded, from
+the recorded links of the ports its verify reached, the prober verifying
+every port at each check while a switch is missing; otherwise from an
+`ibnetdiscover` scan run in the same check, read-only, with `-y <m_key>`
+as `ibswitches` has it, through the switches the check found. Running
+virtual functions are placed through OpenSM's
+`/var/log/opensm-virtualization.dump`: a vport listed once, ACTIVE, at a
+non-zero index of a placed physical port. A new VF has no vport until its
+guest runs, which Nova holds until the port's job completes, so the
+manager learns each hypervisor's physical ports from the dump at passing
+checks (`--status` lists them), and places a VF that the dump doesn't
+list at all when every physical port learnt for its host is placed, and
+every adapter port behind the missing switches, as passing scans last
+found them (`ibnetdiscover` at most once every `confirm_checks` checks, or
+the recorded links), is known: a learnt physical port, a Neutron port's
+GUID, or the port of an HA node that runs no learnt VF. A physical port
+seen for two hosts is learnt for none until two passing checks in a row
+agree, and a learnt port is forgotten once three passing scans in a row
+miss it. On a partial check, a network's creation, or
+an update that keeps its pkey, completes, and a port's create or an
+update that keeps its GUID and network completes if the scans either side
+of its sweep placed its GUID in the same place, with no other OpenSM sweep
+start logged between them, its pkey isn't *tainted*, and, unless it's a
+virtual function (`binding:vnic_type` `direct`), its host isn't tainted
+and no revocation is open for another port on it. A grant placed only
+after its sweep is swept again, once per place. Deletions, pkey changes,
+and ports moving network or changing GUID wait for the whole fabric. A
+pkey or host is tainted while some port may still hold it stale: the
+manager records every membership it writes, before writing it, and
+forgets those the partitions no longer have only at a passing check after
+a sweep of the whole fabric of the latest partitions. Until such a reset,
+as after an upgrade, or after another version or another term swept
+partitions the record didn't see, no port's grant completes on a partial
+check. Once the switches are back, the manager sweeps again before any job
+completes in full. A partial check is still a failed check: it raises the
+alarm, which, like `--status`, names the missing switches and the open
+jobs, tainted pkeys and tainted hosts they hold, and counts towards
+stepping down. After `--confirm-fabric` drops a switch, which may be a
+hung one still forwarding, the taint stays until `--confirm-fabric
+--reset-held`, whose message names the pkeys it untaints: run it once the
+switch is unplugged or wiped. It's refused while the latest partitions
+haven't been swept, or the confirmation found problems. A switch the
+manager drops itself, with every recorded link down, can't forward, and
+doesn't keep the taint.
+
 Nothing is added, dropped or recorded, and the counts start again, while
 the check couldn't query the fabric (a verify that ran out of time counts
 as that), saw another master, or OpenSM wasn't master. The counts also

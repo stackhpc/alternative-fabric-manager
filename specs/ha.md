@@ -79,12 +79,13 @@ would stop itself. The deployment role checks this.
 | `jobs` | Operation, object, the GUIDs and pkeys it involves, generation, effect, deadline, status, error, timestamps (UTC) |
 | `lease` | One row: the leader's node and instance UUID, its term, its renewal counter, whether it was released, the **target set** (see The lease), when leadership last moved, and the **freeze**: whether it is frozen, the frozen leader's node, instance UUID and term, who froze it, when, and when it expires (see Freeze) |
 | `nodes` | Per node: name, instance UUID, heartbeat counter, configuration hash, the number of expected switches it reaches, its adapters' node GUIDs, its physical functions' port GUIDs (see The secured profile), and whether its OpenSM is verified stopped (see Fencing, Rejoining) |
-| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, the last fabric check's result and time, whether it was partial and the open grants' GUIDs it placed, and the memberships some port may hold (see While a switch is missing) |
+| `applied` | The leader's last swept generation, its body, which object each partition and membership in it comes from, the GUIDs whose pkey tables OpenSM couldn't set, the switch ports whose enforcement OpenSM cleared, the leader's term, the last fabric check's result and time, whether it was partial and the open grants' GUIDs it placed, and the memberships some port may hold, whether that map is complete, and the generation of its latest body (see While a switch is missing) |
 | `known_sm_ports` | Port GUIDs whose SMs may hold the fabric's keys: every port GUID a node row has recorded, kept when the node is forgotten, and those an operator recorded |
 | `fabric_ports`, `fabric_links` | Per-port M_Keys' records: each port's key state, never a key, and the links OpenSM's cache listed (see specs/secured-profile.md, Per-port M_Keys) |
 | `quarantine` | Objects left out of rendering, and why |
 | `expected_switches` | The switch GUIDs a complete fabric has (see Job completion) |
 | `deferred` | A request whose pkey or GUID another object still holds, or a port on a network that waits or is quarantined, its values, revision and job |
+| `host_ports` | The physical ports each hypervisor's virtual functions were seen on, learnt from OpenSM's virtualization dump (see While a switch is missing) |
 
 networking-mlnx orders requests per object only, so a network reusing a
 deleted network's VLAN, or a port taking over a deleted port's GUID, can
@@ -558,7 +559,16 @@ matters where the check runs `ibswitches`.
 **A partial check** is one that fails only because expected switches are
 missing: OpenSM is master, the check is contested by no SM, it queried the
 fabric in full, and it finds no enforcement error, no unanswered key, no
-failing apply, and nothing else that fails a check. A check that couldn't
+failing apply, and nothing else that fails a check. In prober mode,
+while this check's own verify finds some expected switch missing (never
+an older full verify's, which may predate the switch's return), a port
+never sent a key because
+each switch that didn't answer on its route (the shortest the recorded
+links give, which the prober follows) is an expected switch that is
+missing or one whose link is down is no unanswered key; one behind any
+other switch that didn't answer is. With no expected switch missing,
+every such port counts as unanswered, as before, so this can make a
+check partial at most, never passing. A check that couldn't
 query the fabric, or any part of what follows, isn't partial: it fails as
 today. A partial check is still a failed check everywhere else: for the
 alarm, for Stepping down (a live candidate that reaches more switches
@@ -586,12 +596,65 @@ end of the second other than the watched sweep's own: OpenSM then knew
 the port, in the same place, throughout the watched sweep, so the sweep
 set it or logged an error, and a port that appeared or moved meanwhile,
 such as a vport created after the sweep began, waits for the next one.
-For a vport, "the same way" means the same dump entry in both reads. The
+For a vport, "the same way" means the same dump entry in both reads.
+
+A new virtual function's grant can't wait for its vport, though: a VF
+becomes a vport only once its guest runs, and Nova keeps a new guest
+paused until the port's job completes. So the manager **learns each
+hypervisor's physical ports**: at each passing check, never a partial
+one, every vport the dump lists exactly once, ACTIVE, at an index above 0,
+whose GUID is a recorded port's, of `binding:vnic_type` `direct`, bound to
+host H and with no open job, on a physical port that isn't a recorded
+port's GUID, as a bare metal node's is, records (H, that physical port)
+in `host_ports`. A node row's port can be learnt: a control-plane host
+that also runs instances, as in a hyperconverged or all-in-one
+deployment, is a hypervisor too. A physical port seen for another host
+than the one it is learnt for, as a stale dump after a migration may show
+it, is unlearnt, logged, and kept as learnt for no host; it is learnt
+again only once two passing checks in a row, each with a dump it could
+read, of the same OpenSM, see it for the same host. A learnt physical
+port is dropped once three passing checks' scans in a row, of the same
+OpenSM, haven't found it. Both counts are the leader's, in memory, and
+start again at each start of OpenSM, which only delays relearning and
+pruning. Three, since a scan made while its link flapped mustn't drop
+it, and three such scans span at least three `confirm_checks` intervals
+where the check runs `ibswitches`. Learning and pruning are leader
+writes, behind the leader fence. A virtual function's GUID that **neither dump read lists
+at all** is placed if H has at least one learnt physical port, and the
+same learnt set is placed the same way by both scans, in the same
+sweep-start window, and every adapter port that the last passing scan
+found cabled to a switch now missing is attributed: a physical port
+learnt for a host, a recorded port's GUID, or a node row's port while
+none of that node's ports is learnt (or kept as learnt for no host). Once
+one is, the node is a hypervisor whose other ports a VF may land on, so
+they count only once learnt themselves. One that isn't may be another
+physical port of H, which the VF could land on, behind a hung
+leaf, so it holds every grant placed this way. A GUID a dump read lists
+but doesn't place (listed twice, not ACTIVE, or on a physical port that
+isn't placed), as when a VF is attached to a running guest or migrated
+live, waits as any vport does; a host with no learnt physical port waits.
+The manager keeps the adapter-to-switch links that passing scans found:
+in prober mode `fabric_links`, and where the check runs `ibswitches`, an
+`ibnetdiscover` scan at a passing check at most once every
+`confirm_checks` checks, which adds to the links kept rather than
+replacing them, so that an adapter whose link was down at one scan keeps
+its last link until a scan finds it elsewhere. They never shrink: an
+adapter removed from the fabric stays behind its old switch, and, while
+that switch is missing, holds the grants placed through hosts' physical
+ports unless it is attributed. That fails closed, and is a known cost. An adapter cabled, or moved between hosts,
+since that scan is a hardware change at the fabric, which this doesn't
+cover. Otherwise, a VF placed this way is on a physical port the scan
+placed, behind a switch the check found, so OpenSM programs its vport
+when it appears, as with a whole fabric, and pkey taint still guards
+against a leak. The
 leader keeps its last scan's placements in memory, since a request's
 grant usually didn't exist when that scan ran, and records, with each
 sweep in `applied`, those of the GUIDs the sweep's grants involve; after
 a takeover, the last scan is the new leader's, never the old one's. So
-the records, and the writes, follow the jobs, not the fabric.
+the records, and the writes, follow the jobs, not the fabric. An open
+grant whose GUID, or for a virtual function its host's physical ports,
+the last scan places where the last sweep's records don't is swept again,
+once for each place it is seen in, so that it isn't left to time out.
 
 **Possibly held memberships.** `applied` keeps a map from pkey to the
 (GUID, membership type, host) entries that some port may hold, the host
@@ -610,24 +673,40 @@ stale is never granted on a partial check:
   deletion, migration or rebinding. Taint isn't pruned while the fabric
   is incomplete, since telling that a stale holder has been cleared needs
   evidence the partial check doesn't have;
-- the map is reset only at a passing check after a fresh sweep (below)
-  with no unattributed error, and only if no expected switch was removed
-  since the map was last reset: to the memberships of the latest body,
-  plus the entries of every GUID that had a pkey error in that sweep, so
-  that one failing adapter doesn't keep every pkey tainted. After
+- the map is reset only at a passing check after a sweep that counts in
+  full (the fresh sweep below, or any later one) with no unattributed
+  error, and only if `--confirm-fabric` removed no expected switch since
+  the map was last reset, and the swept body is the latest body written
+  (otherwise the reset waits for that body's sweep): to the memberships
+  of the swept body, plus the
+  entries of every GUID that had a pkey error in that sweep, so that one
+  failing adapter doesn't keep every pkey tainted. After
   `--confirm-fabric` removes a switch, which may be a hung one still
   forwarding, its ports' stale pkeys stay tainted, and only
   `--confirm-fabric --reset-held` resets the map, which the command's
-  message names along with the pkeys it untaints.
+  message names along with the pkeys it untaints, and which it refuses
+  while the confirmation found problems. Zero-touch's drop of a switch
+  whose recorded links are all down doesn't block the reset: such a
+  switch can't forward;
+- the map is **complete** only once a reset has made it so: until then,
+  as after an upgrade, or once another version may have swept a body the
+  map didn't see (`applied`'s generation or body changed without it), or
+  written one and crashed before recording its sweep (before a leader's
+  first write of the map, the map's term isn't its own or the one just
+  before it: every takeover raises the term by one, so another term
+  led between), it may lack memberships some port still holds, so no
+  port's grant completes on a partial check. A network's creation, which
+  grants nothing, still may.
 
 Taint only affects grants on a partial check: with the whole fabric seen,
 jobs complete as before.
 
 **A grant completes on a partial check** when conditions 1, 2 and 3 of
 Job completion hold, and 5 with this reading: OpenSM is still running on
-the file it swept, and the sweep started after a passing or partial check
-that followed the last contested one (missing switches don't invalidate
-it here, a contested check still does). The partial check is recorded
+the file it swept, and the sweep started after a passing check that
+followed the last contested one (missing switches don't invalidate it
+here, a contested check still does, and a partial check never ends a
+contest). The partial check is recorded
 after the sweep, no older than `2 × check_interval`, and:
 
 1. the job is a grant: creating a network, creating a port, or updating a
@@ -667,7 +746,8 @@ while a switch was missing doesn't count once it is back, since OpenSM
 set that switch's ports later, in a sweep the manager didn't watch.
 
 `--status` and the alarm name the missing switches, and the open jobs,
-tainted pkeys and tainted hosts they hold.
+tainted pkeys and tainted hosts they hold; `--status` also lists the
+physical ports learnt for each host.
 
 A future improvement would close the leak itself, not only bound it: leave
 grants in tainted pkeys out of the rendered body while a switch is
@@ -1459,10 +1539,12 @@ leader's OpenSM has swept its membership with the whole fabric in view.
       fence, node port GUIDs, `--forget-node`, and each group as The
       secured profile says. Their hardware runs in HA mode are still to
       come.
-- [ ] Complete grants on a partial check (see While a switch is missing):
+- [x] Complete grants on a partial check (see While a switch is missing):
       placing ports from the check's own scan (`ibnetdiscover` where
       the check runs `ibswitches`), at the checks either side of the
-      sweep, vports through OpenSM's virtualization dump; the possibly
+      sweep, vports through OpenSM's virtualization dump, and virtual
+      functions whose vport doesn't exist yet through their hosts' learnt
+      physical ports; the possibly
       held memberships with their hosts, extended before each write, and
       tainted pkeys and hosts; each port's `binding:vnic_type`, recorded
       from the port networking-mlnx sends; `--confirm-fabric
@@ -1540,6 +1622,10 @@ leader's OpenSM has swept its membership with the whole fabric in view.
 
 ## Open questions
 
+- Does a ConnectX-5 keep a vport's pkey table across a change of its
+  virtual function's GUID, or a reset of the function? If it does, a VF
+  placed through its host's physical ports could start with a stale
+  table (see While a switch is missing).
 - Does OpenSM 5.17 honour SMInfo DISABLE, and how quickly?
 - For confirmed fencing: can the switches' ports be disabled reliably with
   the M_Key, and does a disabled port stay disabled whatever its neighbour

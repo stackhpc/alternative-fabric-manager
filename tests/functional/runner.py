@@ -266,6 +266,36 @@ class ProcessRunner:
             {self.guid},
         )
 
+    # While a switch is missing (specs/ha.md): the check's scan, the
+    # virtualization dump, and the sweep starts between scans
+
+    def scan(self, m_key=None):
+        """Where this node's scan places each adapter port: a test's ports
+        file, {port GUID: [switch GUID, port]} in hex, of which those on a
+        switch this node reaches. A paused leaf's ports aren't placed."""
+        path = os.path.join(self.fabric_dir, "ports")
+        if not os.path.exists(path):
+            return {}
+        with open(path) as f:
+            ports = json.load(f)
+        switches = self.switches()
+        return {
+            int(guid, 16): ["port", f"{int(switch, 16):016x}", port]
+            for guid, (switch, port) in ports.items()
+            if int(switch, 16) in switches
+        }
+
+    def virtualization_dump(self):
+        return ""
+
+    def sweep_starts(self):
+        """The fake counts a sweep at each SIGHUP, as OpenSM logs one"""
+        pids = self._own_sms()
+        sweeps = self._sweeps()
+        if not pids or sweeps is None:
+            raise ReloadError("OpenSM isn't running")
+        return (pids[0], sweeps)
+
     def stop(self):
         if self._unstoppable():
             return

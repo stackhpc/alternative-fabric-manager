@@ -18,20 +18,32 @@ come from (partitions.attribute()). A delete therefore completes once a sweep
 of a state at or after it has nothing from its object, whatever else holds
 the same pkey or GUID by then, and a port's create can only complete once
 OpenSM has swept a membership of that very port.
+
+An effect also records what a partial fabric check judges the job by (see
+specs/ha.md, While a switch is missing): whether it is a grant, which only
+adds memberships or changes none, and the hosts its ports are bound to, and
+for a port its binding:vnic_type. An effect without them, as a job created
+before they were recorded has, is a revocation whose hosts aren't known, so
+it waits for a whole fabric, and holds every host's grants meanwhile.
 """
 
 import json
 
 
-def network_present(network_id, pkey):
+def network_present(network_id, pkey, grant=False, hosts=()):
     """A network's create or update: its partition, with its current pkey,
-    or, for a flat network (pkey None), nothing beyond the generation"""
+    or, for a flat network (pkey None), nothing beyond the generation.
+    grant is whether it creates the network; hosts are those of its ports,
+    whose memberships an update may revoke."""
     if pkey is None:
-        return {"kind": "flat_network", "network": network_id, "guids": []}
-    return {"kind": "network", "network": network_id, "pkey": pkey, "guids": []}
+        effect = {"kind": "flat_network", "network": network_id, "guids": []}
+    else:
+        effect = {"kind": "network", "network": network_id, "pkey": pkey, "guids": []}
+    effect.update(grant=bool(grant), hosts=sorted(set(hosts)))
+    return effect
 
 
-def network_absent(network_id, port_ids, guids):
+def network_absent(network_id, port_ids, guids, hosts=()):
     """A network's deletion: no partition of it, nor membership of its ports,
     which are recorded now, since the deletion removes them"""
     return {
@@ -39,18 +51,39 @@ def network_absent(network_id, port_ids, guids):
         "network": network_id,
         "ports": sorted(port_ids),
         "guids": sorted(guids),
+        "grant": False,
+        "hosts": sorted(set(hosts)),
     }
 
 
-def port_present(port_id, pkey, guid):
+def port_present(
+    port_id, pkey, guid, grant=False, host=None, old_host=None, vnic_type=None
+):
     """A port's create or update: a full membership of it in its network's
-    partition, pkey, and no other membership of it"""
-    return {"kind": "port", "port": port_id, "pkey": pkey, "guids": [guid]}
+    partition, pkey, and no other membership of it. grant is whether it only
+    adds memberships or changes none; host is the port's host, old_host the
+    one it was on before an update, both of which hosts lists."""
+    return {
+        "kind": "port",
+        "port": port_id,
+        "pkey": pkey,
+        "guids": [guid],
+        "grant": bool(grant),
+        "host": host,
+        "hosts": sorted({h for h in (host, old_host) if h is not None}),
+        "vnic_type": vnic_type,
+    }
 
 
-def port_absent(port_id, guid=None):
+def port_absent(port_id, guid=None, hosts=()):
     """A port's deletion: no membership of it"""
-    return {"kind": "no_port", "port": port_id, "guids": [guid] if guid else []}
+    return {
+        "kind": "no_port",
+        "port": port_id,
+        "guids": [guid] if guid else [],
+        "grant": False,
+        "hosts": sorted({host for host in hosts if host is not None}),
+    }
 
 
 def dumps(effect):
