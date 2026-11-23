@@ -193,17 +193,60 @@ applies: configure OpenSM's protection yourself.
 
 ### Expected switches
 
-AFM only completes jobs while OpenSM sees every switch it expects, so that
-an OpenSM cut off on part of the fabric can't report it as the whole.
-AFM learns the list by itself, and adds new switches the same way.
+AFM checks that OpenSM sees every switch it expects, so that an OpenSM
+cut off on part of the fabric can't report it as the whole. AFM learns
+the list by itself, and adds new switches the same way.
 
-`--confirm-fabric` records the switches OpenSM sees now. You need it only
-to drop a switch that was removed or replaced:
+**While an expected switch is missing,** the check fails and raises an
+alarm, but not every job waits:
+
+| Job | While a switch is missing |
+| --- | --- |
+| A grant (a port joins a partition) that the missing switch can't affect | Completes |
+| A grant on a pkey that a port may still hold stale ("tainted"), or, except for a virtual function, on a tainted host or one with another port's revocation open | Waits |
+| Any port's grant, after an upgrade, until a sweep of the whole fabric | Waits |
+| A revocation (a port leaves a partition, or is deleted) | Waits |
+
+A grant can't be affected when its port is outside the missing switch's
+reach, both before and after its sweep. A virtual function that
+OpenSM doesn't list yet is judged by its host's physical ports, which
+AFM learns at passing checks. When the switch returns, AFM sweeps again,
+and the waiting jobs complete, unless they reached `[opensm]
+job_timeout` meanwhile and failed. With per-port M_Keys, a switch that
+doesn't answer behind a link that's up counts as hung, and holds every
+job. [specs/ha.md](specs/ha.md), While a
+switch is missing, has the full rules.
+
+To see what a missing switch holds:
 
 ```sh
 docker exec alternative-fabric-manager alternative-fabric-manager \
-  --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
+  --config-file /etc/alternative-fabric-manager/afm.conf --status
 ```
+
+It shows the last fabric check, and while switches are missing, the open
+jobs, tainted pkeys and tainted hosts they hold.
+
+**To drop a switch that was removed or replaced:**
+
+1. **Check which switches are missing,** with `--status` as above.
+   The next step drops every missing switch, so make sure they are all
+   ones you removed.
+2. **Unplug or wipe each of them.** A hung switch can keep forwarding
+   with its old partitions.
+3. **Record the switches OpenSM sees now,** and reset what ports may
+   still hold stale, which untaints their pkeys and hosts:
+
+   ```sh
+   docker exec alternative-fabric-manager alternative-fabric-manager \
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric --reset-held
+   ```
+
+   If it says it didn't reset, deal with what it names, and run it
+   again. The waiting jobs then complete after AFM's next sweep. With
+   per-port M_Keys, the removed switch's adapter ports also need
+   `--release-port <guid>`, one GUID per run, or their jobs wait (see
+   [specs/zero-touch.md](specs/zero-touch.md), What stays manual).
 
 > [!WARNING]
 > Naming the experimental `m_key_per_port` group in `[opensm] hardening`

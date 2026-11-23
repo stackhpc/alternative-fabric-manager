@@ -500,8 +500,25 @@ OpenSM.
 
 ### Step 7: Write the tasks that run after the container
 
-These tasks wait until AFM's API answers on each controller. Write
-`etc/kayobe/containers/alternative-fabric-manager/post.yml`:
+These tasks wait until AFM's API answers on each controller. Then they
+apply a configuration change, so that changing `afm.conf.j2` needs
+nothing but `kayobe overcloud service deploy`.
+
+AFM reads its configuration only when it starts, and Kayobe replaces the
+container only when its definition changes, such as its image or
+volumes. So these tasks restart each instance whose configuration
+directory has a file newer than the container's start:
+
+1. They read the lease with `--status`, and stop the deploy if the
+   cluster is frozen: restarting a frozen leader would stop its OpenSM.
+2. They restart the other controllers one at a time, each waiting until
+   its API answers again. If one fails, the remaining candidates still
+   restart, but the leader doesn't, and the deploy fails.
+3. They restart the leader last, as a rolling configuration change needs
+   (see [Change AFM's configuration](#change-afms-configuration)).
+4. They wait for the takeover: a holder with a higher term.
+
+Write `etc/kayobe/containers/alternative-fabric-manager/post.yml`:
 
 ```yaml
 ---
@@ -512,7 +529,156 @@ These tasks wait until AFM's API answers on each controller. Write
   until: afm_health.status == 200
   retries: 30
   delay: 2
+  any_errors_fatal: true
+
+# rc 0: a file in AFM's configuration directory changed after the
+# container started, so the instance still runs the old configuration. A
+# container that this deploy created or started reads the new one.
+# Podman's StartedAt ends in a zone name, which find doesn't accept. Any
+# other failure is rc 2, which fails the task.
+- name: Check whether AFM's configuration changed since it started
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      started=$({{ container_engine }} inspect \
+        -f '{{ '{{' }}.State.StartedAt{{ '}}' }}' alternative_fabric_manager \
+        | sed 's/ [A-Z]*$//') || exit 2
+      newer=$(find {{ afm_config_dir }} -type f -newermt "$started") || exit 2
+      [ -n "$newer" ]
+    executable: /bin/bash
+  register: afm_config_newer
+  changed_when: false
+  failed_when: afm_config_newer.rc > 1
+  check_mode: false
+  become: true
+  when: afm_restart_on_change | default(true) | bool
+
+# The play holds every overcloud host, but only AFM's hosts run these tasks
+- name: Note which instances need a restart
+  ansible.builtin.set_fact:
+    afm_restart_hosts: >-
+      {{ ansible_play_hosts | map('extract', hostvars)
+         | selectattr('afm_config_newer', 'defined')
+         | selectattr('afm_config_newer.rc', 'defined')
+         | selectattr('afm_config_newer.rc', 'equalto', 0)
+         | map(attribute='inventory_hostname') | list }}
+
+- name: Read AFM's lease
+  ansible.builtin.command:
+    argv:
+      - "{{ container_engine }}"
+      - exec
+      - alternative_fabric_manager
+      - alternative-fabric-manager
+      - --config-file
+      - "{{ afm_config_dir }}/afm.conf"
+      - --status
+  register: afm_status
+  changed_when: false
+  check_mode: false
+  run_once: true
+  become: true
+  when: afm_restart_hosts | length > 0
+
+# "holder: <node> (instance ...)", where <node> is [ha] node, which this
+# guide sets to inventory_hostname, or "-" while no instance holds the
+# lease; and "term: N"
+- name: Note AFM's leader and term
+  ansible.builtin.set_fact:
+    afm_leader: >-
+      {{ (afm_status.stdout | default('')
+          | regex_findall('^holder: ([^ ]+)', multiline=True)
+          | default(['-'], true)) | first }}
+    afm_term: >-
+      {{ (afm_status.stdout | default('')
+          | regex_findall('^term: ([0-9]+)', multiline=True)
+          | default(['0'], true)) | first | int }}
+  when: afm_restart_hosts | length > 0
+
+- name: Refuse to restart AFM while it is frozen
+  ansible.builtin.fail:
+    msg: >-
+      AFM's configuration changed, but the cluster is frozen, and a
+      restart would stop the frozen leader's OpenSM. Deploy again after
+      --unfreeze.
+  run_once: true
+  when:
+    - afm_restart_hosts | length > 0
+    - "afm_status.stdout is not search('^freeze: none$', multiline=True)"
+
+# One at a time, each waiting until its instance answers again, while the
+# leader keeps leading on the old configuration
+- name: Restart AFM on the other controllers, one at a time
+  ansible.builtin.shell: >-
+    {{ container_engine }} restart alternative_fabric_manager
+    && timeout 120 sh -c 'until curl -sf
+    http://{{ internal_net_name | net_ip }}:{{ afm_api_port }}/healthz;
+    do sleep 2; done'
+  when:
+    - inventory_hostname in afm_restart_hosts
+    - inventory_hostname != afm_leader
+  throttle: 1
+  any_errors_fatal: true
+  become: true
+
+# Last: the leader steps down and releases the lease. Once every live node
+# has the new configuration's hash, the epoch moves, and an updated
+# instance takes over.
+- name: Restart AFM on the leader
+  ansible.builtin.shell: >-
+    {{ container_engine }} restart alternative_fabric_manager
+    && timeout 120 sh -c 'until curl -sf
+    http://{{ internal_net_name | net_ip }}:{{ afm_api_port }}/healthz;
+    do sleep 2; done'
+  when:
+    - inventory_hostname in afm_restart_hosts
+    - inventory_hostname == afm_leader
+  any_errors_fatal: true
+  become: true
+
+# A takeover can take up to 237 s with this guide's settings, or 327 s
+# with m_key_per_port: wait up to 360 s for a holder with a higher term
+- name: Wait for the takeover
+  ansible.builtin.command:
+    argv:
+      - "{{ container_engine }}"
+      - exec
+      - alternative_fabric_manager
+      - alternative-fabric-manager
+      - --config-file
+      - "{{ afm_config_dir }}/afm.conf"
+      - --status
+  register: afm_after
+  until: >-
+    afm_after.rc == 0
+    and afm_after.stdout is search('^released: no$', multiline=True)
+    and ((afm_after.stdout
+          | regex_findall('^term: ([0-9]+)', multiline=True)
+          | default(['0'], true)) | first | int) > afm_term | int
+  retries: 72
+  delay: 5
+  changed_when: false
+  run_once: true
+  become: true
+  when:
+    - afm_restart_hosts | length > 0
+    - afm_leader in afm_restart_hosts
 ```
+
+Notes on these tasks:
+
+- **`docker restart`** stops the instance cleanly first, within Docker's
+  default 10 s, which `container_stop_timeout` matches (step 6).
+- **They need `curl` and `bash`** on each controller.
+- **A rerun is safe.** If a deploy stops part way, the next one restarts
+  whichever instances still run the old configuration.
+- **Any change to `afm.conf` restarts AFM**, a comment included, and a
+  restart of the leader is a failover. Group changes together.
+- **Don't change `afm_tag` and the configuration in one deploy.** A new
+  image replaces every controller's container at once, not one at a time.
+- **`-e afm_restart_on_change=false`** writes the configuration without
+  restarting anything, for a change that needs every instance stopped
+  (see [Changing the HA timeouts](#change-afms-configuration)).
 
 ### Step 8: Add the HAProxy service
 
@@ -1411,11 +1577,9 @@ warning.
 
 ### Change AFM's configuration
 
-AFM reads its configuration when it starts. Kayobe replaces the container
-only when its definition changes, such as its image or volumes, so a
-change to `afm.conf.j2` alone reaches each controller's file without
-restarting AFM. Restart each instance yourself, one controller at a time,
-with the leader last.
+Edit `afm.conf.j2` and deploy. AFM reads its configuration only when it
+starts, so the deploy's `post.yml` (step 7) restarts each instance whose
+configuration changed: one controller at a time, with the leader last.
 
 **Configuration epochs keep this safe.** Each node's configuration has a
 hash, covering everything that decides the partitions and how OpenSM
@@ -1441,24 +1605,27 @@ Per-port M_Keys).
    kayobe overcloud database backup
    ```
 
-2. **Edit `afm.conf.j2`**, and write it to every controller:
+2. **Edit `afm.conf.j2`, and deploy:**
 
    ```sh
    kayobe overcloud service deploy
    ```
 
-   AFM keeps running with the old configuration.
+   `pre.yml` writes the new `afm.conf` to every controller. `post.yml`
+   then restarts each controller's instance in turn, waiting for its API
+   to answer before the next, and the leader's last, then waits for the
+   takeover. For a change the hash
+   covers, each restarted candidate is `NOT allowed` until the epoch
+   moves, and logs an alarm once per epoch. That is expected. The leader
+   steps down when it restarts, and releases the lease. Once every live
+   node has the new hash, the epoch moves, and an updated node takes
+   over.
 
-3. **Find the leader** with `--status`.
+   If the cluster is frozen, the deploy stops before restarting
+   anything: deploy again after `--unfreeze`.
 
-4. **Restart each candidate, one at a time.** On each controller that
-   isn't the leader:
-
-   ```sh
-   ${ENGINE:-docker} restart alternative_fabric_manager
-   ```
-
-   A restart stops the instance cleanly first. Then check its hash:
+3. **Check** that the epoch number moved, and that every node's hash is
+   `allowed`:
 
    ```sh
    ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
@@ -1466,16 +1633,14 @@ Per-port M_Keys).
    ```
 
    The output lists the epoch, `This configuration: <hash> ...`, and one
-   `Node <name>: <hash> allowed` or `NOT allowed` line per node. A
-   restarted node is `NOT allowed` until the epoch moves, and logs an
-   alarm once per epoch. That is expected.
+   `Node <name>: <hash> allowed` or `NOT allowed` line per node.
+   `--status` names the new holder.
 
-5. **Restart the leader last**, the same way. It steps down and releases
-   the lease. Once every live node has the new hash, the epoch moves, and
-   an updated node takes over.
-
-6. **Check** with `--config-epoch` that the epoch number moved, and that
-   every node's hash is `allowed`. `--status` names the new holder.
+To restart an instance by hand instead, for example on a controller that
+`--limit` left out, run `${ENGINE:-docker} restart
+alternative_fabric_manager` there, candidates first and the leader last,
+or deploy again: the next deploy restarts whichever instances still run
+the old configuration.
 
 A node that comes back with the old configuration isn't allowed, and,
 being live, stops the epoch moving back.
@@ -1503,7 +1668,13 @@ in the unsafe direction needs every node stopped cleanly, so that no node
 may still run OpenSM under the old settings, and raises an alarm
 meanwhile. The fabric has no subnet manager while every node is stopped.
 
-1. Write the new configuration with `kayobe overcloud service deploy`.
+1. Edit `afm.conf.j2`, and write it to every controller without
+   restarting AFM:
+
+   ```sh
+   kayobe overcloud service deploy -e afm_restart_on_change=false
+   ```
+
 2. On every controller, stop AFM cleanly:
 
    ```sh
@@ -1616,13 +1787,31 @@ Expected output: `Forgot N deleted objects and every recorded revision`.
 ### Record a removed or replaced switch
 
 The leader adds new switches to the expected ones by itself, but doesn't
-drop a removed or replaced switch while its links may be up. Once the
-hardware change is done, run `--confirm-fabric` on the leader:
+drop a removed or replaced switch while its links may be up. Meanwhile
+the switch counts as missing: grants it can't affect still complete, and
+other jobs wait (see the README's
+[Expected switches](../README.md#expected-switches)). `--status` shows the
+missing switches, and the jobs, tainted pkeys and tainted hosts they hold.
 
-```sh
-${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
-  --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
-```
+1. **Check which switches are missing,** with `--status` on any
+   controller. The next step drops every missing switch, so make sure
+   they are all ones you removed.
+2. **Unplug or wipe each of them.** A hung switch can keep forwarding
+   with its old partitions.
+3. **On the leader, record the switches OpenSM sees now,** and reset what
+   ports may still hold stale, which untaints their pkeys and hosts:
+
+   ```sh
+   ${ENGINE:-docker} exec alternative_fabric_manager alternative-fabric-manager \
+     --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric --reset-held
+   ```
+
+   If it says it didn't reset, deal with what it names, and run it
+   again. The waiting jobs then complete after the leader's next sweep,
+   unless they reached `job_timeout` meanwhile and failed. With per-port
+   M_Keys, the removed switch's adapter ports also need
+   `--release-port <guid>`, one GUID per run, or their jobs wait (see
+   [specs/zero-touch.md](../specs/zero-touch.md), What stays manual).
 
 On a deployment that names `m_key_per_port`, this also arms the per-port
 M_Key turn-on at once: agree it first (see
