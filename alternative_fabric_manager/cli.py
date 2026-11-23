@@ -40,24 +40,22 @@ def main(argv=None):
     parser.add_argument(
         "--confirm-fabric",
         action="store_true",
-        help="Optional: the manager records the expected switches, and arms "
-        "per-port M_Keys, by itself. Record the switches OpenSM sees now as "
-        "the fabric's expected ones, which every fabric check must find, and, "
-        "with per-port M_Keys, the links its cache lists, and exit: needed "
-        "only to drop a removed or replaced switch. With the m_key_per_port "
-        "hardening group named, it also clears a failed turn-on and arms the "
-        "turn-on at once, which the running manager applies, once every port "
-        "is found ready; otherwise it says why not and exits non-zero",
+        help="Record the switches OpenSM sees now as the fabric's expected "
+        "ones, which every fabric check must find, print those it dropped "
+        "and kept, and exit. Optional: the manager records new switches by "
+        "itself. Needed only to drop a removed or replaced switch. It does "
+        "nothing else, whatever the hardening groups",
     )
     parser.add_argument(
         "--reset-held",
         action="store_true",
-        help="With --confirm-fabric: also reset the memberships some port may "
-        "hold stale to those the partitions now give, which untaints their "
-        "pkeys and hosts for grants while a switch is missing. Needed after "
-        "--confirm-fabric removes a switch, which may be a hung one still "
-        "forwarding with old partitions: run it once that switch is "
-        "unplugged or wiped",
+        help="Reset the memberships some port may hold stale to those the "
+        "partitions now give, which untaints their pkeys and hosts for grants "
+        "while a switch is missing, and exit. Needed after --confirm-fabric "
+        "drops a switch, which may be a hung one still forwarding with old "
+        "partitions: run it once that switch is unplugged or wiped, with "
+        "--confirm-fabric or on its own. On its own, it does nothing unless "
+        "a confirmation has dropped a switch since the last reset",
     )
     enforcement = parser.add_mutually_exclusive_group()
     enforcement.add_argument(
@@ -151,6 +149,14 @@ def main(argv=None):
         "recorded, and what keeps the manager from arming the turn-on",
     )
     commands.add_argument(
+        "--retry-port-key-turn-on",
+        action="store_true",
+        help="Clear a recorded failed per-port M_Key turn-on, once its cause "
+        "is fixed, so that the manager arms the turn-on again at a passing "
+        "check once every port is ready, and then applies it, which restarts "
+        "OpenSM and re-keys every port",
+    )
+    commands.add_argument(
         "--port-m-key",
         metavar="GUID",
         help="Print the M_Key the port holds now, a secret, only to feed a "
@@ -236,9 +242,6 @@ def main(argv=None):
     except db.SchemaError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
-    if args.reset_held and not args.confirm_fabric:
-        sys.exit("alternative-fabric-manager: --reset-held needs --confirm-fabric")
-
     if args.status:
         from alternative_fabric_manager.ha import lease as lease_mod
 
@@ -311,9 +314,7 @@ def main(argv=None):
             confirmation = manager.confirm_fabric()
         except drivers.ReloadError as e:
             # The switches weren't recorded: the fabric couldn't be asked, as
-            # when this host's port answers no key the manager holds. The
-            # links OpenSM's cache lists may have been, as a check records
-            # them.
+            # when this host's port answers no key the manager holds.
             sys.exit(
                 f"alternative-fabric-manager: can't confirm the fabric: {e} "
                 "(no switch was confirmed)"
@@ -325,34 +326,21 @@ def main(argv=None):
             sys.exit("alternative-fabric-manager: OpenSM sees no switches")
         for guid in confirmation.switches:
             print(f"0x{guid:016x}")
-        if args.reset_held and confirmation.problems:
+        if confirmation.removed:
             print(
-                "Not resetting the memberships ports may hold stale while the "
-                "confirmation found problems: deal with them, then run it again"
+                "Dropped from the expected switches: "
+                + ", ".join(f"0x{guid:016x}" for guid in confirmation.removed)
             )
-        elif args.reset_held:
-            try:
-                pkeys, hosts = manager.reset_held()
-            except port_keeper.PortKeysError as e:
-                sys.exit(f"alternative-fabric-manager: {e}")
-            print(
-                "Reset the memberships ports may hold stale; this untainted "
-                + (
-                    "pkeys " + ", ".join(f"0x{pkey:04x}" for pkey in pkeys)
-                    if pkeys
-                    else "no pkey"
-                )
-                + (", and hosts " + ", ".join(hosts) if hosts else "")
+        if args.reset_held:
+            _reset_held(manager, confirmed=True)
+        return
+
+    if args.reset_held:
+        _reset_held(
+            manager_mod.Manager(
+                config, db.make_sessionmaker(config.database_url), drivers.NoOpenSM()
             )
-        if confirmation.note:
-            print(confirmation.note)
-        if confirmation.problems:
-            sys.stdout.flush()
-            sys.exit(
-                "alternative-fabric-manager: the switches are confirmed, but "
-                "per-port M_Keys aren't armed:\n"
-                + "\n".join(f"- {problem}" for problem in confirmation.problems)
-            )
+        )
         return
 
     if args.forget_revisions:
@@ -365,6 +353,7 @@ def main(argv=None):
 
     if (
         args.port_key_states
+        or args.retry_port_key_turn_on
         or args.port_m_key is not None
         or args.add_link is not None
         or args.release_port is not None
@@ -433,6 +422,31 @@ def main(argv=None):
         manager.stop()
 
 
+def _reset_held(manager, confirmed=False):
+    """--reset-held, after a confirmation in the same command or on its own
+    (specs/ha.md, Possibly held memberships)"""
+    try:
+        reset = manager.reset_held(confirmed=confirmed)
+    except port_keeper.PortKeysError as e:
+        sys.exit(f"alternative-fabric-manager: {e}")
+    if reset is None:
+        print(
+            "No confirmation has removed a switch since the last reset: "
+            "nothing to reset."
+        )
+        return
+    pkeys, hosts = reset
+    print(
+        "Reset the memberships ports may hold stale; this untainted "
+        + (
+            "pkeys " + ", ".join(f"0x{pkey:04x}" for pkey in pkeys)
+            if pkeys
+            else "no pkey"
+        )
+        + (", and hosts " + ", ".join(hosts) if hosts else "")
+    )
+
+
 def _port_keys(config, args):
     """The per-port M_Key commands, beside the running manager"""
     manager = manager_mod.Manager(
@@ -441,6 +455,8 @@ def _port_keys(config, args):
     keeper = manager.port_keeper
     if args.port_key_states:
         print("\n".join(keeper.states()))
+    elif args.retry_port_key_turn_on:
+        print(keeper.retry_turn_on())
     elif args.port_m_key is not None:
         print(keeper.port_m_key(port_keeper.parse_guid(args.port_m_key)))
     elif args.add_link is not None:

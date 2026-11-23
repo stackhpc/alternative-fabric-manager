@@ -19,6 +19,7 @@ from tests.test_port_keeper import (  # noqa: F401 - the fixture
     T3,
     T4,
     TN,
+    _cli,
     _port_job,
     confirm,
     derived,
@@ -483,7 +484,7 @@ def test_a_failed_turn_on_is_recorded_and_never_rearmed(auto, caplog):
     lines = world.keeper().states()
     assert (
         "failed turn-on recorded: yes (a change of configuration, or "
-        "--confirm-fabric, clears it)"
+        "--retry-port-key-turn-on, clears it)"
     ) in lines
     # The hash is never shown, nor logged.
     shown = "\n".join(lines) + "\n".join(r.getMessage() for r in caplog.records)
@@ -507,13 +508,78 @@ def test_a_configuration_change_clears_a_failed_turn_on(auto):
     assert "failed turn-on recorded: no" in world.keeper().states()
 
 
-def test_confirm_fabric_clears_a_failed_turn_on_and_arms(auto):
+def _failed(world):
+    with world.sessionmaker() as session:
+        return port_keys.load_text(session, port_keys.FAILED_TURN_ON) is not None
+
+
+def test_confirm_fabric_neither_clears_a_failed_turn_on_nor_arms(auto):
     world = auto
     _failed_turn_on(world)
     world.manager.reconcile()
-    confirmation = confirm(world)
-    assert confirmation.cleared and confirmation.armed
+    assert confirm(world).switches == [S1, S2]
+    assert _failed(world) and world.state()["target"] is False
+    world.check()
+    assert world.state()["target"] is False
+    assert arming(world) == port_keeper.FAILED_REASON
+
+
+def test_retrying_clears_a_failed_turn_on_and_the_checks_arm_it(
+    auto, monkeypatch, capsys, caplog
+):
+    world = auto
+    _failed_turn_on(world)
+    world.manager.reconcile()
+    assert _cli(world, monkeypatch, capsys, "--retry-port-key-turn-on") == [
+        "Cleared the failed per-port M_Key turn-on. The manager arms it again at "
+        "its next passing check once every port is ready, then restarts OpenSM "
+        "to turn per-port M_Keys on, which re-keys every port, at a passing "
+        "check with no open job (at most once an hour after its last attempt). "
+        "--port-key-states shows what blocks arming."
+    ]
+    assert not _failed(world)
     assert "failed turn-on recorded: no" in world.keeper().states()
+    # It only clears the record: the manager's next passing check arms.
+    assert world.state()["target"] is False
+    world.check()
+    assert world.state()["target"] is True
+    # Every message that once named --confirm-fabric names the retry now.
+    failed = [r.getMessage() for r in caplog.records if "failed" in r.getMessage()]
+    assert any("--retry-port-key-turn-on" in line for line in failed)
+    assert not any("--confirm-fabric" in line for line in failed)
+
+
+def test_retrying_with_no_failed_turn_on_changes_nothing(auto, monkeypatch, capsys):
+    world = auto
+    before = world.state()
+    assert _cli(world, monkeypatch, capsys, "--retry-port-key-turn-on") == [
+        "No failed per-port M_Key turn-on is recorded: nothing to retry."
+    ]
+    assert world.state() == before and not _failed(world)
+
+
+@pytest.mark.parametrize(
+    "case, said",
+    [
+        ("unnamed", "The m_key_per_port hardening group isn't named"),
+        ("on", "Per-port M_Keys are already on, or their turn-on is armed"),
+    ],
+)
+def test_retrying_without_the_group_or_with_the_target_on_says_so(
+    auto, monkeypatch, capsys, case, said
+):
+    world = auto
+    with world.sessionmaker() as session:
+        port_keys.save_text(session, port_keys.FAILED_TURN_ON, "a record")
+        if case == "on":
+            port_keys.save_target(session, True)
+        session.commit()
+    if case == "unnamed":
+        world.config.hardening = "all"
+    before = world.state()
+    [line] = _cli(world, monkeypatch, capsys, "--retry-port-key-turn-on")
+    assert line.startswith(said) and line.endswith("nothing to retry.")
+    assert world.state() == before and _failed(world)
 
 
 def test_a_failure_record_holds_no_key():

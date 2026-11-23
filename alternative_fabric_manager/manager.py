@@ -1026,9 +1026,9 @@ class Manager:
 
         A start that stored the base can't begin per-port keys: the next
         start, after a backup that holds it, can (see
-        specs/secured-profile.md, Per-port M_Keys). --confirm-fabric runs
-        beside the running manager, so the start records it for that command
-        to read. Every start overwrites it.
+        specs/secured-profile.md, Per-port M_Keys). The start records it for
+        the checks' arming to read, and in HA mode, for a later term's
+        leader. Every start overwrites it.
         """
         for attempt in range(2):
             with self.fenced_session() as session:
@@ -1606,8 +1606,7 @@ class Manager:
 
     def _block_held_reset(self, session):
         """--confirm-fabric removed an expected switch: it may be a hung one,
-        still forwarding, so the map isn't reset again until --confirm-fabric
-        --reset-held"""
+        still forwarding, so the map isn't reset again until --reset-held"""
         applied = self._locked_applied(session)
         held = partial.Held.loads(applied.held)
         if not held.blocked:
@@ -1615,18 +1614,47 @@ class Manager:
             applied.held = held.dumps()
             LOG.warning(
                 "An expected switch was removed: the pkeys and hosts its ports may "
-                "hold stay tainted until --confirm-fabric --reset-held"
+                "hold stay tainted until --reset-held, once it's unplugged or wiped"
             )
 
-    def reset_held(self):
-        """--confirm-fabric --reset-held: reset the possibly held map to the
-        swept body's memberships, plus those of the GUIDs with pkey errors
-        in that sweep, and let it reset itself again; return the pkeys and
-        hosts it untaints. Raises PortKeysError if the latest body written
-        isn't the one swept, as while a write or its sweep is under way."""
+    def reset_held(self, confirmed=False):
+        """--reset-held: reset the possibly held map to the swept body's
+        memberships, plus those of the GUIDs with pkey errors in that sweep,
+        and let it reset itself again; return the pkeys and hosts it
+        untaints (specs/ha.md, Possibly held memberships).
+
+        confirmed: it runs after a --confirm-fabric in the same command,
+        which has just recorded every switch the fabric has. On its own, it
+        resets only while a confirmation's block is set, and returns None,
+        changing nothing, without one: the map resets itself at a passing
+        check, and a reset at another time could untaint pkeys while an
+        expected switch is missing, and maybe hung. For the same reason it
+        raises PortKeysError while the last check found an expected switch
+        missing. It raises PortKeysError too if the latest body written
+        isn't the one swept, as while a write or its sweep is under way; the
+        block stays, so that a rerun needs no second confirmation."""
         with self._lock, self.sessionmaker() as session:
             applied = self._locked_applied(session)
             held = partial.Held.loads(applied.held)
+            if not confirmed and not held.blocked:
+                session.rollback()
+                return None
+            if not confirmed:
+                expected = {
+                    row.guid for row in session.scalars(sa.select(db.ExpectedSwitch))
+                }
+                missing = sorted(
+                    set(json.loads(applied.missing_switches or "[]")) & expected
+                )
+                if missing:
+                    session.rollback()
+                    raise port_keeper.PortKeysError(
+                        "the last fabric check found expected switches missing ("
+                        + ", ".join(f"0x{guid}" for guid in missing)
+                        + "), so the memberships ports may hold weren't reset: "
+                        "once they're back, run it again, or if they're gone, "
+                        "run --confirm-fabric --reset-held, which drops them"
+                    )
             if not (
                 applied.body
                 and held.latest_is(applied.body)
@@ -2546,11 +2574,7 @@ class Manager:
             + (f" ({shown})" if jobs else "")
             + f"; tainted pkeys: {pkeys or 'none'}"
             + f"; tainted hosts: {hosts or 'none'}"
-            + (
-                "; the map resets only with --confirm-fabric --reset-held"
-                if held.blocked
-                else ""
-            )
+            + ("; the map resets only with --reset-held" if held.blocked else "")
         )
 
     def _log_findings(self):
@@ -2780,14 +2804,10 @@ class Manager:
 
     def confirm_fabric(self):
         """Record the switches OpenSM sees as the fabric's expected ones,
-        and, with per-port M_Keys, the links OpenSM's cache lists; with the
-        m_key_per_port group named and the target off, arm the turn-on if
-        its preconditions hold (specs/secured-profile.md, Turning it on).
-        Returns a port_keeper.Confirmation."""
+        and nothing else: the checks fold OpenSM's cache, and arm the
+        per-port M_Key turn-on, by themselves (specs/zero-touch.md, What
+        stays manual). Returns a port_keeper.Confirmation."""
         keeper = self.port_keeper
-        # A cache that can't be read stops only the turn-on, not the
-        # switches' confirmation.
-        fold_problem = keeper.fold_running()
         # No switch is pending: whatever answers as one is recorded, since
         # the list is only what a complete fabric has (specs/zero-touch.md).
         confirmation = port_keeper.Confirmation()
@@ -2802,7 +2822,7 @@ class Manager:
                 guid if probed is None else probed.get(guid, guid) for guid in found
             }
             removed = [
-                row.guid
+                int(row.guid, 16)
                 for row in session.scalars(sa.select(db.ExpectedSwitch))
                 if int(row.guid, 16) not in found
                 and int(row.node_guid or row.guid, 16) not in nodes
@@ -2829,8 +2849,7 @@ class Manager:
                 state.text = source
             session.commit()
         confirmation.switches = found
-        if confirmation.switches:
-            keeper.arm(confirmation, fold_problem)
+        confirmation.removed = sorted(removed)
         return confirmation
 
     def enforcement_errors(self):
