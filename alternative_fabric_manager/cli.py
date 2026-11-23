@@ -172,10 +172,12 @@ def main(argv=None):
     )
     commands.add_argument(
         "--release-port",
+        nargs="+",
         metavar="GUID",
-        help="Complete a lost port's held jobs as they are, and exempt it from "
-        "the fabric check's rule on lost ports, until it answers its key "
-        "again. It changes nothing on the port",
+        help="Complete each lost port's held jobs as they are, and exempt it "
+        "from the fabric check's rule on lost ports, until it answers its key "
+        "again. It changes nothing on the port. Several GUIDs are released in "
+        "turn, stopping at the first that's refused",
     )
     commands.add_argument(
         "--forget-port-keys",
@@ -464,9 +466,25 @@ def _port_keys(config, args):
         added = keeper.add_link(local, peer)
         print(f"Recorded the link, and {added} new ports")
     elif args.release_port is not None:
-        guid = port_keeper.parse_guid(args.release_port)
-        keeper.release_port(guid)
-        print(f"Released 0x{guid:016x} until it answers its key again")
+        # Every GUID is parsed first, so that a typo releases none.
+        guids = [port_keeper.parse_guid(text) for text in args.release_port]
+        released = []
+        for guid in guids:
+            try:
+                keeper.release_port(guid)
+            except port_keeper.PortKeysError as e:
+                if len(guids) == 1:
+                    raise
+                done = (
+                    "released " + ", ".join(f"0x{g:016x}" for g in released)
+                    if released
+                    else "released none"
+                )
+                raise port_keeper.PortKeysError(
+                    f"{e}; {done}, and stopped there"
+                ) from None
+            released.append(guid)
+            print(f"Released 0x{guid:016x} until it answers its key again")
     elif args.forget_port_keys:
         ports, links = keeper.forget_port_keys()
         print(f"Forgot {ports} ports and {links} links")

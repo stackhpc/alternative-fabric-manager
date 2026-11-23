@@ -585,6 +585,44 @@ def test_port_key_commands(tmp_path, capsys):
     assert capsys.readouterr().out == "Forgot 1 ports and 0 links\n"
 
 
+def test_release_port_takes_several_guids(tmp_path, capsys):
+    path = _per_port_conf(tmp_path)
+    _cli(path, "--add-link", "0x51:3", "b1:1")
+    _cli(path, "--add-link", "0x51:4", "b2:1")
+    capsys.readouterr()
+    _cli(path, "--release-port", "0xB1", "b2")
+    assert capsys.readouterr().out.splitlines() == [
+        f"Released 0x{guid:016x} until it answers its key again"
+        for guid in (0xB1, 0xB2)
+    ]
+    _cli(path, "--port-key-states")
+    out = capsys.readouterr().out
+    assert "0x00000000000000b1 - unknown released" in out
+    assert "0x00000000000000b2 - unknown released" in out
+
+
+def test_release_port_stops_at_the_first_refusal(tmp_path, capsys):
+    path = _per_port_conf(tmp_path)
+    _cli(path, "--add-link", "0x51:3", "b1:1")
+    _cli(path, "--add-link", "0x51:4", "b2:1")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as raised:
+        _cli(path, "--release-port", "b1", "c1", "b2")
+    assert str(raised.value.code) == (
+        "alternative-fabric-manager: no port 0x00000000000000c1 is recorded; "
+        "released 0x00000000000000b1, and stopped there"
+    )
+    _cli(path, "--port-key-states")
+    out = capsys.readouterr().out
+    assert "0x00000000000000b1 - unknown released" in out
+    assert "0x00000000000000b2 - unknown -" in out
+    # A GUID that doesn't parse releases none.
+    with pytest.raises(SystemExit, match="isn't a GUID"):
+        _cli(path, "--release-port", "b2", "zz")
+    _cli(path, "--port-key-states")
+    assert "0x00000000000000b2 - unknown -" in capsys.readouterr().out
+
+
 def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):
     path = _per_port_conf(tmp_path, hardening="all")
     _cli(path, "--show-keys")
@@ -599,7 +637,10 @@ def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):
         (["--add-link", "0x51", "0xb1:1"], "GUID>:<port>"),
         (["--add-link", "0x51:1", "0x51:1"], "two different ports"),
         (["--release-port", "zz"], "isn't a GUID"),
-        (["--release-port", "b1"], "no port"),
+        (
+            ["--release-port", "b1"],
+            "^alternative-fabric-manager: no port 0x0+b1 is recorded$",
+        ),
         (["--forget-port", "b1"], "no port"),
     ],
 )
