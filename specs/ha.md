@@ -1112,11 +1112,23 @@ doesn't keep every pkey tainted.
 
 **After `--confirm-fabric` removes a switch**, which may be a hung one
 still forwarding, its ports' stale pkeys stay tainted. Only
-`--confirm-fabric --reset-held` resets the map:
+`--reset-held` resets the map, once that switch is unplugged or wiped:
 
-- the command's message names the reset, along with the pkeys it
-  untaints;
-- it refuses while the confirmation found problems.
+- **With `--confirm-fabric`,** in the same command, it runs after the
+  confirmation, which has just recorded every switch the fabric has.
+- **On its own,** it runs only while a confirmation's block is set, and
+  the last check found no expected switch missing. With no block set, it
+  changes nothing and says there's nothing to reset: the map resets itself
+  at a passing check, and a reset at any other time could untaint pkeys
+  while an expected switch is missing, and maybe hung.
+- **It refuses while the latest body written isn't swept yet,** as while
+  a write or its sweep is under way: the swept body's memberships aren't
+  yet evidence of what OpenSM set. The block stays, so the rerun needs no
+  second confirmation, which would drop whatever is missing then.
+- Its message names the reset, along with the pkeys it untaints.
+
+Nothing else holds it back: per-port M_Key arming has nothing to do with
+it (specs/zero-touch.md).
 
 Zero-touch's drop of a switch whose recorded links are all down doesn't
 block the reset: such a switch can't forward.
@@ -2371,8 +2383,8 @@ implementation doesn't send the Ask yet (see Fencing, Known limitations).
       physical ports; the possibly
       held memberships with their hosts, extended before each write, and
       tainted pkeys and hosts; each port's `binding:vnic_type`, recorded
-      from the port networking-mlnx sends; `--confirm-fabric
-      --reset-held`; the fresh sweep after a partial period; and a
+      from the port networking-mlnx sends; `--reset-held`, with
+      `--confirm-fabric` or on its own; the fresh sweep after a partial period; and a
       failover test with a leaf paused in the fake fabric. Revocations
       stay for a whole fabric until the open question on the SA below is
       answered on a fabric with more than one switch.

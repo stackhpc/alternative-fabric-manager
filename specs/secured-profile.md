@@ -1165,7 +1165,7 @@ a switch, for the operator to check.
   GUIDs. On a switch whose two differ, the check reports the switch
   missing until it's confirmed again with rows present.
 - Until some switch is confirmed, a verify reaches this host's port and
-  its peer only, and `--confirm-fabric` doesn't record the target on.
+  its peer only, and the turn-on isn't armed.
 
 **Key order.** It tries the key the row records first, then the other one
 the rule allows, so a port on `m_key` during a slow transition isn't sent
@@ -1254,51 +1254,40 @@ naming the cause, as a lost M_Key does today.
 that turns per-port keys on, or it sends 0 and loses them (test 5's empty
 leg). And it must be a start someone chose, not a crash restart.
 
-**Who begins it.** So naming the group doesn't begin it: an operator's
-`--confirm-fabric` does. One command confirms everything the turn-on rests
-on, so that the switches the prober trusts and the links OpenSM is given
-come from one look at the fabric, by one person. It replaces
-`--confirm-switches`, which is gone, with no alias: no stable release has
-had it.
+**Who begins it.** Naming the group does: the manager arms the turn-on
+by itself, at a passing check, and applies it (specs/zero-touch.md,
+Arming and Applying). Arming records the target on, provided that:
 
-**What `--confirm-fabric` does.** It runs beside the running manager, and:
+- the base was stored by an earlier start;
+- links are recorded;
+- the check's last full verify, taken since OpenSM started, finds every
+  recorded port behind an up link holding `m_key`, and no row `unknown`
+  behind an up link (one behind a down link is re-keyed through OpenSM's
+  own choice when it returns);
+- in HA mode, the epoch allows exactly this node's configuration's hash.
 
-1. while the group is named or rows exist, folds the links and ports that
-   the running OpenSM's cache lists into the rows, as a check does;
-2. records the switches the fabric check sees as the expected ones, as
-   `--confirm-switches` did: `ibswitches`' with no rows, the prober's with
-   them (The prober).
-   - A switch the prober finds that wasn't confirmed before is only
-     recorded as pending, and marked in the list. It isn't expected,
-     trusted or routed through until a later run finds it again, after the
-     operator has read the list. Otherwise the running manager would send
-     both keys, at its next check, to whatever answered as a switch.
-   - A prober run that's cut short confirms nothing, rather than replacing
-     the list with part of it;
-3. then, if the group is named and the target is off, records the target
-   on, and says that the next restart of the manager turns per-port keys
-   on, provided that:
-   - the base was stored by an earlier start;
-   - links are recorded;
-   - no switch is left pending by this run (the operator checks the list
-     it printed, and runs it again);
-   - the prober, run beside the running OpenSM with the switches just
-     confirmed, finds every recorded port behind an up link holding
-     `m_key`, and no row `unknown` behind an up link (one behind a down
-     link is re-keyed through OpenSM's own choice when it returns).
+While one fails, the target stays off, and the manager logs which, as
+`--port-key-states` shows.
 
-   If one of these fails, the switches stay confirmed, the target stays
-   off, and the command says which failed and exits non-zero.
+**What `--confirm-fabric` does.** It runs beside the running manager, and
+only records the switches the fabric check sees as the expected ones:
+`ibswitches`' with no rows, the prober's with them (The prober).
 
-With the group not named, or the target already on, it only confirms.
+- A prober run that's cut short confirms nothing, rather than replacing
+  the list with part of it.
+- It prints the switches it dropped, and those it kept.
+- It never folds OpenSM's cache, arms the turn-on, or clears a failed
+  turn-on.
 
-> **Confirming the fabric arms the turn-on.** On a deployment that names
-> the group, confirming the fabric is what arms the turn-on, and the docs
-> say so wherever they tell an operator to run it. The turn-on itself
-> still waits for a restart the operator chooses; a crash restart before
-> that one turns the keys on too, since the target is recorded.
-> specs/zero-touch.md, which wins where they differ, also arms it by
-> itself, at a passing check, once the group is named.
+It replaces `--confirm-switches`, which is gone, with no alias: no stable
+release has had it.
+
+> **Superseded: confirming the fabric armed the turn-on.** An earlier
+> version of this design had `--confirm-fabric` fold the cache, mark new
+> switches pending, and arm the turn-on at once. specs/zero-touch.md
+> replaced all three: the checks fold the cache, no switch is pending, and
+> the manager arms at a passing check. A failed turn-on is retried with
+> `--retry-port-key-turn-on` (specs/zero-touch.md, A failed turn-on).
 
 **The turn-on start.** That start:
 
@@ -1467,8 +1456,8 @@ while the volume and the ports hold the base's derived keys.
 - With the group named and no fingerprint recorded, a start whose folded
   rows show ports on the stored base's derived keys adopts the target on.
 - With a fingerprint, the database has seen a turn-on, and the rows are a
-  turn-off's or a set-back's leftovers, which `--confirm-fabric` must
-  check.
+  turn-off's or a set-back's leftovers, which the arming's checks must
+  pass before the target is on again.
 - The adoption is decided after step 1 and before step 2, so that the
   verify runs with the target on, records the fingerprint, and raises an
   alarm saying so, rather than re-keying the fabric back to the exposed
@@ -1483,11 +1472,12 @@ while the volume and the ports hold the base's derived keys.
 
 | Command | What it does |
 | --- | --- |
-| `--confirm-fabric` | As above (Turning it on) |
+| `--confirm-fabric` | Records the expected switches, printing those it dropped and kept (Turning it on). It never arms the turn-on |
+| `--retry-port-key-turn-on` | Clears a recorded failed turn-on, so that the manager arms it again at a passing check (specs/zero-touch.md, A failed turn-on) |
 | `--port-key-states` | Lists each recorded port's GUID, `holds`, `lapsed` and `reachable`, never a key |
 | `--port-m-key <guid>` | Prints that port's current key, for feeding `-y` under AGENTS.md's rule, never for display |
 | `--add-link` | Records a link |
-| `--release-port <guid>` | Completes a lost port's held jobs, and exempts a non-Neutron port from the fabric check's rule on lost ports, until the port answers its key again |
+| `--release-port <guid> ...` | Completes a lost port's held jobs, and exempts a non-Neutron port from the fabric check's rule on lost ports, until the port answers its key again. It takes several GUIDs, and stops at the first it refuses, naming those it released |
 | `--forget-port-keys` | Drops every row. Refused while the group is named or any row holds a derived key. It also drops a recorded fingerprint that isn't the stored base's, which would otherwise keep every later start on Restores' path |
 | `--forget-port <guid>` | Drops one port and its links, for removed hardware. Refused for a port seen in the last day |
 
@@ -1717,10 +1707,9 @@ As in single node: it leaves nothing on ports.
 - **The rows.** The leader keeps the rows as the single-node manager does,
   behind the leader fence.
 - **Commands.** Operators' commands work in HA mode from any node, as in
-  single node. `--confirm-fabric` reads the running OpenSM's cache, and
-  runs the prober beside it, so it arms the turn-on only on the leader's
-  node. Elsewhere it confirms the switches and says the arming must run
-  there.
+  single node. `--confirm-fabric` only records the expected switches,
+  and `--retry-port-key-turn-on` only clears the failed turn-on's record:
+  the leader arms, behind the leader fence.
 - **A takeover never reads its host's cache volume.** The files there
   are from an older term, or none: the rows are newer, and folding a
   stale file could put back a link or a key state the rows have since
@@ -2164,6 +2153,10 @@ and a re-cabled port.
       experimental until its single-node run passes.
 - [ ] docs/opensm-hardening.md: the new groups, MFT and the VS key, the
       downgrade procedure.
+- [x] `--confirm-fabric` only records the expected switches, printing
+      those it drops; `--reset-held` runs on its own once a confirmation
+      has blocked the reset; `--retry-port-key-turn-on` clears a failed
+      turn-on (specs/zero-touch.md); `--release-port` takes several GUIDs.
 
 ## Open questions
 
