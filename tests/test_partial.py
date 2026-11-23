@@ -847,6 +847,9 @@ def test_a_new_leader_inherits_a_fresh_sweep_due(config, fabric, manager):
     fabric.switches = {LEAF_A, LEAF_B}
     new = manager_mod.Manager(config, manager.sessionmaker, fabric)
     fabric.start = lambda: SweepReport()
+    # No applier thread: it would check, sweep and evaluate alongside this
+    # test's own calls, which then race it.
+    new._run = lambda: None
     new.start()
     try:
         new.check_fabric()
