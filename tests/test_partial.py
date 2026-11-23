@@ -662,6 +662,74 @@ def test_reset_held_on_its_own_refuses_a_stale_check(
     _refused_alone(manager, monkeypatch, capsys, "s old")
 
 
+def _unattributed_sweep(manager, fabric):
+    """A sweep whose pkey error OpenSM's log tied to no port"""
+    fabric.report = SweepReport(unattributed=True)
+    manager._written = None
+    manager.reconcile()
+    manager.reconcile()
+    assert "unattributed" in _applied(manager).pkey_errors
+
+
+def _cleared_enforcement(manager):
+    with manager.sessionmaker() as session:
+        session.get(db.Applied, 1).enforcement_errors = json.dumps([f"{LEAF_A:016x}:3"])
+        session.commit()
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize(
+    "cause, why",
+    [
+        ("unattributed", "a pkey error that OpenSM's log tied to no port"),
+        ("enforcement", "--show-enforcement-errors"),
+    ],
+)
+def test_reset_held_refuses_while_the_sweep_isnt_evidence(
+    manager, fabric, monkeypatch, capsys, cause, why, confirmed
+):
+    # As the automatic reset does, on both paths: the confirmation is no
+    # evidence of what OpenSM set.
+    _removed_leaf(manager, fabric)
+    if cause == "unattributed":
+        _unattributed_sweep(manager, fabric)
+    else:
+        _cleared_enforcement(manager)
+    before = _held(manager).dumps()
+    args = ["--confirm-fabric", "--reset-held"] if confirmed else ["--reset-held"]
+    with pytest.raises(SystemExit) as raised:
+        _cli(manager, monkeypatch, capsys, *args)
+    message = str(raised.value.code)
+    assert why in message and "weren't reset" in message, message
+    assert _held(manager).dumps() == before
+    assert _held(manager).blocked
+
+
+def test_a_second_confirmation_that_drops_a_switch_needs_a_check_after_it(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    # A third switch is confirmed, and checked, then removed again.
+    fabric.switches = {LEAF_A, LEAF_B}
+    manager.confirm_fabric()
+    manager.reconcile()
+    assert _applied(manager).check_ok
+    fabric.switches = {LEAF_A}
+    assert manager.confirm_fabric().removed == [LEAF_B]
+    # The checks so far judged the list that had it.
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        "no fabric check has passed since the confirmation",
+    )
+    manager.reconcile()
+    manager.reconcile()
+    assert _cli(manager, monkeypatch, capsys, "--reset-held")[0].startswith(
+        "Reset the memberships"
+    )
+
+
 def test_reset_held_on_its_own_keeps_the_block_until_the_sweep(
     manager, fabric, monkeypatch
 ):

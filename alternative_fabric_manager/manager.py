@@ -1609,11 +1609,14 @@ class Manager:
         still forwarding, so the map isn't reset again until --reset-held"""
         applied = self._locked_applied(session)
         held = partial.Held.loads(applied.held)
-        if not held.blocked:
-            held.blocked = True
-            check = _aware(applied.check_time)
-            held.blocked_after = check.timestamp() if check is not None else 0
-            applied.held = held.dumps()
+        # Every confirmation that drops a switch moves the mark on, so that
+        # only a check that judged its list lets --reset-held run alone.
+        check = _aware(applied.check_time)
+        held.blocked_after = check.timestamp() if check is not None else 0
+        newly = not held.blocked
+        held.blocked = True
+        applied.held = held.dumps()
+        if newly:
             LOG.warning(
                 "An expected switch was removed: the pkeys and hosts its ports may "
                 "hold stay tainted until --reset-held, once it's unplugged or wiped"
@@ -1642,6 +1645,12 @@ class Manager:
             if not confirmed and not held.blocked:
                 session.rollback()
                 return None
+            refusal = self._sweep_refusal(applied)
+            if refusal is not None:
+                session.rollback()
+                raise port_keeper.PortKeysError(
+                    f"{refusal}, so the memberships ports may hold weren't reset"
+                )
             refusal = None if confirmed else self._held_reset_refusal(applied, held)
             if refusal is not None:
                 session.rollback()
@@ -1673,6 +1682,29 @@ class Manager:
             # term's leader judges the map by that leader's term as before.
             session.commit()
         return sorted(pkeys), sorted(hosts - held.tainted_hosts())
+
+    @staticmethod
+    def _sweep_refusal(applied):
+        """Why the last sweep isn't evidence of what OpenSM set, as
+        _reset_held_if_fresh also requires, with what to deal with first; or
+        None. Both --reset-held paths refuse on it."""
+        if UNATTRIBUTED in json.loads(applied.pkey_errors or "[]"):
+            return (
+                "the last sweep had a pkey error that OpenSM's log tied to no "
+                "port, so any port may still hold what it should have lost: "
+                "find its cause in OpenSM's log, and run it again once a sweep "
+                "has none"
+            )
+        cleared = json.loads(applied.enforcement_errors or "[]")
+        if cleared:
+            return (
+                "OpenSM cleared the enforcement of switch ports ("
+                + ", ".join(cleared)
+                + "): deal with them first, as the README's \"When a switch "
+                'port stops enforcing partitions" says (--show-enforcement-errors '
+                "lists them), then run it again"
+            )
+        return None
 
     def _held_reset_refusal(self, applied, held):
         """Why --reset-held on its own can't reset now, or None: the

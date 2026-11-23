@@ -1135,7 +1135,19 @@ still forwarding, its ports' stale pkeys stay tainted. Only
   Its message says which failed, and to run it again once a check passes,
   or, if the missing switches are gone, to run `--confirm-fabric
   --reset-held`. A check's list of missing switches isn't trusted
-  instead: a check that couldn't query the fabric lists none.
+  instead: a check that couldn't query the fabric lists none. Every
+  confirmation that drops a switch moves the block's time on.
+- **The freshness rule relies on the clocks being synchronised,** as job
+  completion's does: the confirming node's clock judges the age of a check
+  the leader timed.
+- **With or without `--confirm-fabric`, it refuses while the last sweep
+  isn't evidence of what OpenSM set,** as the automatic reset does:
+  - while the sweep had a pkey error OpenSM's log tied to no port, since
+    any port may then hold what it should have lost: the message says to
+    find its cause in OpenSM's log;
+  - while OpenSM has cleared a switch port's enforcement: the message
+    says to deal with it first, with `--show-enforcement-errors` and the
+    README's procedure.
 - **It refuses while the latest body written isn't swept yet,** as while
   a write or its sweep is under way: the swept body's memberships aren't
   yet evidence of what OpenSM set. The block stays, so the rerun needs no
@@ -1144,6 +1156,13 @@ still forwarding, its ports' stale pkeys stay tainted. Only
 
 Nothing else holds it back: per-port M_Key arming has nothing to do with
 it (specs/zero-touch.md).
+
+**A known gap after a contested check.** The next passing check clears
+`applied.contested`, but the re-sweep then due is kept only in the
+leader's memory. So `--reset-held` on its own may reset in that short
+window, which the automatic reset waits out. The memberships a foreign
+master set were never in the map anyway. Persisting the due re-sweep
+would close it.
 
 Zero-touch's drop of a switch whose recorded links are all down doesn't
 block the reset: such a switch can't forward.

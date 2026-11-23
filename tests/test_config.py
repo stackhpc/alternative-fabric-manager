@@ -622,10 +622,11 @@ def test_release_port_releases_all_or_none(tmp_path, capsys):
 @pytest.mark.parametrize(
     "other", [["--status"], ["--port-key-states"], ["--forget-port", "b1"]]
 )
-def test_reset_held_on_its_own_combines_with_no_other_command(tmp_path, other):
+@pytest.mark.parametrize("confirm", [[], ["--confirm-fabric"]])
+def test_reset_held_combines_with_no_other_command(tmp_path, other, confirm):
     path = _per_port_conf(tmp_path)
     with pytest.raises(SystemExit, match="combines only with --confirm-fabric"):
-        _cli(path, "--reset-held", *other)
+        _cli(path, *confirm, "--reset-held", *other)
 
 
 def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):

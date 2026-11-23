@@ -231,11 +231,11 @@ def main(argv=None):
     except config_mod.ConfigError as e:
         sys.exit(f"alternative-fabric-manager: {e}")
 
-    if args.reset_held and not args.confirm_fabric:
+    if args.reset_held:
         combined = [
             name
             for name, value in vars(args).items()
-            if name not in ("config_file", "debug", "reset_held")
+            if name not in ("config_file", "debug", "reset_held", "confirm_fabric")
             and value not in (None, False)
         ]
         if combined:
