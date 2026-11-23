@@ -2,6 +2,7 @@
 switch can't matter to them, and every other job waits for a whole fabric
 (specs/ha.md, While a switch is missing)"""
 
+import datetime
 import json
 
 import pytest
@@ -564,6 +565,19 @@ def test_reset_held_on_its_own_with_no_block_resets_nothing(
     assert _held(manager).tainted_pkeys() == {100}
 
 
+def _refused_alone(manager, monkeypatch, capsys, why):
+    """--reset-held on its own refuses, saying why, and changes nothing"""
+    before = _held(manager).dumps()
+    with pytest.raises(SystemExit) as raised:
+        _cli(manager, monkeypatch, capsys, "--reset-held")
+    message = str(raised.value.code)
+    assert why in message, message
+    assert "run it again once a check passes" in message
+    assert "--confirm-fabric --reset-held" in message
+    assert _held(manager).dumps() == before
+    assert _held(manager).blocked
+
+
 def test_reset_held_on_its_own_refuses_while_an_expected_switch_is_missing(
     manager, fabric, monkeypatch, capsys
 ):
@@ -571,13 +585,81 @@ def test_reset_held_on_its_own_refuses_while_an_expected_switch_is_missing(
     # Another expected switch goes missing after the confirmation.
     fabric.switches = set()
     assert not manager.check_fabric()
-    before = _held(manager).dumps()
-    with pytest.raises(SystemExit) as raised:
-        _cli(manager, monkeypatch, capsys, "--reset-held")
-    message = str(raised.value.code)
-    assert f"expected switches missing (0x{LEAF_A:016x})" in message
-    assert "--confirm-fabric --reset-held" in message
-    assert _held(manager).dumps() == before
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        f"the last fabric check didn't pass (Missing switches: 0x{LEAF_A:016x}",
+    )
+
+
+def test_reset_held_on_its_own_refuses_after_a_check_that_couldnt_query(
+    manager, fabric, monkeypatch, capsys
+):
+    # A check that couldn't ask the fabric lists no switch missing.
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.fabric_result = ReloadError("ibswitches timed out")
+    assert not manager.check_fabric()
+    assert _applied(manager).missing_switches == "[]"
+    _refused_alone(manager, monkeypatch, capsys, "ibswitches timed out")
+
+
+def test_reset_held_on_its_own_refuses_when_opensm_isnt_master(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.fabric = lambda *a, **k: Fabric(set(), [(OWN, 2)], {OWN})
+    assert not manager.check_fabric()
+    _refused_alone(manager, monkeypatch, capsys, "the last fabric check didn't pass")
+
+
+def test_reset_held_on_its_own_refuses_before_the_fresh_sweep(
+    manager, fabric, monkeypatch, capsys
+):
+    # The switch is back, and the check passes, but the sweep that would
+    # reach it hasn't been made.
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.switches = {LEAF_A}
+    assert manager.check_fabric()
+    assert _applied(manager).missing
+    _refused_alone(manager, monkeypatch, capsys, "fresh sweep")
+
+
+def test_reset_held_on_its_own_refuses_until_a_check_follows_the_block(
+    manager, fabric, monkeypatch, capsys
+):
+    # The check that passed before the confirmation judged the old list.
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    fabric.switches = {LEAF_A}
+    manager.confirm_fabric()
+    assert _held(manager).blocked and _applied(manager).check_ok
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        "no fabric check has passed since the confirmation",
+    )
+    manager.reconcile()
+    assert _cli(manager, monkeypatch, capsys, "--reset-held")[0].startswith(
+        "Reset the memberships"
+    )
+
+
+def test_reset_held_on_its_own_refuses_a_stale_check(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    with manager.sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        applied.check_time = applied.check_time - datetime.timedelta(minutes=5)
+        session.commit()
+    _refused_alone(manager, monkeypatch, capsys, "s old")
 
 
 def test_reset_held_on_its_own_keeps_the_block_until_the_sweep(

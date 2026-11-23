@@ -1611,6 +1611,8 @@ class Manager:
         held = partial.Held.loads(applied.held)
         if not held.blocked:
             held.blocked = True
+            check = _aware(applied.check_time)
+            held.blocked_after = check.timestamp() if check is not None else 0
             applied.held = held.dumps()
             LOG.warning(
                 "An expected switch was removed: the pkeys and hosts its ports may "
@@ -1627,10 +1629,11 @@ class Manager:
         which has just recorded every switch the fabric has. On its own, it
         resets only while a confirmation's block is set, and returns None,
         changing nothing, without one: the map resets itself at a passing
-        check, and a reset at another time could untaint pkeys while an
-        expected switch is missing, and maybe hung. For the same reason it
-        raises PortKeysError while the last check found an expected switch
-        missing. It raises PortKeysError too if the latest body written
+        check. On its own it also needs the evidence the confirmation
+        would have given: a fresh passing check, taken after the block was
+        set, with no fresh sweep due (_held_reset_refusal); otherwise it
+        raises PortKeysError, since an expected switch may be missing, and
+        maybe hung. It raises PortKeysError too if the latest body written
         isn't the one swept, as while a write or its sweep is under way; the
         block stays, so that a rerun needs no second confirmation."""
         with self._lock, self.sessionmaker() as session:
@@ -1639,22 +1642,15 @@ class Manager:
             if not confirmed and not held.blocked:
                 session.rollback()
                 return None
-            if not confirmed:
-                expected = {
-                    row.guid for row in session.scalars(sa.select(db.ExpectedSwitch))
-                }
-                missing = sorted(
-                    set(json.loads(applied.missing_switches or "[]")) & expected
+            refusal = None if confirmed else self._held_reset_refusal(applied, held)
+            if refusal is not None:
+                session.rollback()
+                raise port_keeper.PortKeysError(
+                    f"{refusal}, so the memberships ports may hold weren't reset: "
+                    "run it again once a check passes, or, if the missing "
+                    "switches are gone, run --confirm-fabric --reset-held, which "
+                    "drops them"
                 )
-                if missing:
-                    session.rollback()
-                    raise port_keeper.PortKeysError(
-                        "the last fabric check found expected switches missing ("
-                        + ", ".join(f"0x{guid}" for guid in missing)
-                        + "), so the memberships ports may hold weren't reset: "
-                        "once they're back, run it again, or if they're gone, "
-                        "run --confirm-fabric --reset-held, which drops them"
-                    )
             if not (
                 applied.body
                 and held.latest_is(applied.body)
@@ -1677,6 +1673,30 @@ class Manager:
             # term's leader judges the map by that leader's term as before.
             session.commit()
         return sorted(pkeys), sorted(hosts - held.tainted_hosts())
+
+    def _held_reset_refusal(self, applied, held):
+        """Why --reset-held on its own can't reset now, or None: the
+        persisted forms of what a passing check's own reset needs
+        (_reset_held_if_fresh), from a check fresh as job completion counts
+        it, and taken after the block was set, so that it judged the
+        switches the confirmation recorded. A missing switch is listed only
+        by a check that judged the switches, so no list of them is trusted
+        here: a check that couldn't query the fabric lists none."""
+        check = _aware(applied.check_time)
+        if not applied.check_ok or applied.contested or check is None:
+            detail = applied.check_detail or "no fabric check is recorded"
+            return f"the last fabric check didn't pass ({detail})"
+        age = (_now() - check).total_seconds()
+        if age > 2 * self.config.check_interval:
+            return f"the last fabric check is {age:.0f} s old: the manager may be down"
+        if applied.missing:
+            return (
+                "switches were missing, and the fresh sweep due since they "
+                "returned hasn't been made"
+            )
+        if held.blocked_after is None or check.timestamp() <= held.blocked_after:
+            return "no fabric check has passed since the confirmation"
+        return None
 
     @staticmethod
     def _host_ports(session):

@@ -1116,11 +1116,26 @@ still forwarding, its ports' stale pkeys stay tainted. Only
 
 - **With `--confirm-fabric`,** in the same command, it runs after the
   confirmation, which has just recorded every switch the fabric has.
-- **On its own,** it runs only while a confirmation's block is set, and
-  the last check found no expected switch missing. With no block set, it
-  changes nothing and says there's nothing to reset: the map resets itself
-  at a passing check, and a reset at any other time could untaint pkeys
-  while an expected switch is missing, and maybe hung.
+- **On its own,** it runs only while a confirmation's block is set. With
+  no block set, it changes nothing and says there's nothing to reset: the
+  map resets itself at a passing check, and a reset at any other time
+  could untaint pkeys while an expected switch is missing, and maybe hung.
+- **On its own, it also needs the evidence a confirmation gives:** the
+  persisted forms of what a passing check's own reset needs. It refuses
+  unless all of these hold:
+  - the last check passed, and wasn't contested;
+  - that check is fresh, within two check intervals, as job completion
+    counts it;
+  - no fresh sweep is due after switches returned (`applied.missing`);
+  - that check was taken after the block was set. The block records the
+    last check's time when it's set, and a later check's time must exceed
+    it. Both come from the leader's clock, so skew with the confirming
+    node can't pass an older check.
+
+  Its message says which failed, and to run it again once a check passes,
+  or, if the missing switches are gone, to run `--confirm-fabric
+  --reset-held`. A check's list of missing switches isn't trusted
+  instead: a check that couldn't query the fabric lists none.
 - **It refuses while the latest body written isn't swept yet,** as while
   a write or its sweep is under way: the swept body's memberships aren't
   yet evidence of what OpenSM set. The block stays, so the rerun needs no
@@ -2384,8 +2399,8 @@ implementation doesn't send the Ask yet (see Fencing, Known limitations).
       held memberships with their hosts, extended before each write, and
       tainted pkeys and hosts; each port's `binding:vnic_type`, recorded
       from the port networking-mlnx sends; `--reset-held`, with
-      `--confirm-fabric` or on its own; the fresh sweep after a partial period; and a
-      failover test with a leaf paused in the fake fabric. Revocations
+      `--confirm-fabric` or on its own; the fresh sweep after a partial
+      period; and a failover test with a leaf paused in the fake fabric. Revocations
       stay for a whole fabric until the open question on the SA below is
       answered on a fabric with more than one switch.
 - [x] Retry deadlocks and constraint races in the request path, as Galera's

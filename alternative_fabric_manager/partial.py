@@ -20,7 +20,10 @@ need in applied.
 The possibly held map is kept as JSON in applied.held:
   {"held": {pkey: [[GUID, membership, host], ...]},
    "latest": {pkey: [[GUID, membership, host], ...]},
-   "blocked": whether an expected switch was removed since the last reset}
+   "blocked": whether an expected switch was removed since the last reset,
+   "blocked_after": when the block was set, the time of the last fabric
+   check then, as POSIX seconds, 0 if there was none; absent in a map
+   written before it was recorded}
 pkeys as decimal strings, GUIDs as 16 hex digits, host the port's
 binding:host_id, "" for a member that is no Neutron port's.
 """
@@ -86,10 +89,16 @@ class Held:
         known=True,
         complete=False,
         recent=None,
+        blocked_after=None,
     ):
         self.held = held or {}
         self.latest = latest or {}
         self.blocked = blocked
+        # The last fabric check's time when the block was set: a check
+        # taken after it is one that judged the confirmed switches. The
+        # check's own clock, the leader's, rather than the confirming
+        # node's, so that skew between them can't pass an older check.
+        self.blocked_after = blocked_after
         # False until a body has been added, as before this was recorded
         self.known = known
         self.complete = complete
@@ -108,6 +117,7 @@ class Held:
             bool(data.get("blocked")),
             complete=bool(data.get("complete")),
             recent=[tuple(pair) for pair in data.get("recent", [])],
+            blocked_after=data.get("blocked_after"),
         )
 
     def dumps(self):
@@ -116,6 +126,7 @@ class Held:
                 "held": _dump_map(self.held),
                 "latest": _dump_map(self.latest),
                 "blocked": self.blocked,
+                "blocked_after": self.blocked_after,
                 "complete": self.complete,
                 "recent": [list(pair) for pair in self.recent],
             },
@@ -155,6 +166,7 @@ class Held:
                 held.setdefault(pkey, set()).update(kept)
         self.held = held
         self.blocked = False
+        self.blocked_after = None
         self.complete = True
         return before - self.tainted_pkeys()
 
