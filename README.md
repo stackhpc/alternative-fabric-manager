@@ -135,12 +135,61 @@ socket controls the host.
    and the check says "No expected switches yet". See
    [Expected switches](#expected-switches).
 
+### Changing the configuration
+
+AFM reads `afm.conf` only when it starts, and OpenSM reads `opensm.conf`
+only when it starts. So every change below takes the same three steps on
+a single node. In HA mode, change one node at a time instead, as
+[docs/kayobe.md](docs/kayobe.md) describes.
+
+1. **Edit** `/etc/alternative-fabric-manager/afm.conf`. The examples in
+   this README show each option under its section header, such as
+   `[opensm]`: set the option in that existing section. A second copy of
+   a section header stops AFM starting.
+2. **Restart AFM.** This restarts OpenSM too, so the fabric has no subnet
+   manager until the new OpenSM is up, usually within a minute.
+   Established traffic keeps flowing meanwhile, but nothing new is
+   configured, and new connections and multicast joins wait for OpenSM.
+   On a deployment that names `m_key_per_port`, a restart also applies a
+   pending per-port M_Key target, which re-keys every port.
+
+   ```sh
+   docker restart -t 30 alternative-fabric-manager
+   ```
+
+   `-t 30` gives AFM 30 seconds to stop OpenSM cleanly before Docker
+   kills it.
+3. **Check that OpenSM came back.** Within a minute, the log should show
+   OpenSM's "SUBNET UP", and no `ERROR` lines. The `grep -vi "key 0x"`
+   keeps any key out of your terminal:
+
+   ```sh
+   docker logs --since 5m alternative-fabric-manager 2>&1 \
+     | grep -E "SUBNET UP|ERROR" | grep -vi "key 0x"
+   ```
+
 ### Other ways to run OpenSM
 
 With `[opensm] driver = docker`, something else runs OpenSM, and AFM only
 sends it `SIGHUP`. That OpenSM must read its partitions from `config_dir`,
 bind mounted into its container. Mount the directory, not the file, so
-that AFM's atomic rename reaches it.
+that AFM's atomic rename reaches it. For an OpenSM container named
+`opensm` that reads `/etc/opensm/partitions.conf`:
+
+```ini
+[opensm]
+driver = docker
+# The OpenSM container AFM signals
+container = opensm
+# The directory AFM writes partitions.conf into, which is bind mounted
+# into OpenSM's container
+config_dir = /etc/opensm
+```
+
+With `driver = none`, AFM only writes the files.
+
+Neither of these writes `opensm.conf`, so none of AFM's hardening
+applies: configure OpenSM's protection yourself.
 
 ### Expected switches
 
@@ -242,9 +291,58 @@ writes `opensm.conf`.
 
 ### Your own template
 
-AFM renders `partitions.conf` from a Jinja template, in a sandbox. Set
-`[opensm] partitions_template` to use your own, for example to add static
-partitions or multicast groups.
+AFM renders `partitions.conf` from a Jinja template, in a sandbox. Use
+your own template to add static partitions or multicast groups, for
+example a storage partition for servers outside OpenStack.
+
+1. **Start from AFM's default template.** This copies it out of the
+   running image into AFM's configuration directory, which the container
+   already mounts:
+
+   ```sh
+   docker exec alternative-fabric-manager python -c \
+     'from alternative_fabric_manager.partitions import DEFAULT_TEMPLATE; print(DEFAULT_TEMPLATE, end="")' \
+     | sudo tee /etc/alternative-fabric-manager/partitions.conf.j2 > /dev/null
+   ```
+
+   The template gets `default_partition`, `networks` (each with `id`,
+   `name`, `pkey`, `pkey_hex` and `guids`), `flat` (the flat networks'
+   partition, with `name`, `pkey`, `pkey_hex` and `guids`), `ipoib`
+   (`rate`, `mtu`, `sl`, and `flags`, as the default template writes them)
+   and `generation`. Keep the default template's loop over the networks as it
+   is: it writes `indx0`, without which a guest's IPoIB interface lands in
+   the default partition, and splits big partitions over several lines,
+   since OpenSM reads each line into a fixed buffer.
+
+2. **Add your partitions** at the end of the file, in OpenSM's
+   `partitions.conf` syntax. For example, a storage partition with two
+   servers' port GUIDs as full members:
+
+   ```
+   storage=0x0100, ipoib : 0x0002c90300a1b2c3=full, 0x0002c90300a1b2c4=full ;
+   ```
+
+   Choose a pkey that no network uses as its VLAN ID: from then on, AFM
+   rejects a network whose VLAN ID is a static partition's pkey (0x0100 is
+   VLAN 256). The GUIDs must not be OpenStack ports' (see the checks
+   below).
+
+3. **Point AFM at it,** in `afm.conf`:
+
+   ```ini
+   [opensm]
+   partitions_template = /etc/alternative-fabric-manager/partitions.conf.j2
+   ```
+
+4. **Restart AFM and check it,** as in
+   [Changing the configuration](#changing-the-configuration). Then read
+   the file OpenSM now uses, which holds GUIDs and pkeys but no keys:
+
+   ```sh
+   docker exec alternative-fabric-manager cat /etc/opensm/partitions.conf
+   ```
+
+To go back to the default, empty `partitions_template` and restart.
 
 AFM checks whatever the template renders before writing it:
 
@@ -262,15 +360,52 @@ whose VLAN ID is a static partition's pkey is rejected when it is sent.
 
 `[opensm] default_partition` is written to the file as it is. By default
 every port is only a limited member, so tenants can't reach each other
-there. If ports on your fabric rely on full membership (`ALL=full`), the
-check refuses it unless `[opensm] shared_default_partition` is true; see
-[docs/opensm-hardening.md](docs/opensm-hardening.md) for what that
-exposes.
+there:
 
-On a running fabric, give the default partition's IPoIB broadcast group
-the rate and MTU it has now, as `saquery -g` shows them. Otherwise
-OpenSM recreates the group, which disrupts IPoIB on the default partition
-across the fabric.
+```ini
+[opensm]
+default_partition = Default=0x7fff, ipoib : ALL=limited, SELF=full ;
+```
+
+**On a fabric that already runs IPoIB,** give the default partition's
+broadcast group the rate and MTU it has now. Otherwise OpenSM recreates
+the group, which disrupts IPoIB on the default partition across the
+fabric.
+
+1. Read the group's rate and MTU, before AFM takes over the fabric. The
+   default partition's IPv4 broadcast group has the MGID
+   `ff12:401b:ffff::ffff:ffff`:
+
+   ```sh
+   saquery -g | grep -A12 "MGID.*ff12:401b:ffff::ffff:ffff" | grep -E "Mtu|Rate"
+   ```
+
+   The values include two selector bits: take the low 6 bits. For
+   example `Mtu.....0x84` is `mtu=4`, and `Rate.....0x82` is `rate=2`.
+
+2. Write the values you read into the line, in the existing `[opensm]`
+   section, for example for a rate of 2 and an MTU of 4:
+
+   ```ini
+   [opensm]
+   default_partition = Default=0x7fff, ipoib, rate=2, mtu=4, sl=0 : ALL=limited, SELF=full ;
+   ```
+
+**If ports on your fabric rely on full membership** of the default
+partition (`ALL=full`), the check refuses it unless you allow it as well.
+That lets every port, other tenants' included, reach every other in the
+default partition, so read
+[docs/opensm-hardening.md](docs/opensm-hardening.md), The default
+partition, first:
+
+```ini
+[opensm]
+default_partition = Default=0x7fff, ipoib : ALL=full ;
+shared_default_partition = true
+```
+
+Restart AFM after either change, as in
+[Changing the configuration](#changing-the-configuration).
 
 ## When a switch port stops enforcing partitions
 
