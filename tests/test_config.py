@@ -585,6 +585,50 @@ def test_port_key_commands(tmp_path, capsys):
     assert capsys.readouterr().out == "Forgot 1 ports and 0 links\n"
 
 
+def test_release_port_takes_several_guids(tmp_path, capsys):
+    path = _per_port_conf(tmp_path)
+    _cli(path, "--add-link", "0x51:3", "b1:1")
+    _cli(path, "--add-link", "0x51:4", "b2:1")
+    capsys.readouterr()
+    _cli(path, "--release-port", "0xB1", "b2")
+    assert capsys.readouterr().out.splitlines() == [
+        f"Released 0x{guid:016x} until it answers its key again"
+        for guid in (0xB1, 0xB2)
+    ]
+    _cli(path, "--port-key-states")
+    out = capsys.readouterr().out
+    assert "0x00000000000000b1 - unknown released" in out
+    assert "0x00000000000000b2 - unknown released" in out
+
+
+def test_release_port_releases_all_or_none(tmp_path, capsys):
+    path = _per_port_conf(tmp_path)
+    _cli(path, "--add-link", "0x51:3", "b1:1")
+    _cli(path, "--add-link", "0x51:4", "b2:1")
+    capsys.readouterr()
+    for args, match in (
+        (("b1", "c1", "b2"), "no port 0x00000000000000c1 is recorded; none was "),
+        (("b1", "zz"), "isn't a GUID"),
+    ):
+        with pytest.raises(SystemExit, match=match):
+            _cli(path, "--release-port", *args)
+        assert capsys.readouterr().out == ""
+        _cli(path, "--port-key-states")
+        out = capsys.readouterr().out
+        assert "0x00000000000000b1 - unknown -" in out
+        assert "0x00000000000000b2 - unknown -" in out
+
+
+@pytest.mark.parametrize(
+    "other", [["--status"], ["--port-key-states"], ["--forget-port", "b1"]]
+)
+@pytest.mark.parametrize("confirm", [[], ["--confirm-fabric"]])
+def test_reset_held_combines_with_no_other_command(tmp_path, other, confirm):
+    path = _per_port_conf(tmp_path)
+    with pytest.raises(SystemExit, match="combines only with --confirm-fabric"):
+        _cli(path, *confirm, "--reset-held", *other)
+
+
 def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):
     path = _per_port_conf(tmp_path, hardening="all")
     _cli(path, "--show-keys")
@@ -599,7 +643,10 @@ def test_port_m_key_with_no_rows_is_the_stored_m_key(tmp_path, capsys):
         (["--add-link", "0x51", "0xb1:1"], "GUID>:<port>"),
         (["--add-link", "0x51:1", "0x51:1"], "two different ports"),
         (["--release-port", "zz"], "isn't a GUID"),
-        (["--release-port", "b1"], "no port"),
+        (
+            ["--release-port", "b1"],
+            "^alternative-fabric-manager: no port 0x0+b1 is recorded$",
+        ),
         (["--forget-port", "b1"], "no port"),
     ],
 )

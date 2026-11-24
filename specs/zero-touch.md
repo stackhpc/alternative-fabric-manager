@@ -23,7 +23,7 @@ running (AGENTS.md, Usability):
 - A step that protects an edge case gives way to usability.
 
 `--confirm-fabric` stays, as a shortcut, and for the one case below that
-needs a person (What stays manual).
+needs a person (What stays manual). It only records the expected switches.
 
 ## Terms
 
@@ -55,9 +55,8 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
 > [!WARNING]
 > Naming `m_key_per_port` in `[opensm] hardening` is the decision to turn
 > per-port M_Keys on, and the manager then arms and applies the turn-on by
-> itself, re-keying every port. On a deployment that names it,
-> `--confirm-fabric` arms the turn-on at once. Agree the hardening with
-> whoever shares the fabric. docs/opensm-hardening.md, Per-port M_Keys,
+> itself, re-keying every port. Agree the hardening with whoever shares
+> the fabric. docs/opensm-hardening.md, Per-port M_Keys,
 > has the procedure for turning them on and off.
 
 ## What stays manual
@@ -66,6 +65,7 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
 | --- | --- |
 | Removing a switch that may still forward | Automating it could let jobs complete past a live switch. |
 | Naming and removing hardening groups | It's the operator's decision, agreed with whoever shares the fabric. |
+| Retrying a failed per-port M_Key turn-on | Each retry restarts OpenSM on a shared fabric (A failed turn-on). |
 | What specs/ha.md keeps manual for safety | For example `--force-unfreeze`, and `--forget-node` for a node that died. |
 
 ### Removing a switch that may still forward
@@ -91,12 +91,34 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
   --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric
 ```
 
-With rows, a dead leaf's ports need `--release-port` too, one GUID per run,
-or their jobs wait (specs/secured-profile.md, Lost ports and jobs):
+**What it does.** It only records the switches the fabric has now as the
+expected ones:
+
+- it prints the switches it dropped, and those it kept;
+- exit 0 means they were recorded;
+- it never folds OpenSM's cache, which every check does already;
+- it never arms the per-port M_Key turn-on, nor clears a failed one.
+
+So whatever the hardening groups, it never re-keys a port. It still
+drops every missing switch, a hung one included: check `--status` first.
+
+**A dropped switch may be a hung one still forwarding,** so the pkeys and
+hosts its ports may hold stay tainted (specs/ha.md, While a switch is
+missing). Once it's unplugged or wiped, `--reset-held` untaints them. It
+runs in the same command, or on its own later:
 
 ```sh
 docker exec alternative-fabric-manager alternative-fabric-manager \
-  --config-file /etc/alternative-fabric-manager/afm.conf --release-port <guid>
+  --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric --reset-held
+```
+
+With rows, a dead leaf's ports need `--release-port` too, or their jobs
+wait (specs/secured-profile.md, Lost ports and jobs). One run takes every
+GUID, and releases none if any isn't recorded:
+
+```sh
+docker exec alternative-fabric-manager alternative-fabric-manager \
+  --config-file /etc/alternative-fabric-manager/afm.conf --release-port <guid> ...
 ```
 
 That's a hardware change, made by someone at the fabric anyway.
@@ -168,8 +190,8 @@ It protects too little to cost an operator step:
 
 **What replaces trust:**
 
-- The prober follows every row that answers as a switch, as
-  `--confirm-fabric` already does (`follow_unconfirmed`).
+- The prober follows every row that answers as a switch, as OpenSM's own
+  sweeps do.
 - The expected switches are only the completeness list.
 - What a check, or HA mode's reach probe, counts is the expected switches
   found. A new switch, or a spoofer, never makes a fragment look complete,
@@ -369,7 +391,7 @@ sweep.
 
 This covers:
 
-- a turn-on armed automatically or by `--confirm-fabric`;
+- a turn-on armed at a passing check (Arming);
 - a turn-off after the group is removed;
 - a start whose verify failed and started OpenSM on the previous target.
 
@@ -388,8 +410,25 @@ The hash is never shown.
 While a failed turn-on is recorded, nothing arms again. Either of these
 clears it:
 
-- a change of configuration;
-- `--confirm-fabric`.
+- a change of configuration, since the record is keyed by its hash;
+- `--retry-port-key-turn-on`, once the cause is fixed:
+
+  ```sh
+  docker exec alternative-fabric-manager alternative-fabric-manager \
+    --config-file /etc/alternative-fabric-manager/afm.conf --retry-port-key-turn-on
+  ```
+
+`--retry-port-key-turn-on` only clears the record:
+
+| Case | What it does |
+| --- | --- |
+| A failed turn-on is recorded | Clears it, and says that the manager arms the turn-on again at its next passing check once every port is ready, then applies it, re-keying every port |
+| None is recorded | Says there's nothing to retry |
+| The group isn't named, or the target is on | Says so |
+
+Each changes nothing else, and exits 0. It writes only the database, so it
+works from any node in HA mode. The arming that follows is the manager's,
+under Arming's rules, the epoch rule included.
 
 `--port-key-states` shows, beside the ports, whether a failed turn-on is
 recorded, what clears it, and the arming's blocking reason:
@@ -399,12 +438,33 @@ docker exec alternative-fabric-manager alternative-fabric-manager \
   --config-file /etc/alternative-fabric-manager/afm.conf --port-key-states
 ```
 
-`--confirm-fabric` arms in HA mode under the same epoch rule as the
-leader's checks.
-
 So a fabric that can't be turned on isn't re-keyed in a loop, across
 restarts and takeovers alike. The record is logged at every start, with
-what to check.
+what to check and the command that retries.
+
+#### No automatic retry
+
+The manager never clears a failed turn-on by itself. The first arming
+restarts OpenSM by itself too, so the restart isn't what sets a retry
+apart. A retry follows a known failure, whose cause is probably
+unchanged. Under AGENTS.md's Usability test:
+
+- **It isn't a real hole.** A retry can't put two OpenSMs in charge,
+  strand a port with a key no SM holds, or hand a tenant a key: it's the
+  same turn-on, under the same success rule and set-back.
+- **But it isn't an edge case either.** Automated, it would bring
+  repeated, expected outages on a fabric others share: each retry
+  restarts OpenSM, and one whose start fails in a way the prober can't
+  tell leaves OpenSM stopped until it can (specs/secured-profile.md,
+  Turning it on). That isn't "a delay one command undoes".
+- **Causes that configuration fixes already clear it,** since the record is
+  keyed by the configuration hash.
+
+What's left is a cause outside the configuration, such as a port that was
+down or held by another SM. Only a person can tell that it's fixed, so the
+retry is one command, whose message says what follows.
+
+A retry with a bounded backoff could replace it later.
 
 ## What this changes in specs/secured-profile.md
 
@@ -416,7 +476,8 @@ This spec overrides, for per-port M_Keys:
   target on and anything possibly derived, gets the stored M_Key only if
   its row holds it.
 - **Turning it on:** naming the group arms it, at a passing check, and the
-  manager applies it. `--confirm-fabric` arms it at once, and no longer
-  needs a second run for new switches.
+  manager applies it. `--confirm-fabric` never arms it, and no longer
+  needs a second run for new switches: it only records the expected
+  switches.
 - **HA mode:** the reach probe follows every switch, and counts the
   expected ones it finds.

@@ -242,18 +242,21 @@ jobs, tainted pkeys and tainted hosts they hold.
      --config-file /etc/alternative-fabric-manager/afm.conf --confirm-fabric --reset-held
    ```
 
-   If it says it didn't reset, deal with what it names, and run it
-   again. The waiting jobs then complete after AFM's next sweep. With
-   per-port M_Keys, the removed switch's adapter ports also need
-   `--release-port <guid>`, one GUID per run, or their jobs wait (see
-   [specs/zero-touch.md](specs/zero-touch.md), What stays manual).
+   It prints the switches it kept and those it dropped. It records
+   only the switches, whatever the hardening groups. If it says the
+   latest partitions haven't been swept yet, the switches are recorded:
+   run `--reset-held` on its own once AFM's sweep has finished. The
+   waiting jobs then complete after AFM's next sweep. With per-port
+   M_Keys, the removed switch's adapter ports also need
+   `--release-port <guid> ...`, which takes every GUID in one run, or
+   their jobs wait (see [specs/zero-touch.md](specs/zero-touch.md), What
+   stays manual).
 
 > [!WARNING]
 > Naming the experimental `m_key_per_port` group in `[opensm] hardening`
 > turns per-port M_Keys on: once the fabric is ready, AFM arms the turn-on
-> and restarts OpenSM by itself, which re-keys every port.
-> `--confirm-fabric` arms it at once. Agree it with whoever shares the
-> fabric before naming the group. See
+> and restarts OpenSM by itself, which re-keys every port. Agree it with
+> whoever shares the fabric before naming the group. See
 > [docs/opensm-hardening.md](docs/opensm-hardening.md), Per-port M_Keys.
 
 ### High availability

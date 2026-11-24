@@ -549,7 +549,7 @@ def should_adopt(ports, group_named, target_on, recorded_fingerprint):
     what Restores asks for. With a fingerprint, the database has seen a
     turn-on, and derived rows are a turn-off's or a set-back's leftovers,
     such as a node that was down: they're turned off as any others, and
-    --confirm-fabric, which checks the fabric first, arms them.
+    the manager's checks, which verify the fabric first, arm them again.
     Decided after folding the volume's files and before verifying, and only
     once restore_problem has found none.
     """

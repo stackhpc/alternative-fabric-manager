@@ -2,6 +2,7 @@
 switch can't matter to them, and every other job waits for a whole fabric
 (specs/ha.md, While a switch is missing)"""
 
+import datetime
 import json
 
 import pytest
@@ -481,6 +482,280 @@ def test_a_removed_switch_keeps_the_map_until_reset_held(manager, fabric, caplog
         held = partial.Held.loads(session.get(db.Applied, 1).held)
     assert not held.blocked
     assert held.tainted_pkeys() == set()
+
+
+def _cli(manager, monkeypatch, capsys, *args):
+    """Run the CLI beside the manager; return what it printed"""
+    from alternative_fabric_manager import cli, drivers
+    from alternative_fabric_manager import config as config_mod
+
+    monkeypatch.setattr(config_mod.Config, "load", lambda _path: manager.config)
+    monkeypatch.setattr(db, "make_sessionmaker", lambda *a, **k: manager.sessionmaker)
+    monkeypatch.setattr(drivers, "make_driver", lambda _config: manager.driver)
+    cli.main(["--config-file", "afm.conf", *args])
+    return capsys.readouterr().out.splitlines()
+
+
+def _held(manager):
+    with manager.sessionmaker() as session:
+        return partial.Held.loads(session.get(db.Applied, 1).held)
+
+
+def _removed_leaf(manager, fabric):
+    """Leaf B is lost while a port's deletion taints pkey 100 and host h2,
+    and --confirm-fabric drops it, which blocks the map's reset"""
+    _settled(
+        manager,
+        manager.put_network(NETWORK_ID, conftest.network()),
+        manager.put_port(OTHER_PORT, _port(OTHER_PORT, OTHER_CLIENT_ID, host="h2")),
+    )
+    _lose_leaf(manager, fabric)
+    manager.delete_port(OTHER_PORT)
+    manager.reconcile()
+    manager.confirm_fabric()
+    manager.reconcile()
+    manager.reconcile()
+    assert _applied(manager).check_ok
+    held = _held(manager)
+    assert held.blocked and held.tainted_pkeys() == {100}
+
+
+def test_confirm_fabric_prints_the_switches_it_drops(
+    manager, fabric, monkeypatch, capsys
+):
+    _lose_leaf(manager, fabric)
+    assert _cli(manager, monkeypatch, capsys, "--confirm-fabric") == [
+        f"0x{LEAF_A:016x}",
+        f"Dropped from the expected switches: 0x{LEAF_B:016x}",
+    ]
+
+
+def test_reset_held_on_its_own_resets_a_blocked_map(
+    manager, fabric, monkeypatch, capsys
+):
+    # Run later, once the dropped leaf is unplugged: no second confirmation,
+    # which would drop whatever is missing then.
+    _removed_leaf(manager, fabric)
+    assert _cli(manager, monkeypatch, capsys, "--reset-held") == [
+        "Reset the memberships ports may hold stale; this untainted pkeys "
+        "0x0064, and hosts h2"
+    ]
+    held = _held(manager)
+    assert not held.blocked and held.tainted_pkeys() == set()
+
+
+def test_reset_held_on_its_own_with_no_block_resets_nothing(
+    manager, fabric, monkeypatch, capsys
+):
+    # A leaf is missing, and not dropped: the map stays as it is, since that
+    # leaf may be hung, still forwarding.
+    _settled(
+        manager,
+        manager.put_network(NETWORK_ID, conftest.network()),
+        manager.put_port(OTHER_PORT, _port(OTHER_PORT, OTHER_CLIENT_ID, host="h2")),
+    )
+    _lose_leaf(manager, fabric)
+    manager.delete_port(OTHER_PORT)
+    manager.reconcile()
+    before = _held(manager).dumps()
+    assert _cli(manager, monkeypatch, capsys, "--reset-held") == [
+        "No confirmation has removed a switch since the last reset: nothing to reset."
+    ]
+    assert _held(manager).dumps() == before
+    assert _held(manager).tainted_pkeys() == {100}
+
+
+def _refused_alone(manager, monkeypatch, capsys, why):
+    """--reset-held on its own refuses, saying why, and changes nothing"""
+    before = _held(manager).dumps()
+    with pytest.raises(SystemExit) as raised:
+        _cli(manager, monkeypatch, capsys, "--reset-held")
+    message = str(raised.value.code)
+    assert why in message, message
+    assert "run it again once a check passes" in message
+    assert "--confirm-fabric --reset-held" in message
+    assert _held(manager).dumps() == before
+    assert _held(manager).blocked
+
+
+def test_reset_held_on_its_own_refuses_while_an_expected_switch_is_missing(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    # Another expected switch goes missing after the confirmation.
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        f"the last fabric check didn't pass (Missing switches: 0x{LEAF_A:016x}",
+    )
+
+
+def test_reset_held_on_its_own_refuses_after_a_check_that_couldnt_query(
+    manager, fabric, monkeypatch, capsys
+):
+    # A check that couldn't ask the fabric lists no switch missing.
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.fabric_result = ReloadError("ibswitches timed out")
+    assert not manager.check_fabric()
+    assert _applied(manager).missing_switches == "[]"
+    _refused_alone(manager, monkeypatch, capsys, "ibswitches timed out")
+
+
+def test_reset_held_on_its_own_refuses_when_opensm_isnt_master(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.fabric = lambda *a, **k: Fabric(set(), [(OWN, 2)], {OWN})
+    assert not manager.check_fabric()
+    _refused_alone(manager, monkeypatch, capsys, "the last fabric check didn't pass")
+
+
+def test_reset_held_on_its_own_refuses_before_the_fresh_sweep(
+    manager, fabric, monkeypatch, capsys
+):
+    # The switch is back, and the check passes, but the sweep that would
+    # reach it hasn't been made.
+    _removed_leaf(manager, fabric)
+    fabric.switches = set()
+    assert not manager.check_fabric()
+    fabric.switches = {LEAF_A}
+    assert manager.check_fabric()
+    assert _applied(manager).missing
+    _refused_alone(manager, monkeypatch, capsys, "fresh sweep")
+
+
+def test_reset_held_on_its_own_refuses_until_a_check_follows_the_block(
+    manager, fabric, monkeypatch, capsys
+):
+    # The check that passed before the confirmation judged the old list.
+    _settled(manager, manager.put_network(NETWORK_ID, conftest.network()))
+    fabric.switches = {LEAF_A}
+    manager.confirm_fabric()
+    assert _held(manager).blocked and _applied(manager).check_ok
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        "no fabric check has passed since the confirmation",
+    )
+    manager.reconcile()
+    assert _cli(manager, monkeypatch, capsys, "--reset-held")[0].startswith(
+        "Reset the memberships"
+    )
+
+
+def test_reset_held_on_its_own_refuses_a_stale_check(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    with manager.sessionmaker() as session:
+        applied = session.get(db.Applied, 1)
+        applied.check_time = applied.check_time - datetime.timedelta(minutes=5)
+        session.commit()
+    _refused_alone(manager, monkeypatch, capsys, "s old")
+
+
+def _unattributed_sweep(manager, fabric):
+    """A sweep whose pkey error OpenSM's log tied to no port"""
+    fabric.report = SweepReport(unattributed=True)
+    manager._written = None
+    manager.reconcile()
+    manager.reconcile()
+    assert "unattributed" in _applied(manager).pkey_errors
+
+
+def _cleared_enforcement(manager):
+    with manager.sessionmaker() as session:
+        session.get(db.Applied, 1).enforcement_errors = json.dumps([f"{LEAF_A:016x}:3"])
+        session.commit()
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize(
+    "cause, why",
+    [
+        ("unattributed", "a pkey error that OpenSM's log tied to no port"),
+        ("enforcement", "--show-enforcement-errors"),
+    ],
+)
+def test_reset_held_refuses_while_the_sweep_isnt_evidence(
+    manager, fabric, monkeypatch, capsys, cause, why, confirmed
+):
+    # As the automatic reset does, on both paths: the confirmation is no
+    # evidence of what OpenSM set.
+    _removed_leaf(manager, fabric)
+    if cause == "unattributed":
+        _unattributed_sweep(manager, fabric)
+    else:
+        _cleared_enforcement(manager)
+    before = _held(manager).dumps()
+    args = ["--confirm-fabric", "--reset-held"] if confirmed else ["--reset-held"]
+    with pytest.raises(SystemExit) as raised:
+        _cli(manager, monkeypatch, capsys, *args)
+    message = str(raised.value.code)
+    assert why in message and "weren't reset" in message, message
+    assert _held(manager).dumps() == before
+    assert _held(manager).blocked
+
+
+def test_a_second_confirmation_that_drops_a_switch_needs_a_check_after_it(
+    manager, fabric, monkeypatch, capsys
+):
+    _removed_leaf(manager, fabric)
+    # A third switch is confirmed, and checked, then removed again.
+    fabric.switches = {LEAF_A, LEAF_B}
+    manager.confirm_fabric()
+    manager.reconcile()
+    assert _applied(manager).check_ok
+    fabric.switches = {LEAF_A}
+    assert manager.confirm_fabric().removed == [LEAF_B]
+    # The checks so far judged the list that had it.
+    _refused_alone(
+        manager,
+        monkeypatch,
+        capsys,
+        "no fabric check has passed since the confirmation",
+    )
+    manager.reconcile()
+    manager.reconcile()
+    assert _cli(manager, monkeypatch, capsys, "--reset-held")[0].startswith(
+        "Reset the memberships"
+    )
+
+
+def test_reset_held_on_its_own_keeps_the_block_until_the_sweep(
+    manager, fabric, monkeypatch
+):
+    from alternative_fabric_manager import manager as manager_mod
+    from alternative_fabric_manager import port_keeper
+
+    _removed_leaf(manager, fabric)
+    manager.delete_network(NETWORK_ID)
+    written = manager_mod.partitions.write_atomically
+
+    def fails(path, content, *args):
+        if path == manager.config.partitions_file:
+            raise OSError("disk full")
+        return written(path, content, *args)
+
+    monkeypatch.setattr(manager_mod.partitions, "write_atomically", fails)
+    manager.sync()
+    with pytest.raises(port_keeper.PortKeysError, match="haven't been swept"):
+        manager.reset_held()
+    # The block stays, so the rerun after the sweep needs no confirmation.
+    assert _held(manager).blocked
+    monkeypatch.setattr(manager_mod.partitions, "write_atomically", written)
+    manager.reconcile()
+    assert _held(manager).blocked
+    assert manager.reset_held() is not None
+    assert not _held(manager).blocked
 
 
 def test_a_takeover_inherits_the_fresh_sweep(manager, fabric):
@@ -1039,7 +1314,7 @@ def test_a_reset_never_uses_a_body_opensm_didnt_sweep(manager, fabric, monkeypat
         held = partial.Held.loads(session.get(db.Applied, 1).held)
     assert held.tainted_pkeys() == {100}
     with pytest.raises(port_keeper.PortKeysError):
-        manager.reset_held()
+        manager.reset_held(confirmed=True)
     monkeypatch.setattr(manager_mod.partitions, "write_atomically", written)
     manager.reconcile()
     manager.reconcile()
