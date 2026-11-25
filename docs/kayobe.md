@@ -898,7 +898,11 @@ Later, run it only after removing or replacing a switch (see
 
 ### Step 12: Test it
 
-1. Run the networking-mlnx tempest plugin against the deployment.
+1. Run the networking-mlnx tempest plugin against the deployment. If
+   `[opensm] shared_default_partition` is true, set
+   `[networking_mlnx] shared_default_partition = True` in `tempest.conf`
+   too, so that the plugin expects ports to be full members of the
+   default partition.
 2. Create an InfiniBand network and boot an instance on it, as in
    [infiniband-networks.md](infiniband-networks.md).
 
