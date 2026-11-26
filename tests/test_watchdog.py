@@ -73,13 +73,18 @@ def test_opensm_dies_when_its_lease_lapses(tmp_path):
 
 
 def test_renewal_keeps_it_running_and_stop_kills_it(tmp_path):
-    _lease(tmp_path, seconds=0.6)
+    # Renew at a quarter of the lease, so that a busy CI runner's late
+    # wakeups don't let it lapse, and keep going past the first lease's
+    # deadline, so that only the renewals can be keeping OpenSM running.
+    _lease(tmp_path, seconds=2.0)
+    first_deadline = time.monotonic() + 2.0
     _start(tmp_path)
     dog, thread, _ = _run(tmp_path)
     assert _started(dog)
-    for _ in range(5):
-        time.sleep(0.3)
-        _lease(tmp_path, seconds=0.6)
+    _lease(tmp_path, seconds=2.0)
+    while time.monotonic() < first_deadline + 1.0:
+        time.sleep(0.5)
+        _lease(tmp_path, seconds=2.0)
     assert dog.process.poll() is None
     (tmp_path / wd.STOP).write_text("")
     thread.join(5)

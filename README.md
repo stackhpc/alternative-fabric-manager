@@ -450,6 +450,15 @@ default_partition = Default=0x7fff, ipoib : ALL=full ;
 shared_default_partition = true
 ```
 
+If you run the networking-mlnx tempest plugin, tell it too, or its test
+that guests on different networks can't reach each other in the default
+partition fails, since they now can. In `tempest.conf`:
+
+```ini
+[networking_mlnx]
+shared_default_partition = True
+```
+
 Restart AFM after either change, as in
 [Changing the configuration](#changing-the-configuration).
 
